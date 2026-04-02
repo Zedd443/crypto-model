@@ -1,0 +1,271 @@
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  features_dir: "data/features"
+  labels_dir: "data/labels"
+  models_dir: "models"
+  results_dir: "results"
+  monitoring_dir: "monitoring"
+  checkpoints_dir: "data/checkpoints"
+  timeframes: ["15m", "1h", "4h", "1d"]
+  primary_timeframe: "15m"
+  train_end: "2024-06-30"
+  val_start: "2024-07-01"
+  val_end: "2024-09-30"
+  test_start: "2024-10-01"
+  min_history_bars: 5000
+  min_align_bars: 200
+
+features:
+  warmup_bars: 2000
+  lookback_windows: [5, 10, 20, 50, 100, 200]
+  lag_periods: [1, 2, 3, 5, 10, 20]
+  ofi_window: 20
+  amihud_window: 20
+  kyle_window: 20
+  rv_daily_bars: 96
+  rv_weekly_days: 5
+  rv_monthly_days: 22
+  vwap_window: 20
+  spread_window: 20
+  funding_zscore_window: 672
+  funding_percentile_window: 2880
+  btc_corr_window: 20
+  granger_window: 20
+  perm_entropy_window: 100
+  btc_nvt_window: 90
+  vix_zscore_days: 60
+  use_chronos: false
+  fracdiff_threshold: 0.01
+  fracdiff_d_step: 0.1
+  htf_ffill_limits:
+    "1h": 4
+    "4h": 16
+    "1d": 96
+
+labels:
+  tp_atr_mult: 2.5
+  sl_atr_mult: 1.5
+  tp_min_pct: 0.015
+  tp_max_pct: 0.06
+  sl_min_pct: 0.01
+  sl_max_pct: 0.05
+  vol_lookback: 20
+  max_hold_bars: 16
+  h1_rolling_median_window: 480
+  weight_clip_min: 0.1
+  weight_clip_max: 3.0
+  dead_zone_cost_multiple: 0.5
+
+regime:
+  n_states: 4
+  hmm_covariance_type: "full"
+  hmm_n_iter: 100
+  hmm_retrain_hours: 24
+  hmm_burnin_bars: 100
+  bocpd_min_size: 50
+  bocpd_penalty: "bic"
+
+model:
+  xgb_device: "cpu"  # override to "cuda" on Kaggle GPU or set env XGB_DEVICE=cuda
+  xgb_n_estimators: 500
+  xgb_max_depth: 6
+  xgb_learning_rate: 0.05
+  xgb_subsample: 0.8
+  xgb_colsample_bytree: 0.8
+  xgb_min_child_weight: 10
+  xgb_reg_alpha: 0.1
+  xgb_reg_lambda: 1.0
+  xgb_gamma: 0.1
+  xgb_early_stopping_rounds: 50
+  cv_n_splits: 8
+  embargo_pct: 0.01
+  embargo_bars_min: 50
+  optuna_n_trials: 50
+  optuna_n_trials_wfo: 25
+  optuna_patience: 20
+  objective_da_weight: 0.4
+  objective_ic_weight: 0.3
+  objective_sharpe_weight: 0.3
+  stability_threshold: 0.6
+  stability_n_bootstrap: 50
+  variance_threshold: 1.0e-6
+  permutation_importance_top_k: 80
+  shap_top_k: 70
+  importance_stability_spearman_min: 0.6
+  staleness_decay_days: 30
+  staleness_exclude_threshold: 0.3
+  calibration_method: "isotonic"
+  conformal_q_level: 0.90
+  conformal_width_full: 0.20
+  conformal_width_60pct: 0.40
+  meta_n_estimators: 200
+  meta_max_depth: 4
+  meta_signal_floor: 0.55
+  tier_A_da_min: 0.53
+  tier_A_da_min_folds: 6
+  tier_A_dsr_min: 0.0
+  tier_A_pbo_max: 0.40
+  tier_A_sharpe_wfo_min: 0.5
+  tier_A_adversarial_auc_max: 0.60
+  tier_A_leverage_default: 2
+  tier_A_leverage_max: 3
+  tier_B_da_min: 0.51
+  tier_B_leverage_max: 1
+  fdr_alpha: 0.05
+
+portfolio:
+  signal_floor_prob: 0.55
+  max_position_size: 0.10
+  max_total_margin_pct: 0.80
+  kelly_fraction: 0.5
+  cvar_confidence_levels: [0.95, 0.99]
+  cvar_lambda_penalty: 0.5
+  dcc_fallback_ewm_span: 60
+  correlation_reduce_threshold: 0.85
+  correlation_skip_threshold: 0.95
+  correlation_reduce_pct: 0.30
+  stress_test_max_dd: 0.03
+  max_turnover: 0.30
+  rebalance_trigger_regime_change: true
+
+backtest:
+  train_pct: 0.70
+  val_pct: 0.15
+  test_pct: 0.15
+  wfo_train_ratio: 0.70
+  wfo_min_windows: 5
+  slippage_pct: 0.002
+  commission_pct: 0.001
+  delisted_slippage_mult: 2.0
+  daily_halt_dd_pct: 0.015
+  ath_pause_dd_pct: 0.10
+  ath_pause_hours: 48
+  daily_profit_target_pct: 0.02
+  spread_guard_natr_mult: 0.20
+  limit_requote_seconds: 15
+  limit_skip_seconds: 30
+  partial_fill_min_ratio: 0.90
+  sl_atr_mult: 1.5
+  tp_atr_mult: 2.5
+  trailing_trigger_pct: 0.005
+  trailing_atr_mult: 1.0
+  funding_skip_net_pnl_threshold: 0.003
+  funding_projected_close_threshold: 0.0005
+  min_notional_buffer_mult: 1.5
+  below_notional_skip_threshold: 0.30
+  liquidity_adv_threshold_usd: 10000000
+  order_book_levels: 5
+  max_size_liquidity_pct: 0.10
+  large_cap_symbols: ["BTCUSDT", "SOLUSDT", "AVAXUSDT", "LINKUSDT", "UNIUSDT"]
+  attribution_trigger_tier_a: 100
+  attribution_trigger_tier_b: 50
+  attribution_trigger_global: 300
+  sqrt_impact_coef: 0.1
+
+growth_gate:
+  threshold: 300.0
+  demo_trades_required: 500
+  tiers:
+    - max_equity: 150
+      max_symbols: 1
+      leverage_a_max: 2
+    - max_equity: 300
+      max_symbols: 3
+      leverage_a_max: 3
+    - max_equity: 600
+      max_symbols: 6
+      leverage_a_max: 3
+      leverage_b_max: 1
+
+monitoring:
+  psi_minor_threshold: 0.10
+  psi_major_threshold: 0.20
+  psi_retrain_feature_count: 10
+  degradation_reduce_std: 2
+  degradation_pause_std: 3
+  adversarial_check_days: 30
+  adversarial_retrain_auc: 0.65
+  retrain_schedule_days: 30
+  rolling_win_rate_window: 20
+  model_weight_decay_days: 30
+  model_stale_threshold: 0.3
+
+trading:
+  mode: "DEMO"
+  endpoints:
+    DEMO: "https://demo-fapi.binance.com"
+    TESTNET: "https://testnet.binancefuture.com"
+    MAINNET: "https://fapi.binance.com"
+  websocket_ping_interval: 30
+  websocket_reconnect_delay: 5
+  rate_limit_backoff_base: 2
+  rate_limit_backoff_max: 60
+  memecoin_symbols: ["TRUMPUSDT", "1000BONKUSDT", "WIFUSDT", "PNUTUSDT", "PENGUUSDT", "1000FLOKIUSDT"]
+  memecoin_demo_trades_required: 200
+  memecoin_sharpe_required: 0.3
+  dead_man_switch_seconds: 60
+
+macro:
+  release_lags:
+    oecd_unemployment:
+      lag_days: 45
+      skip_days: 14
+      safety_buffer_days: 14
+    oecd_cpi:
+      lag_days: 30
+      skip_days: 7
+      safety_buffer_days: 14
+    oecd_industrial_prod:
+      lag_days: 45
+      skip_days: 14
+      safety_buffer_days: 14
+    macro_bond_10y:
+      lag_days: 0
+    macro_vix:
+      lag_days: 0
+    macro_sp500:
+      lag_days: 0
+    macro_usd_index:
+      lag_days: 0
+    macro_inflation_cpi:
+      lag_days: 1
+    macro_unemployment:
+      lag_days: 45
+    macro_euro:
+      lag_days: 1
+    macro_industrial_prod:
+      lag_days: 30
+    market_gold:
+      lag_days: 1
+    market_silver:
+      lag_days: 1
+    market_dji:
+      lag_days: 0
+    market_nikkei:
+      lag_days: 1
+    market_ftse100:
+      lag_days: 1
+    market_kospi:
+      lag_days: 1
+    market_hushen300:
+      lag_days: 1
+    market_msci_world:
+      lag_days: 1
+    market_commodity:
+      lag_days: 1
+    fear_greed:
+      lag_days: 0
+
+adversarial:
+  valid_auc_max: 0.55
+  warn_auc_max: 0.70
+  n_estimators: 100
+  max_depth: 4
+
+ab_testing:
+  sprt_alpha: 0.05
+  sprt_beta: 0.20
+  h0_da: 0.51
+  h1_da: 0.53
+  shadow_min_trades: 50

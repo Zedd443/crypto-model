@@ -1,0 +1,87 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# =============================================================================
+# Data — NEVER commit raw or processed data (use Kaggle Dataset instead)
+# =============================================================================
+data/raw/
+data/processed/
+data/features/
+data/labels/
+data/checkpoints/
+data/logs/
+
+# Keep directory structure
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/features/.gitkeep
+!data/labels/.gitkeep
+!data/checkpoints/.gitkeep
+
+# =============================================================================
+# Models & Results — large binaries, versioned via Kaggle Dataset
+# =============================================================================
+models/*.json
+models/*.pkl
+models/*.ubj
+models/*.bin
+models/training_summary.csv
+results/
+!models/.gitkeep
+
+# =============================================================================
+# Secrets — NEVER commit
+# =============================================================================
+.env
+*.key
+*.pem
+secrets/
+
+# =============================================================================
+# Logs & monitoring
+# =============================================================================
+logs/
+*.log
+monitoring/
+
+# =============================================================================
+# IDE & OS
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# Jupyter
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb
+
+# =============================================================================
+# Misc
+# =============================================================================
+*.tmp
+*.bak
+model_registry.json.lock
+project_state.json.lock

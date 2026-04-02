@@ -1,0 +1,79 @@
+{
+  "last_updated": "2026-04-02T15:05:10.695942+00:00",
+  "stages": {
+    "ingest": {
+      "status": "done",
+      "hash": "e395fcf78cfca2534261135a59d2c62d",
+      "last_run": "2026-04-02T15:05:10.695942+00:00",
+      "issues": [
+        "Excluded for 1d: ['ASTERUSDT', 'LITUSDT', 'KITEUSDT', 'XPLUSDT', 'BARDUSDT']"
+      ]
+    },
+    "features": {
+      "status": "pending",
+      "hash": null,
+      "last_run": null,
+      "issues": []
+    },
+    "labels": {
+      "status": "pending",
+      "hash": null,
+      "last_run": null,
+      "issues": []
+    },
+    "training": {
+      "status": "pending",
+      "completed_symbols": [],
+      "failed_symbols": {},
+      "hash": null,
+      "last_run": null,
+      "issues": []
+    },
+    "meta_labeling": {
+      "status": "pending",
+      "completed_symbols": [],
+      "failed_symbols": {},
+      "hash": null,
+      "last_run": null,
+      "issues": []
+    },
+    "portfolio": {
+      "status": "pending",
+      "hash": null,
+      "last_run": null,
+      "issues": []
+    },
+    "backtest": {
+      "status": "pending",
+      "hash": null,
+      "last_run": null,
+      "issues": []
+    }
+  },
+  "model_tiers": {},
+  "account": {
+    "current_equity": 120.0,
+    "active_symbol_count": 1,
+    "growth_gate_unlocked": false,
+    "growth_gate_threshold": 300.0
+  },
+  "global_alerts": [],
+  "next_scheduled_retrain": null,
+  "token_hints": {
+    "skip_reading": [
+      "data/raw/*",
+      "data/processed/*",
+      "data/features/*"
+    ],
+    "always_read": [
+      "project_state.json",
+      "CLAUDE.md"
+    ],
+    "read_if_relevant": {
+      "training_issue": "models/training_summary.csv",
+      "drift_alert": "monitoring/model_health.json",
+      "trade_debug": "results/trade_log.csv",
+      "execution_issue": "monitoring/skip_log.csv"
+    }
+  }
+}

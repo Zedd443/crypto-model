@@ -1,0 +1,16 @@
+{
+  "id": "irfandragneel/crypto-model-training",
+  "title": "crypto-model-training",
+  "code_file": "notebook.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "irfandragneel/crypto-model-raw-data",
+    "irfandragneel/crypto-model-checkpoints"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
