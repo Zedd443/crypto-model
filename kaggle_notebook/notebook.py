@@ -18,7 +18,7 @@ WORK      = Path("/kaggle/working")
 # ── 1. Clone latest code from GitHub ─────────────────────────────────────────
 subprocess.run([
     "git", "clone", "--depth=1",
-    "https://github.com/irfandragneel/crypto-model.git",
+    "https://github.com/Zedd443/crypto-model.git",
     str(REPO)
 ], check=True)
 
