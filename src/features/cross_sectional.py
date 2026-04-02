@@ -57,7 +57,13 @@ def fit_cross_sectional_stats_from_files(
     accum = {col: {"min": np.inf, "max": -np.inf, "sum": 0.0, "sum_sq": 0.0, "count": 0, "samples": []}
              for col in feature_cols}
 
-    for path in parquet_paths:
+    try:
+        from tqdm import tqdm as _tqdm
+        _iter = _tqdm(parquet_paths, desc="XS-fit", unit="file", ncols=90)
+    except ImportError:
+        _iter = parquet_paths
+
+    for path in _iter:
         try:
             pf = pq.ParquetFile(path)
             # Read index column to get train mask — index is stored as '__index_level_0__' or similar
@@ -85,7 +91,15 @@ def fit_cross_sectional_stats_from_files(
                     continue
                 col_table = pf.read(columns=[col])
                 vals_all = col_table.column(col).to_pylist()
-                vals = np.array([v for v, m in zip(vals_all, train_mask) if m and v is not None], dtype=np.float64)
+                try:
+                    vals = np.array(
+                        [v for v, m in zip(vals_all, train_mask) if m and v is not None],
+                        dtype=np.float64,
+                    )
+                except (TypeError, ValueError):
+                    # Column contains non-numeric types (e.g. Timestamp) — skip silently
+                    del col_table
+                    continue
                 vals = vals[np.isfinite(vals)]
                 if len(vals) == 0:
                     continue
