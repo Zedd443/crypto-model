@@ -49,7 +49,10 @@ def fit_cross_sectional_stats_from_files(
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    train_end_ns = pd.Timestamp(train_end_ts).value  # nanoseconds for fast comparison
+    # Ensure train_end_ts is UTC-aware Timestamp for index comparison
+    train_end_ts = pd.Timestamp(train_end_ts, tz="UTC") if not isinstance(train_end_ts, pd.Timestamp) else train_end_ts
+    if train_end_ts.tz is None:
+        train_end_ts = train_end_ts.tz_localize("UTC")
 
     accum = {col: {"min": np.inf, "max": -np.inf, "sum": 0.0, "sum_sq": 0.0, "count": 0, "samples": []}
              for col in feature_cols}
@@ -63,10 +66,14 @@ def fit_cross_sectional_stats_from_files(
             # Read full index first (cheap — one int64 column)
             idx_table = pf.read(columns=[])  # no data columns, just index
             idx_vals = idx_table.to_pandas().index
-            if hasattr(idx_vals, "asi8"):
-                train_mask = idx_vals.asi8 <= train_end_ns
+            # Normalise to UTC-aware DatetimeIndex for comparison
+            if not isinstance(idx_vals, pd.DatetimeIndex):
+                idx_vals = pd.to_datetime(idx_vals, utc=True)
+            elif idx_vals.tz is None:
+                idx_vals = idx_vals.tz_localize("UTC")
             else:
-                train_mask = idx_vals <= train_end_ts
+                idx_vals = idx_vals.tz_convert("UTC")
+            train_mask = idx_vals <= train_end_ts
             n_train = train_mask.sum()
             if n_train == 0:
                 continue
