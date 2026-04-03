@@ -131,7 +131,7 @@ def _generate_symbol_signals(
             signals["atr"] = 0.01
 
     # Compute position sizes
-    equity = float(cfg.account.get("current_equity", 120.0))
+    equity = float(getattr(getattr(cfg, "account", None), "current_equity", None) or 120.0)
     win_rate = 0.52  # will be updated from backtest results
     avg_win = float(cfg.labels.tp_atr_mult) * 0.01
     avg_loss = float(cfg.labels.sl_atr_mult) * 0.01

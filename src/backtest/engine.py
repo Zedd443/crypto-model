@@ -18,7 +18,7 @@ class BacktestEngine:
         self.positions = {}  # {symbol: {entry_price, size_usd, direction, entry_time, tp, sl}}
         self.nav = []
         self.trade_log = []
-        self.equity = float(cfg.account.get("current_equity", 10000.0))
+        self.equity = float(getattr(getattr(cfg, "account", None), "current_equity", None) or 120.0)
         self.equity_start_of_day = self.equity
         self.ath = self.equity
         self.trading_halted_today = False

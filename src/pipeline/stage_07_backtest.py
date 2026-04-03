@@ -200,7 +200,7 @@ def _aggregate_nav(nav_series_list: list, cfg) -> pd.Series:
     portfolio_nav = combined.mean(axis=1)
 
     # Scale to initial equity
-    initial_equity = float(cfg.account.get("current_equity", 120.0))
+    initial_equity = float(getattr(getattr(cfg, "account", None), "current_equity", None) or 120.0)
     portfolio_nav = portfolio_nav * initial_equity
 
     return portfolio_nav.rename("portfolio_nav")
