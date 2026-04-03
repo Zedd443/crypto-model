@@ -6,6 +6,7 @@
 #   python -m src.pipeline.run_pipeline --stage 2              # run stage 2 only (features)
 #   python -m src.pipeline.run_pipeline --stage 4 --force      # re-run training even if done
 #   python -m src.pipeline.run_pipeline --stage 4 --symbol BTCUSDT  # single symbol debug
+#   python -m src.pipeline.run_pipeline --stage 8              # run live execution loop
 #
 # Stage map:
 #   1 ingest       — download OHLCV + on-chain + macro data from APIs
@@ -15,6 +16,7 @@
 #   5 meta_labeling— meta-labeler trained on OOF predictions (signal confidence)
 #   6 portfolio    — generate signals, position sizing, correlation filter
 #   7 backtest     — walk-forward backtest with realistic costs
+#   8 live         — real-time execution loop (Binance Demo/Mainnet FAPI)
 
 import argparse
 import sys
@@ -29,6 +31,7 @@ from src.pipeline import (
     stage_05_meta,
     stage_06_portfolio,
     stage_07_backtest,
+    stage_08_live,
 )
 
 logger = get_logger("run_pipeline")
@@ -41,6 +44,7 @@ STAGES = {
     5: stage_05_meta.run,
     6: stage_06_portfolio.run,
     7: stage_07_backtest.run,
+    8: stage_08_live.run,
 }
 
 STAGE_NAMES = {
@@ -51,14 +55,15 @@ STAGE_NAMES = {
     5: "meta_labeling",
     6: "portfolio",
     7: "backtest",
+    8: "live",
 }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Crypto ML Trading Pipeline")
     parser.add_argument(
-        "--stage", type=int, choices=range(1, 8),
-        help="Run specific stage only (1-7). Omit to run all stages sequentially."
+        "--stage", type=int, choices=range(1, 9),
+        help="Run specific stage only (1-8). Omit to run all stages sequentially."
     )
     parser.add_argument(
         "--symbol", type=str, default=None,
@@ -76,7 +81,7 @@ def main():
 
     cfg = load_config(args.config)
 
-    stages_to_run = [args.stage] if args.stage else list(range(1, 8))
+    stages_to_run = [args.stage] if args.stage else list(range(1, 8))  # 8 (live) not in batch run
 
     for stage_num in stages_to_run:
         stage_name = STAGE_NAMES[stage_num]

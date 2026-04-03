@@ -117,6 +117,14 @@ def update_project_state(stage: str, status: str, issues: list[str] | None = Non
     save_state(state)
 
 
+def update_equity(equity: float, state_path: Path = Path("project_state.json")) -> None:
+    state = load_state()
+    account = state.setdefault("account", {})
+    account["current_equity"] = float(equity)
+    save_state(state)
+    logger.debug(f"account.current_equity updated to {equity:.4f}")
+
+
 def _hash_directory(path: str) -> str | None:
     p = Path(path)
     if not p.exists():
