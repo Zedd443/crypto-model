@@ -9,7 +9,8 @@
   "enable_internet": true,
   "dataset_sources": [
     "irfandragneel/crypto-model-raw-data",
-    "irfandragneel/crypto-model-checkpoints"
+    "irfandragneel/crypto-model-checkpoints",
+    "irfandragneel/crypto-model-features"
   ],
   "competition_sources": [],
   "kernel_sources": []

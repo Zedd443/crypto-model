@@ -1,7 +1,7 @@
 """
 crypto-model Kaggle training script
-Runs stages 3-7 (features already in checkpoints dataset, or re-run stage 2 if needed)
-GPU: XGB_DEVICE=cuda is set automatically when GPU is enabled
+Stage 2 (features) is skipped — pre-built feature files are loaded from
+the crypto-model-features dataset. Stages 3-7 run on GPU.
 """
 import os
 import sys
@@ -13,6 +13,7 @@ from pathlib import Path
 REPO      = Path("/kaggle/working/repo")
 RAW       = Path("/kaggle/input/crypto-model-raw-data")
 CKPT_IN   = Path("/kaggle/input/crypto-model-checkpoints")
+FEAT_IN   = Path("/kaggle/input/crypto-model-features")
 WORK      = Path("/kaggle/working")
 
 # ── 1. Clone latest code from GitHub ─────────────────────────────────────────
@@ -42,6 +43,16 @@ data_dir.mkdir(exist_ok=True)
 raw_link = data_dir / "raw"
 if not raw_link.exists():
     raw_link.symlink_to(RAW)
+
+# Features: symlink from pre-built dataset — stage 2 will be skipped
+feat_link = data_dir / "features"
+if not feat_link.exists():
+    if FEAT_IN.exists():
+        feat_link.symlink_to(FEAT_IN)
+        print(f"Features linked from dataset: {len(list(FEAT_IN.glob('*.parquet')))} files")
+    else:
+        feat_link.mkdir(exist_ok=True)
+        print("WARNING: crypto-model-features dataset not attached — stage 2 will run")
 
 # Checkpoints: dataset root IS the checkpoints dir (no subfolder)
 ckpt_dst = data_dir / "checkpoints"
@@ -102,7 +113,12 @@ def _run_stage(name, fn, *args, **kwargs):
         _tb.print_exc()
         _sys.exit(1)
 
-_run_stage("Stage 2: features",      stage_02_features.run, cfg, force=False)
+# Stage 2: skip if features dataset is attached (files already in data/features/)
+_feat_files = list((REPO / "data/features").glob("*.parquet"))
+if _feat_files:
+    print(f"\n=== Stage 2: features SKIPPED ({len(_feat_files)} files from dataset) ===", flush=True)
+else:
+    _run_stage("Stage 2: features", stage_02_features.run, cfg, force=False)
 _run_stage("Stage 3: labels",        stage_03_labels.run,   cfg)
 _run_stage("Stage 4: training (GPU)",stage_04_train.run,    cfg)
 _run_stage("Stage 5: meta-labeling", stage_05_meta.run,     cfg)
