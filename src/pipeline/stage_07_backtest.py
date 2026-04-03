@@ -124,7 +124,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
         logger.info(f"{sym}: backtest complete — {n_trades} trades, final equity={result['final_equity']:.2f}")
 
         # Save per-symbol results
-        nav.to_parquet(results_dir / f"{sym}_{_TF}_nav.parquet")
+        nav.to_frame("nav").to_parquet(results_dir / f"{sym}_{_TF}_nav.parquet")
         if n_trades > 0:
             trades.to_csv(results_dir / f"{sym}_{_TF}_trades.csv", index=False)
 
