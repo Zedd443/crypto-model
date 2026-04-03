@@ -63,7 +63,21 @@ def generate_signals(
     # Dominant regime state
     if regime_df is not None and len(regime_df) > 0:
         regime_aligned = regime_df.reindex(primary_proba_df.index, method="ffill")
-        regime_state = regime_aligned.idxmax(axis=1).fillna("unknown")
+        # idxmax(axis=1) raises ValueError when a row is entirely NaN — handle by
+        # pre-computing a "unknown" default for all-NaN rows and only calling
+        # idxmax on rows that have at least one valid probability
+        all_nan_mask = regime_aligned.isna().all(axis=1)
+        if all_nan_mask.any():
+            logger.warning(
+                f"regime_aligned has {all_nan_mask.sum()} all-NaN rows — "
+                "defaulting those rows to 'unknown'"
+            )
+        regime_state = pd.Series("unknown", index=primary_proba_df.index, dtype=object)
+        valid_mask = ~all_nan_mask
+        if valid_mask.any():
+            regime_state.loc[valid_mask] = (
+                regime_aligned.loc[valid_mask].idxmax(axis=1).fillna("unknown")
+            )
     else:
         regime_state = pd.Series("unknown", index=primary_proba_df.index)
 
