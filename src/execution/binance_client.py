@@ -40,8 +40,8 @@ class BinanceClient:
         params["recvWindow"] = 5000
         query = urlencode(params)
         sig = hmac.new(
-            self._api_secret.encode("utf-8"),
-            query.encode("utf-8"),
+            self._api_secret.encode(),
+            query.encode(),
             hashlib.sha256,
         ).hexdigest()
         params["signature"] = sig
