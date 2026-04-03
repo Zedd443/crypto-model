@@ -10,7 +10,10 @@
   "dataset_sources": [
     "irfandragneel/crypto-model-raw-data",
     "irfandragneel/crypto-model-checkpoints",
-    "irfandragneel/crypto-model-features"
+    "irfandragneel/crypto-model-features-1",
+    "irfandragneel/crypto-model-features-2",
+    "irfandragneel/crypto-model-features-3",
+    "irfandragneel/crypto-model-features-4"
   ],
   "competition_sources": [],
   "kernel_sources": []

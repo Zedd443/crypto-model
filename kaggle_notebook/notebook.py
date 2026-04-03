@@ -13,7 +13,7 @@ from pathlib import Path
 REPO      = Path("/kaggle/working/repo")
 RAW       = Path("/kaggle/input/crypto-model-raw-data")
 CKPT_IN   = Path("/kaggle/input/crypto-model-checkpoints")
-FEAT_IN   = Path("/kaggle/input/crypto-model-features")
+FEAT_IN   = Path("/kaggle/input")  # features spread across -1/-2/-3/-4 subdirs
 WORK      = Path("/kaggle/working")
 
 # ── 1. Clone latest code from GitHub ─────────────────────────────────────────
@@ -44,15 +44,22 @@ raw_link = data_dir / "raw"
 if not raw_link.exists():
     raw_link.symlink_to(RAW)
 
-# Features: symlink from pre-built dataset — stage 2 will be skipped
-feat_link = data_dir / "features"
-if not feat_link.exists():
-    if FEAT_IN.exists():
-        feat_link.symlink_to(FEAT_IN)
-        print(f"Features linked from dataset: {len(list(FEAT_IN.glob('*.parquet')))} files")
-    else:
-        feat_link.mkdir(exist_ok=True)
-        print("WARNING: crypto-model-features dataset not attached — stage 2 will run")
+# Features: collect parquets from all crypto-model-features-N datasets into one dir
+feat_dst = data_dir / "features"
+feat_dst.mkdir(exist_ok=True)
+_feat_count = 0
+for _batch_num in range(1, 5):
+    _batch_dir = Path(f"/kaggle/input/crypto-model-features-{_batch_num}")
+    if _batch_dir.exists():
+        for _pq in _batch_dir.glob("*.parquet"):
+            _link = feat_dst / _pq.name
+            if not _link.exists():
+                _link.symlink_to(_pq)
+                _feat_count += 1
+if _feat_count:
+    print(f"Features linked: {_feat_count} files from batch datasets")
+else:
+    print("WARNING: no crypto-model-features-N datasets found — stage 2 will run")
 
 # Checkpoints: dataset root IS the checkpoints dir (no subfolder)
 ckpt_dst = data_dir / "checkpoints"
@@ -113,7 +120,7 @@ def _run_stage(name, fn, *args, **kwargs):
         _tb.print_exc()
         _sys.exit(1)
 
-# Stage 2: skip if features dataset is attached (files already in data/features/)
+# Stage 2: skip if features already linked from batch datasets
 _feat_files = list((REPO / "data/features").glob("*.parquet"))
 if _feat_files:
     print(f"\n=== Stage 2: features SKIPPED ({len(_feat_files)} files from dataset) ===", flush=True)
