@@ -96,8 +96,9 @@ for batch_num in run_batches:
 
     # Upload: create new dataset or bump version if it already exists
     print(f"  Uploading to Kaggle as '{slug}'...")
+    # No --dir-mode zip: upload files individually so Kaggle serves them as plain parquets
     result = subprocess.run(
-        [kaggle, "datasets", "create", "-p", str(staging), "--dir-mode", "zip"],
+        [kaggle, "datasets", "create", "-p", str(staging)],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or "already exists" in (result.stderr + result.stdout):
