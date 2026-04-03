@@ -153,17 +153,19 @@ def apply_cross_sectional_ranks(panel_df: pd.DataFrame, stats_path: Path, featur
     with open(stats_path, "rb") as f:
         stats = pickle.load(f)
 
-    result = panel_df.copy()
+    new_cols = {}
     for col in feature_cols:
         if col not in stats or col not in panel_df.columns:
             continue
         s = stats[col]
         rng = s["max"] - s["min"]
         if rng < 1e-12:
-            result[f"{col}_rank"] = 0.5
+            new_cols[f"{col}_rank"] = 0.5
         else:
-            result[f"{col}_rank"] = (panel_df[col].clip(s["q01"], s["q99"]) - s["min"]) / rng
-    return result
+            new_cols[f"{col}_rank"] = (panel_df[col].clip(s["q01"], s["q99"]) - s["min"]) / rng
+    if new_cols:
+        return pd.concat([panel_df, pd.DataFrame(new_cols, index=panel_df.index)], axis=1)
+    return panel_df
 
 
 def compute_return_ranks(returns_panel: pd.DataFrame, windows: list = None, stats: dict = None) -> pd.DataFrame:

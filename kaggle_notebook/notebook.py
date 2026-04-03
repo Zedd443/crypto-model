@@ -80,28 +80,29 @@ from src.pipeline import (
 )
 
 import sys as _sys
+import traceback as _tb
+
 # Flush stdout after every write so Kaggle captures logs in real-time
 _sys.stdout.reconfigure(line_buffering=True)
 import logging as _logging
 _logging.basicConfig(stream=_sys.stdout, level=_logging.INFO, force=True)
 
-print("\n=== Stage 2: features ===")
-stage_02_features.run(cfg, force=False)  # skips if already in checkpoints
+def _run_stage(name, fn, *args, **kwargs):
+    print(f"\n=== {name} ===", flush=True)
+    try:
+        fn(*args, **kwargs)
+        print(f"=== {name} DONE ===", flush=True)
+    except Exception:
+        print(f"\n!!! {name} FAILED !!!", flush=True)
+        _tb.print_exc()
+        _sys.exit(1)
 
-print("\n=== Stage 3: labels ===")
-stage_03_labels.run(cfg)
-
-print("\n=== Stage 4: training (GPU) ===")
-stage_04_train.run(cfg)
-
-print("\n=== Stage 5: meta-labeling ===")
-stage_05_meta.run(cfg)
-
-print("\n=== Stage 6: portfolio ===")
-stage_06_portfolio.run(cfg)
-
-print("\n=== Stage 7: backtest ===")
-stage_07_backtest.run(cfg)
+_run_stage("Stage 2: features",      stage_02_features.run, cfg, force=False)
+_run_stage("Stage 3: labels",        stage_03_labels.run,   cfg)
+_run_stage("Stage 4: training (GPU)",stage_04_train.run,    cfg)
+_run_stage("Stage 5: meta-labeling", stage_05_meta.run,     cfg)
+_run_stage("Stage 6: portfolio",     stage_06_portfolio.run,cfg)
+_run_stage("Stage 7: backtest",      stage_07_backtest.run, cfg)
 
 # ── 7. Package output for download ───────────────────────────────────────────
 print("\n=== Packaging output ===")
