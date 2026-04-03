@@ -65,7 +65,8 @@ feat_dst.mkdir(exist_ok=True)
 
 _feat_count = 0
 for _batch_num in range(1, 5):
-    _batch_dir = Path(f"/kaggle/input/crypto-model-features-{_batch_num}")
+    # User datasets mount at /kaggle/input/datasets/{user}/{slug}
+    _batch_dir = Path(f"/kaggle/input/datasets/irfandragneel/crypto-model-features-{_batch_num}")
     print(f"  Batch {_batch_num}: exists={_batch_dir.exists()} path={_batch_dir}")
     if not _batch_dir.exists():
         continue
