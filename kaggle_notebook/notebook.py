@@ -79,6 +79,12 @@ from src.pipeline import (
     stage_07_backtest,
 )
 
+import sys as _sys
+# Flush stdout after every write so Kaggle captures logs in real-time
+_sys.stdout.reconfigure(line_buffering=True)
+import logging as _logging
+_logging.basicConfig(stream=_sys.stdout, level=_logging.INFO, force=True)
+
 print("\n=== Stage 2: features ===")
 stage_02_features.run(cfg, force=False)  # skips if already in checkpoints
 
