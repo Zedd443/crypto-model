@@ -1,3 +1,21 @@
+# Entry point for the crypto ML pipeline.
+# Run as module: python -m src.pipeline.run_pipeline [options]
+#
+# Examples:
+#   python -m src.pipeline.run_pipeline                        # run all stages 1-7
+#   python -m src.pipeline.run_pipeline --stage 2              # run stage 2 only (features)
+#   python -m src.pipeline.run_pipeline --stage 4 --force      # re-run training even if done
+#   python -m src.pipeline.run_pipeline --stage 4 --symbol BTCUSDT  # single symbol debug
+#
+# Stage map:
+#   1 ingest       — download OHLCV + on-chain + macro data from APIs
+#   2 features     — compute technical/regime/cross-sectional features per symbol
+#   3 labels       — triple-barrier labeling + sample weights
+#   4 training     — XGBoost primary model with Optuna tuning + feature selection
+#   5 meta_labeling— meta-labeler trained on OOF predictions (signal confidence)
+#   6 portfolio    — generate signals, position sizing, correlation filter
+#   7 backtest     — walk-forward backtest with realistic costs
+
 import argparse
 import sys
 from pathlib import Path
