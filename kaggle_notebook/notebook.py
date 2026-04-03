@@ -65,12 +65,17 @@ feat_dst.mkdir(exist_ok=True)
 _feat_count = 0
 for _batch_num in range(1, 5):
     _batch_dir = Path(f"/kaggle/input/crypto-model-features-{_batch_num}")
-    if _batch_dir.exists():
-        for _pq in _batch_dir.glob("*.parquet"):
-            _link = feat_dst / _pq.name
-            if not _link.exists():
-                _link.symlink_to(_pq)
-                _feat_count += 1
+    if not _batch_dir.exists():
+        print(f"  [debug] batch {_batch_num} dir not found: {_batch_dir}")
+        continue
+    # Kaggle sometimes nests files under a subdirectory matching the dataset slug
+    _all_pq = list(_batch_dir.rglob("*.parquet"))
+    print(f"  [debug] batch {_batch_num}: {len(_all_pq)} parquets found under {_batch_dir}")
+    for _pq in _all_pq:
+        _link = feat_dst / _pq.name
+        if not _link.exists():
+            _link.symlink_to(_pq)
+            _feat_count += 1
 if _feat_count:
     print(f"Mode A: {_feat_count} feature files linked from batch datasets — stage 2 will be skipped")
 else:
