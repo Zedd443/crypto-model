@@ -150,7 +150,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     )
 
     # Save combined results
-    combined_nav.to_parquet(results_dir / "portfolio_nav.parquet")
+    combined_nav.to_frame("nav").to_parquet(results_dir / "portfolio_nav.parquet")
     if len(combined_trades) > 0:
         combined_trades.to_csv(results_dir / "trade_log.csv", index=False)
 
