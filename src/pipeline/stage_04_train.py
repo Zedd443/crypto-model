@@ -37,13 +37,19 @@ def _assign_tier(metrics: dict, cfg) -> str:
     sharpe = metrics.get("synthetic_sharpe", 0.0)
     pbo = metrics.get("pbo", 1.0)
     dsr = metrics.get("dsr", 0.0)
+    fold_da_list = metrics.get("fold_da_list", [])
 
     tier_a_da = float(cfg.model.tier_A_da_min)
     tier_a_sharpe = float(cfg.model.tier_A_sharpe_wfo_min)
     tier_a_pbo = float(cfg.model.tier_A_pbo_max)
+    tier_a_da_min_folds = int(cfg.model.tier_A_da_min_folds)
     tier_b_da = float(cfg.model.tier_B_da_min)
 
-    if da >= tier_a_da and sharpe >= tier_a_sharpe and pbo <= tier_a_pbo:
+    # Count how many CV folds exceed the DA threshold
+    folds_above_da = sum(1 for fda in fold_da_list if fda >= tier_a_da)
+    passes_fold_da = (folds_above_da >= tier_a_da_min_folds) if fold_da_list else False
+
+    if da >= tier_a_da and sharpe >= tier_a_sharpe and pbo <= tier_a_pbo and passes_fold_da:
         return "A"
     elif da >= tier_b_da:
         return "B"
@@ -198,18 +204,46 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     except Exception:
         ic = 0.0
 
-    # Compute fold Sharpes from OOF predictions
+    # Class balance on train and val sets
+    pct_positive_train = float(y_train_binary.mean())
+    pct_positive_val = float(y_val_binary.mean())
+    logger.info(
+        f"  {symbol}: class balance — train_pos={pct_positive_train:.3f} "
+        f"val_pos={pct_positive_val:.3f}"
+    )
+
+    # Build a price-return series for train samples indexed identically to X_train_final
+    # label=+1 → tp_level (long trade hits TP), label=-1 → -sl_level (hits SL), label=0 → 0
+    # This gives the actual realized return per bar under the triple-barrier scheme
+    train_labels_for_sharpe = labels_aligned.loc[train_mask]
+    # Reindex to X_train_final.index — this drops warmup rows automatically since they were
+    # already filtered out of X_train before building X_train_final
+    train_labels_for_sharpe = train_labels_for_sharpe.reindex(X_train_final.index)
+    raw_label_col = train_labels_for_sharpe["label"].values
+    tp_col = train_labels_for_sharpe["tp_level"].fillna(0.0).values if "tp_level" in train_labels_for_sharpe.columns else np.zeros(len(X_train_final))
+    sl_col = train_labels_for_sharpe["sl_level"].fillna(0.0).values if "sl_level" in train_labels_for_sharpe.columns else np.zeros(len(X_train_final))
+    # Realized pct return: +tp_level for TP hit, -sl_level for SL hit, 0 for time barrier
+    price_returns = np.where(raw_label_col == 1, tp_col,
+                    np.where(raw_label_col == -1, -sl_col, 0.0))
+
+    # Compute fold Sharpes using actual price returns (not binary label proxies)
     fold_sharpes = []
+    fold_da_list = []
     for _, val_idx in splitter.split(X_train_final, y_train_binary):
         fold_proba = oof_proba[val_idx, 1]
         fold_y = y_train_binary.iloc[val_idx].values
-        positions = np.where(fold_proba > 0.5, 1.0, -1.0)
-        # Approximate returns from labels
-        fold_returns = positions * (fold_y * 2 - 1).astype(float)
-        std_ret = fold_returns.std()
-        if std_ret > 0:
-            sharpe = float(fold_returns.mean() / std_ret * np.sqrt(252 * 96))
+        fold_price_ret = price_returns[val_idx]
+        # Direction: go long when model says prob > 0.5, else flat (no forced short for binary model)
+        positions = np.where(fold_proba > 0.5, 1.0, 0.0)
+        # Only count bars where we have a position; return = position × realized_price_return
+        fold_returns = positions * fold_price_ret
+        # Use only active-position bars to avoid diluting Sharpe with flat periods
+        active = fold_returns[positions > 0]
+        if len(active) > 1 and active.std() > 1e-12:
+            sharpe = float(active.mean() / active.std() * np.sqrt(252 * 96))
             fold_sharpes.append(sharpe)
+        fold_da = float(np.mean((fold_proba > 0.5).astype(int) == fold_y)) if len(fold_y) > 0 else 0.0
+        fold_da_list.append(fold_da)
 
     pbo = compute_pbo(fold_sharpes)
     synthetic_sharpe = float(np.mean(fold_sharpes)) if fold_sharpes else 0.0
@@ -224,10 +258,16 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         "n_val_samples": len(X_val_final),
         "n_features": len(selected_features),
         "dsr": max(synthetic_sharpe - pbo, 0.0),  # simplified DSR proxy
+        "pct_positive_train": pct_positive_train,
+        "pct_positive_val": pct_positive_val,
+        "fold_da_list": fold_da_list,
     }
 
     tier = _assign_tier(metrics, cfg)
-    logger.info(f"  {symbol}: DA={da:.3f} Sharpe={synthetic_sharpe:.3f} PBO={pbo:.3f} Tier={tier}")
+    logger.info(
+        f"  {symbol}: DA={da:.3f} Sharpe={synthetic_sharpe:.3f} PBO={pbo:.3f} "
+        f"Tier={tier} folds_above_da={sum(1 for d in fold_da_list if d >= float(cfg.model.tier_A_da_min))}"
+    )
 
     # Step 8: SHAP importance
     try:
@@ -295,11 +335,13 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
             issues.append(f"{sym}: {str(err)[:200]}")
         else:
             update_completed_symbol("training", sym)
+            # Exclude fold_da_list (list type) from CSV — it's used only for tier assignment
+            csv_metrics = {k: v for k, v in result["metrics"].items() if k != "fold_da_list"}
             training_summary.append({
                 "symbol": sym,
                 "version": result["version"],
                 "tier": result["tier"],
-                **result["metrics"],
+                **csv_metrics,
             })
             logger.info(f"{sym}: training complete — Tier {result['tier']}")
 
