@@ -43,13 +43,14 @@ raw_link = data_dir / "raw"
 if not raw_link.exists():
     raw_link.symlink_to(RAW)
 
-# Checkpoints: copy to working dir so pipeline can write new files
+# Checkpoints: dataset root IS the checkpoints dir (no subfolder)
 ckpt_dst = data_dir / "checkpoints"
 if CKPT_IN.exists() and not ckpt_dst.exists():
-    shutil.copytree(CKPT_IN / "checkpoints", ckpt_dst, dirs_exist_ok=True)
+    shutil.copytree(CKPT_IN, ckpt_dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("dataset-metadata.json"))
 
 models_dst = REPO / "models"
 models_dst.mkdir(exist_ok=True)
+# models/ subfolder exists inside the dataset root
 if (CKPT_IN / "models").exists():
     shutil.copytree(CKPT_IN / "models", models_dst, dirs_exist_ok=True)
 
