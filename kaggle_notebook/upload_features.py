@@ -79,7 +79,7 @@ for batch_num in run_batches:
 
     # Copy files with per-file progress bar
     total_gb = sum(f.stat().st_size for f in batch) / 1024 ** 3
-    print(f"\nBatch {batch_num} — {len(batch)} files  {total_gb:.2f} GB  →  {staging}")
+    print(f"\nBatch {batch_num} -- {len(batch)} files  {total_gb:.2f} GB  ->  {staging}")
 
     total_bytes = sum(f.stat().st_size for f in batch)
     copied_bytes = 0
