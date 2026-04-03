@@ -191,6 +191,8 @@ def build_technical_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     lags = list(cfg.features.lag_periods)
     daily_bars = int(cfg.features.rv_daily_bars)
 
+    # shift(1) uses previous bar close — backward-looking; the global shift(1) in
+    # feature_pipeline.py pushes this further so feature at t = log(close_{t-1}/close_{t-2})
     log_ret = np.log(close / close.shift(1)).rename("log_return")
 
     parts = [log_ret.to_frame()]
