@@ -66,16 +66,31 @@ feat_dst.mkdir(exist_ok=True)
 _feat_count = 0
 for _batch_num in range(1, 5):
     _batch_dir = Path(f"/kaggle/input/crypto-model-features-{_batch_num}")
+    print(f"  Batch {_batch_num}: exists={_batch_dir.exists()} path={_batch_dir}")
     if not _batch_dir.exists():
         continue
-    for _pq in _batch_dir.glob("*.parquet"):
+    _pq_list = list(_batch_dir.glob("*.parquet"))
+    print(f"  Batch {_batch_num}: {len(_pq_list)} parquets found")
+    if _pq_list:
+        print(f"    sample: {[p.name for p in _pq_list[:3]]}")
+    for _pq in _pq_list:
         _link = feat_dst / _pq.name
         if not _link.exists():
             _link.symlink_to(_pq)
             _feat_count += 1
 
+print(f"Feature scan complete: _feat_count={_feat_count}")
 if _feat_count:
     print(f"Mode A: {_feat_count} feature files linked — stage 2 will be skipped")
+    # Sanity-read first 5 rows of first linked parquet to confirm readability
+    import pandas as _pd
+    _first_pq = next(feat_dst.glob("*.parquet"))
+    try:
+        _sample = _pd.read_parquet(_first_pq)
+        print(f"  Sample file: {_first_pq.name}  shape={_sample.shape}")
+        print(_sample.head(5).to_string())
+    except Exception as _e:
+        print(f"  WARNING: could not read sample parquet: {_e}")
 else:
     print("Mode B: no feature datasets attached — stage 2 will generate features from raw data")
 
