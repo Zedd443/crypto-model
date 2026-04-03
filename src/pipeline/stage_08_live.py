@@ -6,6 +6,13 @@ import numpy as np
 import pandas as pd
 import yaml
 
+# Load .env before any Binance client is instantiated so API keys are in os.environ
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass  # python-dotenv not installed — keys must be set in environment manually
+
 from src.execution.binance_client import BinanceClient
 from src.execution.live_features import compute_live_features, get_lookback_bars_needed
 from src.execution.order_manager import OrderManager
@@ -128,10 +135,12 @@ def run(cfg, **kwargs) -> None:
         while True:
             wait = _seconds_until_next_bar() + _BAR_CLOSE_BUFFER
             logger.info(f"Sleeping {wait:.1f}s until next bar + buffer...")
+            # Heartbeat before sleep so DMS doesn't fire during the bar-wait period
+            order_manager.heartbeat()
             time.sleep(wait)
+            order_manager.heartbeat()  # reset again right after waking
 
             bar_start = datetime.now(timezone.utc)
-            order_manager.heartbeat()
 
             state = load_state()
             active_symbols = _get_active_symbols(cfg, state, all_symbols)

@@ -12,8 +12,8 @@ logger = get_logger("live_features")
 
 
 def get_lookback_bars_needed(cfg) -> int:
-    # Extra 200 bars ensures rolling indicators (longest window=200) have enough history
-    return int(cfg.features.warmup_bars) + 200
+    # Cap at 1500 — Binance FAPI hard limit for klines endpoint
+    return min(int(cfg.features.warmup_bars) + 200, 1500)
 
 
 def compute_live_features(symbol: str, cfg, lookback_df: pd.DataFrame) -> pd.Series:
