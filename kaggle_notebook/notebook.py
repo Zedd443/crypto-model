@@ -57,6 +57,11 @@ if (CKPT_IN / "models").exists():
 if (CKPT_IN / "model_registry.json").exists():
     shutil.copy(CKPT_IN / "model_registry.json", REPO / "model_registry.json")
 
+# Restore project_state.json from checkpoints so pipeline can resume prior run
+if (CKPT_IN / "project_state.json").exists():
+    shutil.copy(CKPT_IN / "project_state.json", REPO / "project_state.json")
+    print("Restored project_state.json from checkpoints — pipeline will skip completed stages")
+
 # Create dirs pipeline needs
 for d in ["data/features", "data/processed", "data/labels", "results", "logs", "monitoring"]:
     (REPO / d).mkdir(parents=True, exist_ok=True)
