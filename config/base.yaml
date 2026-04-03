@@ -138,7 +138,7 @@ backtest:
   slippage_pct: 0.002
   commission_pct: 0.001
   delisted_slippage_mult: 2.0
-  daily_halt_dd_pct: 0.015
+  daily_halt_dd_pct: 0.15
   ath_pause_dd_pct: 0.10
   ath_pause_hours: 48
   daily_profit_target_pct: 0.02
