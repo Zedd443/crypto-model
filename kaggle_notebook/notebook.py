@@ -1,7 +1,21 @@
 """
-crypto-model Kaggle training script
-Stage 2 (features) is skipped — pre-built feature files are loaded from
-the crypto-model-features dataset. Stages 3-7 run on GPU.
+crypto-model Kaggle training script — GPU training on Kaggle T4/P100.
+
+Stage 2 (feature generation) has 3 modes, detected automatically:
+
+  Mode A — pre-built features uploaded as batch datasets (FASTEST, ~1h total)
+            Attach: crypto-model-features-1, -2, -3, -4
+            Stage 2 is SKIPPED, all 59 parquets symlinked from datasets.
+
+  Mode B — features not attached, raw data available (SLOW, ~3-4h total)
+            Attach: crypto-model-raw-data only (no feature datasets)
+            Stage 2 runs and generates features from scratch on CPU.
+
+  Mode C — local stage 2 already done, upload data/features/ as batch datasets
+            Run locally: python kaggle_notebook/upload_features.py
+            Then re-run notebook → auto-detected as Mode A.
+
+Stages 3-7 always run on GPU (XGB_DEVICE=cuda).
 """
 import os
 import sys
@@ -44,7 +58,8 @@ raw_link = data_dir / "raw"
 if not raw_link.exists():
     raw_link.symlink_to(RAW)
 
-# Features: collect parquets from all crypto-model-features-N datasets into one dir
+# Mode A: symlink pre-built feature parquets from batch datasets (-1 to -4)
+# Mode B/C: feat_dst will be empty → stage 2 runs below and fills it
 feat_dst = data_dir / "features"
 feat_dst.mkdir(exist_ok=True)
 _feat_count = 0
@@ -57,9 +72,9 @@ for _batch_num in range(1, 5):
                 _link.symlink_to(_pq)
                 _feat_count += 1
 if _feat_count:
-    print(f"Features linked: {_feat_count} files from batch datasets")
+    print(f"Mode A: {_feat_count} feature files linked from batch datasets — stage 2 will be skipped")
 else:
-    print("WARNING: no crypto-model-features-N datasets found — stage 2 will run")
+    print("Mode B: no feature datasets attached — stage 2 will generate features from raw data")
 
 # Checkpoints: dataset root IS the checkpoints dir (no subfolder)
 ckpt_dst = data_dir / "checkpoints"
@@ -120,12 +135,12 @@ def _run_stage(name, fn, *args, **kwargs):
         _tb.print_exc()
         _sys.exit(1)
 
-# Stage 2: skip if features already linked from batch datasets
+# Stage 2: Mode A → skip (features already linked), Mode B → generate from raw
 _feat_files = list((REPO / "data/features").glob("*.parquet"))
 if _feat_files:
-    print(f"\n=== Stage 2: features SKIPPED ({len(_feat_files)} files from dataset) ===", flush=True)
+    print(f"\n=== Stage 2: SKIPPED — {len(_feat_files)} feature files ready (Mode A) ===", flush=True)
 else:
-    _run_stage("Stage 2: features", stage_02_features.run, cfg, force=False)
+    _run_stage("Stage 2: features (Mode B — generating from raw)", stage_02_features.run, cfg, force=False)
 _run_stage("Stage 3: labels",        stage_03_labels.run,   cfg)
 _run_stage("Stage 4: training (GPU)",stage_04_train.run,    cfg)
 _run_stage("Stage 5: meta-labeling", stage_05_meta.run,     cfg)
