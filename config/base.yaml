@@ -1,219 +1,219 @@
 data:
-  raw_dir: "data/raw"
-  processed_dir: "data/processed"
-  features_dir: "data/features"
-  labels_dir: "data/labels"
-  models_dir: "models"
-  results_dir: "results"
-  monitoring_dir: "monitoring"
-  checkpoints_dir: "data/checkpoints"
-  timeframes: ["15m", "1h", "4h", "1d"]
-  primary_timeframe: "15m"
-  train_end: "2024-06-30"
-  val_start: "2024-07-01"
-  val_end: "2024-09-30"
-  test_start: "2024-10-01"
-  min_history_bars: 5000
-  min_align_bars: 200
+  raw_dir: "data/raw"                          # downloaded OHLCV parquets from Binance
+  processed_dir: "data/processed"              # aligned multi-timeframe data
+  features_dir: "data/features"                # engineered feature parquets (per symbol)
+  labels_dir: "data/labels"                    # triple-barrier label parquets
+  models_dir: "models"                         # trained XGBoost + meta-labeler files
+  results_dir: "results"                       # backtest NAV curves and trade logs
+  monitoring_dir: "monitoring"                 # drift reports and model health checks
+  checkpoints_dir: "data/checkpoints"          # scalers, imputers, HMM states, XS stats
+  timeframes: ["15m", "1h", "4h", "1d"]        # timeframes fetched and aligned per symbol
+  primary_timeframe: "15m"                     # timeframe used for model training and signals
+  train_end: "2024-06-30"                      # last date of training set (inclusive)
+  val_start: "2024-07-01"                      # validation set start (hyperparameter selection)
+  val_end: "2024-09-30"                        # validation set end
+  test_start: "2024-10-01"                     # held-out test set start (never touched during tuning)
+  min_history_bars: 5000                       # minimum bars required to include a symbol
+  min_align_bars: 200                          # minimum overlapping bars across timeframes
 
 features:
-  warmup_bars: 2000
-  lookback_windows: [5, 10, 20, 50, 100, 200]
-  lag_periods: [1, 2, 3, 5, 10, 20]
-  ofi_window: 20
-  amihud_window: 20
-  kyle_window: 20
-  rv_daily_bars: 96
-  rv_weekly_days: 5
-  rv_monthly_days: 22
-  vwap_window: 20
-  spread_window: 20
-  funding_zscore_window: 672
-  funding_percentile_window: 2880
-  btc_corr_window: 20
-  granger_window: 20
-  perm_entropy_window: 100
-  btc_nvt_window: 90
-  vix_zscore_days: 60
-  use_chronos: false
-  fracdiff_threshold: 0.01
-  fracdiff_d_step: 0.1
-  htf_ffill_limits:
-    "1h": 4
-    "4h": 16
-    "1d": 96
+  warmup_bars: 2000                            # bars discarded at start to let indicators stabilise
+  lookback_windows: [5, 10, 20, 50, 100, 200]  # rolling window sizes for momentum/vol features
+  lag_periods: [1, 2, 3, 5, 10, 20]           # return lag periods added as features
+  ofi_window: 20                               # order flow imbalance rolling window (bars)
+  amihud_window: 20                            # Amihud illiquidity ratio window (bars)
+  kyle_window: 20                              # Kyle lambda price-impact window (bars)
+  rv_daily_bars: 96                            # bars in one trading day (96 × 15m = 24h)
+  rv_weekly_days: 5                            # trading days in one week for weekly RV
+  rv_monthly_days: 22                          # trading days in one month for monthly RV
+  vwap_window: 20                              # VWAP deviation rolling window (bars)
+  spread_window: 20                            # bid-ask spread proxy rolling window (bars)
+  funding_zscore_window: 672                   # funding rate z-score window (~7 days of 15m bars)
+  funding_percentile_window: 2880              # funding percentile rank window (~30 days)
+  btc_corr_window: 20                          # rolling BTC correlation window (bars)
+  granger_window: 20                           # Granger causality test window (bars)
+  perm_entropy_window: 100                     # permutation entropy window — measures randomness
+  btc_nvt_window: 90                           # BTC NVT ratio smoothing window (days)
+  vix_zscore_days: 60                          # VIX z-score lookback window (days)
+  use_chronos: false                           # enable Amazon Chronos time-series embeddings (slow)
+  fracdiff_threshold: 0.01                     # ADF p-value threshold for fractional differencing
+  fracdiff_d_step: 0.1                         # step size when searching for minimum d
+  htf_ffill_limits:                            # max bars to forward-fill higher-timeframe features
+    "1h": 4                                    # 1h feature stale after 4 × 15m bars
+    "4h": 16                                   # 4h feature stale after 16 × 15m bars
+    "1d": 96                                   # 1d feature stale after 96 × 15m bars
 
 labels:
-  tp_atr_mult: 2.5
-  sl_atr_mult: 1.5
-  tp_min_pct: 0.015
-  tp_max_pct: 0.06
-  sl_min_pct: 0.01
-  sl_max_pct: 0.05
-  vol_lookback: 20
-  max_hold_bars: 16
-  h1_rolling_median_window: 480
-  weight_clip_min: 0.1
-  weight_clip_max: 3.0
-  dead_zone_cost_multiple: 0.5
+  tp_atr_mult: 2.5                             # take-profit = ATR × 2.5 (risk-reward numerator)
+  sl_atr_mult: 1.5                             # stop-loss = ATR × 1.5 (risk-reward denominator)
+  tp_min_pct: 0.015                            # minimum take-profit distance (1.5% of price)
+  tp_max_pct: 0.06                             # maximum take-profit distance (6% of price)
+  sl_min_pct: 0.01                             # minimum stop-loss distance (1%)
+  sl_max_pct: 0.05                             # maximum stop-loss distance (5%)
+  vol_lookback: 20                             # ATR lookback window for barrier sizing
+  max_hold_bars: 16                            # time barrier — exit after 16 bars (4h) if no hit
+  h1_rolling_median_window: 480                # 1h volume median window for liquidity filter
+  weight_clip_min: 0.1                         # minimum sample weight after clipping
+  weight_clip_max: 3.0                         # maximum sample weight after clipping
+  dead_zone_cost_multiple: 0.5                 # penalty weight for dead-zone (no-trade) labels
 
 regime:
-  n_states: 4
-  hmm_covariance_type: "full"
-  hmm_n_iter: 100
-  hmm_retrain_hours: 24
-  hmm_burnin_bars: 100
-  bocpd_min_size: 50
-  bocpd_penalty: "bic"
+  n_states: 4                                  # HMM states: low_vol_range, high_vol_range, trending, crisis
+  hmm_covariance_type: "full"                  # full covariance matrix per HMM state
+  hmm_n_iter: 100                              # EM iterations for HMM fitting
+  hmm_retrain_hours: 24                        # retrain HMM every 24h in live mode
+  hmm_burnin_bars: 100                         # bars discarded before HMM state assignment
+  bocpd_min_size: 50                           # minimum segment size for BOCPD changepoint detection
+  bocpd_penalty: "bic"                         # model selection penalty for BOCPD (BIC/AIC)
 
 model:
-  xgb_device: "cpu"  # override to "cuda" on Kaggle GPU or set env XGB_DEVICE=cuda
-  xgb_n_estimators: 500
-  xgb_max_depth: 6
-  xgb_learning_rate: 0.05
-  xgb_subsample: 0.8
-  xgb_colsample_bytree: 0.8
-  xgb_min_child_weight: 10
-  xgb_reg_alpha: 0.1
-  xgb_reg_lambda: 1.0
-  xgb_gamma: 0.1
-  xgb_early_stopping_rounds: 50
-  cv_n_splits: 8
-  embargo_pct: 0.01
-  embargo_bars_min: 50
-  optuna_n_trials: 50
-  optuna_n_trials_wfo: 25
-  optuna_patience: 20
-  objective_da_weight: 0.4
-  objective_ic_weight: 0.3
-  objective_sharpe_weight: 0.3
-  stability_threshold: 0.6
-  stability_n_bootstrap: 50
-  variance_threshold: 1.0e-6
-  permutation_importance_top_k: 80
-  shap_top_k: 70
-  importance_stability_spearman_min: 0.6
-  staleness_decay_days: 30
-  staleness_exclude_threshold: 0.3
-  calibration_method: "isotonic"
-  conformal_q_level: 0.90
-  conformal_width_full: 0.20
-  conformal_width_60pct: 0.40
-  meta_n_estimators: 200
-  meta_max_depth: 4
-  meta_signal_floor: 0.55
-  tier_A_da_min: 0.53
-  tier_A_da_min_folds: 6
-  tier_A_dsr_min: 0.0
-  tier_A_pbo_max: 0.40
-  tier_A_sharpe_wfo_min: 0.5
-  tier_A_adversarial_auc_max: 0.60
-  tier_A_leverage_default: 2
-  tier_A_leverage_max: 3
-  tier_B_da_min: 0.51
-  tier_B_leverage_max: 1
-  fdr_alpha: 0.05
+  xgb_device: "cpu"                            # override to "cuda" on Kaggle GPU or set env XGB_DEVICE=cuda
+  xgb_n_estimators: 500                        # default tree count (Optuna may override)
+  xgb_max_depth: 6                             # default max tree depth
+  xgb_learning_rate: 0.05                      # default shrinkage rate
+  xgb_subsample: 0.8                           # row subsampling ratio per tree
+  xgb_colsample_bytree: 0.8                    # feature subsampling ratio per tree
+  xgb_min_child_weight: 10                     # minimum sum of sample weights in a leaf
+  xgb_reg_alpha: 0.1                           # L1 regularisation (feature sparsity)
+  xgb_reg_lambda: 1.0                          # L2 regularisation (weight shrinkage)
+  xgb_gamma: 0.1                               # minimum loss reduction to make a split
+  xgb_early_stopping_rounds: 50               # stop if no improvement for 50 rounds
+  cv_n_splits: 8                               # number of purged time-series CV folds
+  embargo_pct: 0.01                            # fraction of data embargoed between train/val folds
+  embargo_bars_min: 50                         # minimum embargo gap in bars regardless of pct
+  optuna_n_trials: 50                          # hyperparameter search trials per symbol
+  optuna_n_trials_wfo: 25                      # trials for walk-forward optimisation
+  optuna_patience: 20                          # early-stop Optuna if no improvement after N trials
+  objective_da_weight: 0.4                     # weight of directional accuracy in Optuna objective
+  objective_ic_weight: 0.3                     # weight of information coefficient in objective
+  objective_sharpe_weight: 0.3                 # weight of Sharpe ratio in objective
+  stability_threshold: 0.6                     # minimum selection frequency for stability selection
+  stability_n_bootstrap: 50                    # bootstrap iterations for stability selection
+  variance_threshold: 1.0e-6                   # drop features with variance below this
+  permutation_importance_top_k: 80            # keep top-k features by permutation importance
+  shap_top_k: 70                               # keep top-k features by SHAP importance
+  importance_stability_spearman_min: 0.6       # min Spearman correlation of feature ranks across folds
+  staleness_decay_days: 30                     # decay window for feature importance staleness check
+  staleness_exclude_threshold: 0.3            # exclude feature if staleness score exceeds this
+  calibration_method: "isotonic"               # probability calibration method (isotonic / sigmoid)
+  conformal_q_level: 0.90                      # conformal prediction quantile level
+  conformal_width_full: 0.20                   # prediction interval width below this → full position size
+  conformal_width_60pct: 0.40                  # width between 0.20–0.40 → 60% position size (above → 30%)
+  meta_n_estimators: 200                       # meta-labeler tree count
+  meta_max_depth: 4                            # meta-labeler max depth (shallow to avoid overfit)
+  meta_signal_floor: 0.55                      # minimum meta-prob to pass a signal
+  tier_A_da_min: 0.53                          # tier A: minimum directional accuracy on validation
+  tier_A_da_min_folds: 6                       # tier A: DA threshold must hold in at least N folds
+  tier_A_dsr_min: 0.0                          # tier A: minimum deflated Sharpe ratio
+  tier_A_pbo_max: 0.40                         # tier A: maximum probability of backtest overfitting
+  tier_A_sharpe_wfo_min: 0.5                   # tier A: minimum Sharpe on walk-forward windows
+  tier_A_adversarial_auc_max: 0.60             # tier A: adversarial AUC must be below this (no drift)
+  tier_A_leverage_default: 2                   # tier A default leverage
+  tier_A_leverage_max: 3                       # tier A maximum leverage
+  tier_B_da_min: 0.51                          # tier B: minimum directional accuracy (lower bar)
+  tier_B_leverage_max: 1                       # tier B: no leverage (1× only)
+  fdr_alpha: 0.05                              # false discovery rate threshold for feature selection
 
 portfolio:
-  signal_floor_prob: 0.55
-  max_position_size: 0.10
-  max_total_margin_pct: 0.80
-  kelly_fraction: 0.5
-  cvar_confidence_levels: [0.95, 0.99]
-  cvar_lambda_penalty: 0.5
-  dcc_fallback_ewm_span: 60
-  correlation_reduce_threshold: 0.85
-  correlation_skip_threshold: 0.95
-  correlation_reduce_pct: 0.30
-  stress_test_max_dd: 0.03
-  max_turnover: 0.30
-  rebalance_trigger_regime_change: true
+  signal_floor_prob: 0.55                      # minimum signal_strength to enter a trade
+  max_position_size: 0.10                      # maximum single position as fraction of equity
+  max_total_margin_pct: 0.80                   # maximum total margin deployed (80% of equity)
+  kelly_fraction: 0.5                          # half-Kelly sizing fraction
+  cvar_confidence_levels: [0.95, 0.99]         # CVaR confidence levels for tail risk estimation
+  cvar_lambda_penalty: 0.5                     # CVaR penalty weight in position sizing
+  dcc_fallback_ewm_span: 60                    # EWM span for correlation when DCC-GARCH unavailable
+  correlation_reduce_threshold: 0.85           # reduce second position size if correlation exceeds this
+  correlation_skip_threshold: 0.95             # skip entry entirely if correlation exceeds this
+  correlation_reduce_pct: 0.30                 # reduce correlated position by this fraction
+  stress_test_max_dd: 0.03                     # reject position if stress-test drawdown exceeds 3%
+  max_turnover: 0.30                           # maximum portfolio turnover per rebalance (30%)
+  rebalance_trigger_regime_change: true        # force rebalance when HMM regime shifts
 
 backtest:
-  train_pct: 0.70
-  val_pct: 0.15
-  test_pct: 0.15
-  wfo_train_ratio: 0.70
-  wfo_min_windows: 5
-  slippage_pct: 0.002
-  commission_pct: 0.001
-  delisted_slippage_mult: 2.0
-  daily_halt_dd_pct: 0.15
-  ath_pause_dd_pct: 0.10
-  ath_pause_hours: 48
-  daily_profit_target_pct: 0.02
-  spread_guard_natr_mult: 0.20
-  limit_requote_seconds: 15
-  limit_skip_seconds: 30
-  partial_fill_min_ratio: 0.90
-  sl_atr_mult: 1.5
-  tp_atr_mult: 2.5
-  trailing_trigger_pct: 0.005
-  trailing_atr_mult: 1.0
-  funding_skip_net_pnl_threshold: 0.003
-  funding_projected_close_threshold: 0.0005
-  min_notional_buffer_mult: 1.5
-  below_notional_skip_threshold: 0.30
-  liquidity_adv_threshold_usd: 10000000
-  order_book_levels: 5
-  max_size_liquidity_pct: 0.10
-  large_cap_symbols: ["BTCUSDT", "SOLUSDT", "AVAXUSDT", "LINKUSDT", "UNIUSDT"]
-  attribution_trigger_tier_a: 100
-  attribution_trigger_tier_b: 50
-  attribution_trigger_global: 300
-  sqrt_impact_coef: 0.1
+  train_pct: 0.70                              # training set fraction of total data
+  val_pct: 0.15                                # validation set fraction
+  test_pct: 0.15                               # held-out test set fraction
+  wfo_train_ratio: 0.70                        # walk-forward train window as fraction of expanding window
+  wfo_min_windows: 5                           # minimum walk-forward windows required
+  slippage_pct: 0.002                          # assumed market impact slippage (0.2% per fill)
+  commission_pct: 0.001                        # Binance FAPI taker fee (0.1%)
+  delisted_slippage_mult: 2.0                  # extra slippage multiplier for delisted coins
+  daily_halt_dd_pct: 0.15                      # halt all trading if daily drawdown exceeds 15%
+  ath_pause_dd_pct: 0.10                       # pause trading if equity drops 10% from all-time high
+  ath_pause_hours: 48                          # resume trading after ATH pause once N hours pass
+  daily_profit_target_pct: 0.02               # stop taking new trades if daily profit exceeds 2%
+  spread_guard_natr_mult: 0.20                 # skip entry if spread > 20% of normalised ATR
+  limit_requote_seconds: 15                    # wait N seconds before requoting a stale limit order
+  limit_skip_seconds: 30                       # cancel limit order and skip if unfilled after N seconds
+  partial_fill_min_ratio: 0.90                 # accept partial fill only if at least 90% filled
+  sl_atr_mult: 1.5                             # stop-loss distance in ATR multiples (backtest)
+  tp_atr_mult: 2.5                             # take-profit distance in ATR multiples (backtest)
+  trailing_trigger_pct: 0.005                  # activate trailing stop after 0.5% favourable move
+  trailing_atr_mult: 1.0                       # trailing stop distance in ATR multiples
+  funding_skip_net_pnl_threshold: 0.003        # skip entry if projected funding cost exceeds net PnL
+  funding_projected_close_threshold: 0.0005    # close position early if funding eats this much equity
+  min_notional_buffer_mult: 1.5                # require 1.5× minimum notional in margin buffer
+  below_notional_skip_threshold: 0.30          # skip if position size is below 30% of min notional
+  liquidity_adv_threshold_usd: 10000000        # minimum 30-day average daily volume in USD
+  order_book_levels: 5                         # order book depth levels used for liquidity check
+  max_size_liquidity_pct: 0.10                 # max position size as fraction of order book depth
+  large_cap_symbols: ["BTCUSDT", "SOLUSDT", "AVAXUSDT", "LINKUSDT", "UNIUSDT"]  # relaxed liquidity rules
+  attribution_trigger_tier_a: 100             # run PnL attribution after N trades (tier A)
+  attribution_trigger_tier_b: 50              # run PnL attribution after N trades (tier B)
+  attribution_trigger_global: 300             # run global attribution after N total trades
+  sqrt_impact_coef: 0.1                        # square-root market impact coefficient
 
 growth_gate:
-  threshold: 300.0
-  demo_trades_required: 500
-  tiers:
-    - max_equity: 150
-      max_symbols: 1
-      leverage_a_max: 2
-    - max_equity: 300
-      max_symbols: 3
+  threshold: 300.0                             # equity target to unlock multi-symbol live trading
+  demo_trades_required: 500                    # minimum demo trades before mainnet is allowed
+  tiers:                                       # symbol and leverage limits per equity tier
+    - max_equity: 150                          # tier 1: equity ≤ $150
+      max_symbols: 1                           # trade 1 symbol only
+      leverage_a_max: 2                        # tier A models: up to 2× leverage
+    - max_equity: 300                          # tier 2: equity ≤ $300
+      max_symbols: 3                           # trade up to 3 symbols
+      leverage_a_max: 3                        # tier A models: up to 3× leverage
+    - max_equity: 600                          # tier 3: equity ≤ $600
+      max_symbols: 6                           # trade up to 6 symbols
       leverage_a_max: 3
-    - max_equity: 600
-      max_symbols: 6
-      leverage_a_max: 3
-      leverage_b_max: 1
+      leverage_b_max: 1                        # tier B models: 1× leverage only
 
 monitoring:
-  psi_minor_threshold: 0.10
-  psi_major_threshold: 0.20
-  psi_retrain_feature_count: 10
-  degradation_reduce_std: 2
-  degradation_pause_std: 3
-  adversarial_check_days: 30
-  adversarial_retrain_auc: 0.65
-  retrain_schedule_days: 30
-  rolling_win_rate_window: 20
-  model_weight_decay_days: 30
-  model_stale_threshold: 0.3
+  psi_minor_threshold: 0.10                   # PSI above this → log warning (minor drift)
+  psi_major_threshold: 0.20                   # PSI above this → trigger retraining (major drift)
+  psi_retrain_feature_count: 10              # retrain if more than N features show major drift
+  degradation_reduce_std: 2                   # reduce position size if DA drops 2 std below baseline
+  degradation_pause_std: 3                    # pause trading if DA drops 3 std below baseline
+  adversarial_check_days: 30                  # rolling window for adversarial train/val discrimination
+  adversarial_retrain_auc: 0.65              # retrain if adversarial AUC exceeds this (feature drift)
+  retrain_schedule_days: 30                   # scheduled full retrain interval (days)
+  rolling_win_rate_window: 20                 # live win rate rolling window (number of trades)
+  model_weight_decay_days: 30                 # decay window for model importance weighting
+  model_stale_threshold: 0.3                  # flag model as stale if weight decays below this
 
 trading:
-  mode: "DEMO"
+  mode: "DEMO"                                 # active trading mode: DEMO / TESTNET / MAINNET
   endpoints:
-    DEMO: "https://demo-fapi.binance.com"
-    TESTNET: "https://testnet.binancefuture.com"
-    MAINNET: "https://fapi.binance.com"
-  websocket_ping_interval: 30
-  websocket_reconnect_delay: 5
-  rate_limit_backoff_base: 2
-  rate_limit_backoff_max: 60
+    DEMO: "https://demo-fapi.binance.com"      # Binance paper trading FAPI (no real money)
+    TESTNET: "https://testnet.binancefuture.com" # Binance futures testnet
+    MAINNET: "https://fapi.binance.com"        # Binance live futures API
+  websocket_ping_interval: 30                  # WebSocket keepalive ping interval (seconds)
+  websocket_reconnect_delay: 5                 # seconds to wait before reconnecting a dropped WS
+  rate_limit_backoff_base: 2                   # exponential backoff base (seconds) on 429 errors
+  rate_limit_backoff_max: 60                   # maximum backoff wait (seconds)
   memecoin_symbols: ["TRUMPUSDT", "1000BONKUSDT", "WIFUSDT", "PNUTUSDT", "PENGUUSDT", "1000FLOKIUSDT"]
-  memecoin_demo_trades_required: 200
-  memecoin_sharpe_required: 0.3
-  dead_man_switch_seconds: 60
+  memecoin_demo_trades_required: 200           # minimum demo trades before trading memecoins
+  memecoin_sharpe_required: 0.3               # minimum backtest Sharpe to trade a memecoin
+  dead_man_switch_seconds: 60                  # cancel all orders if main loop silent for 60s
 
 macro:
-  release_lags:
+  release_lags:                                # publication delay per macro indicator (forward-fill safe)
     oecd_unemployment:
-      lag_days: 45
+      lag_days: 45                             # OECD unemployment published ~45 days after reference month
       skip_days: 14
       safety_buffer_days: 14
     oecd_cpi:
-      lag_days: 30
+      lag_days: 30                             # CPI published ~30 days after reference month
       skip_days: 7
       safety_buffer_days: 14
     oecd_industrial_prod:
@@ -221,7 +221,7 @@ macro:
       skip_days: 14
       safety_buffer_days: 14
     macro_bond_10y:
-      lag_days: 0
+      lag_days: 0                              # daily market data — no publication lag
     macro_vix:
       lag_days: 0
     macro_sp500:
@@ -229,7 +229,7 @@ macro:
     macro_usd_index:
       lag_days: 0
     macro_inflation_cpi:
-      lag_days: 1
+      lag_days: 1                              # 1-day lag to avoid same-day lookahead
     macro_unemployment:
       lag_days: 45
     macro_euro:
@@ -243,7 +243,7 @@ macro:
     market_dji:
       lag_days: 0
     market_nikkei:
-      lag_days: 1
+      lag_days: 1                              # 1-day lag due to timezone difference
     market_ftse100:
       lag_days: 1
     market_kospi:
@@ -255,17 +255,17 @@ macro:
     market_commodity:
       lag_days: 1
     fear_greed:
-      lag_days: 0
+      lag_days: 0                              # Alternative.me fear & greed — same-day available
 
 adversarial:
-  valid_auc_max: 0.55
-  warn_auc_max: 0.70
-  n_estimators: 100
-  max_depth: 4
+  valid_auc_max: 0.55                          # AUC below this → no drift detected (pass)
+  warn_auc_max: 0.70                           # AUC above this → drift warning logged
+  n_estimators: 100                            # adversarial classifier tree count
+  max_depth: 4                                 # shallow tree to detect covariate shift only
 
 ab_testing:
-  sprt_alpha: 0.05
-  sprt_beta: 0.20
-  h0_da: 0.51
-  h1_da: 0.53
-  shadow_min_trades: 50
+  sprt_alpha: 0.05                             # SPRT type-I error rate (false positive threshold)
+  sprt_beta: 0.20                              # SPRT type-II error rate (false negative threshold)
+  h0_da: 0.51                                  # null hypothesis directional accuracy (baseline)
+  h1_da: 0.53                                  # alternative hypothesis DA (meaningful improvement)
+  shadow_min_trades: 50                        # minimum shadow trades before SPRT decision
