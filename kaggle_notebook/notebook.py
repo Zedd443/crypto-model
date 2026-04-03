@@ -59,42 +59,25 @@ if not raw_link.exists():
     raw_link.symlink_to(RAW)
 
 # Mode A: symlink pre-built feature parquets from batch datasets (-1 to -4)
-# Mode B/C: feat_dst will be empty → stage 2 runs below and fills it
+# Mode B: no datasets attached → stage 2 generates features from raw data
 feat_dst = data_dir / "features"
 feat_dst.mkdir(exist_ok=True)
-import zipfile as _zipfile
 
 _feat_count = 0
 for _batch_num in range(1, 5):
     _batch_dir = Path(f"/kaggle/input/crypto-model-features-{_batch_num}")
     if not _batch_dir.exists():
         continue
-
-    # Datasets uploaded with --dir-mode zip arrive as a single zip archive
-    _zips = list(_batch_dir.glob("*.zip"))
-    if _zips:
-        _extract_dir = feat_dst / f"_batch_{_batch_num}"
-        _extract_dir.mkdir(exist_ok=True)
-        for _z in _zips:
-            print(f"  Extracting {_z.name} ({_z.stat().st_size//1024//1024}MB)...")
-            with _zipfile.ZipFile(_z) as _zf:
-                _zf.extractall(_extract_dir)
-        _all_pq = list(_extract_dir.rglob("*.parquet"))
-    else:
-        # Files uploaded directly (no zip)
-        _all_pq = list(_batch_dir.rglob("*.parquet"))
-
-    print(f"  Batch {_batch_num}: {len(_all_pq)} parquets")
-    for _pq in _all_pq:
+    for _pq in _batch_dir.glob("*.parquet"):
         _link = feat_dst / _pq.name
         if not _link.exists():
             _link.symlink_to(_pq)
             _feat_count += 1
 
 if _feat_count:
-    print(f"Mode A: {_feat_count} feature files ready — stage 2 will be skipped")
+    print(f"Mode A: {_feat_count} feature files linked — stage 2 will be skipped")
 else:
-    print("Mode B: no feature datasets found — stage 2 will generate features from raw data")
+    print("Mode B: no feature datasets attached — stage 2 will generate features from raw data")
 
 # Checkpoints: dataset root IS the checkpoints dir (no subfolder)
 ckpt_dst = data_dir / "checkpoints"
