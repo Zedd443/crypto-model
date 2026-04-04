@@ -160,8 +160,8 @@ def _train_meta_symbol(
         symbol, _TF,
         feature_names=meta_X.columns.tolist(),
         hyperparams={"primary_version": primary_version},
-        train_start=str(train_labels.index.min().date()),
-        train_end=str(train_labels.index.max().date()),
+        train_start=str(train_labels_aligned.index.min().date()),
+        train_end=str(train_labels_aligned.index.max().date()),
     )
 
     save_meta_model(meta_model, symbol, _TF, version, models_dir)
@@ -172,7 +172,7 @@ def _train_meta_symbol(
         metrics={"meta_accuracy_oof": meta_acc},
         feature_names=meta_X.columns.tolist(),
         hyperparams={"primary_version": primary_version},
-        train_period=(str(train_labels.index.min().date()), str(train_labels.index.max().date())),
+        train_period=(str(train_labels_aligned.index.min().date()), str(train_labels_aligned.index.max().date())),
         model_path=str(models_dir / f"{version}_meta.pkl"),
         model_type="meta",
     )
@@ -211,13 +211,15 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
     # Skip symbols already meta-labeled in a prior run (pipeline is resumable)
-    from src.utils.state_manager import load_state
-    _state = load_state()
-    _completed = set(_state.get("stages", {}).get("meta_labeling", {}).get("completed_symbols", []))
-    if _completed:
-        _pending = [s for s in symbol_names if s not in _completed]
-        logger.info(f"Resuming meta-labeling — {len(_completed)} already done, {len(_pending)} remaining")
-        symbol_names = _pending
+    # --force bypasses resume: re-run meta-labeling for all symbols in symbol_names
+    if not force:
+        from src.utils.state_manager import load_state
+        _state = load_state()
+        _completed = set(_state.get("stages", {}).get("meta_labeling", {}).get("completed_symbols", []))
+        if _completed:
+            _pending = [s for s in symbol_names if s not in _completed]
+            logger.info(f"Resuming meta-labeling — {len(_completed)} already done, {len(_pending)} remaining")
+            symbol_names = _pending
 
     checkpoints_dir = Path(cfg.data.checkpoints_dir)
     labels_dir = Path(cfg.data.labels_dir)
