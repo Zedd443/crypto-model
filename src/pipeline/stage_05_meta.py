@@ -229,8 +229,9 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
 
     # GPU cannot be shared across processes — enforce serial when XGB_DEVICE=cuda
+    # Reduced from 4 to 2 to avoid OOM when loading 1.2GB feature/label DataFrames in parallel
     device = os.environ.get("XGB_DEVICE", "cpu")
-    max_workers = 1 if device == "cuda" else int(os.environ.get("META_WORKERS", 4))
+    max_workers = 1 if device == "cuda" else int(os.environ.get("META_WORKERS", 2))
 
     # Serialize OmegaConf and Paths so they survive multiprocessing pickling
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
