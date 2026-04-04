@@ -1,6 +1,9 @@
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from omegaconf import OmegaConf
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state, update_completed_symbol
 from src.utils.logger import get_logger
@@ -56,8 +59,11 @@ def _train_meta_symbol(
     y_train = (train_labels["label"] == 1).astype(int).values
 
     if len(y_train) != len(oof_proba):
-        # Trim oof_proba to match train labels length
         min_len = min(len(y_train), len(oof_proba))
+        logger.warning(
+            f"{symbol}: OOF/label length mismatch — y_train={len(y_train)}, "
+            f"oof_proba={len(oof_proba)}, trimming to {min_len}. Check stage_04 OOF alignment."
+        )
         y_train = y_train[:min_len]
         oof_proba = oof_proba[:min_len]
         train_weights = train_weights.iloc[:min_len]
@@ -148,6 +154,26 @@ def _train_meta_symbol(
     return symbol, {"version": version, "meta_accuracy": meta_acc}, None
 
 
+def _train_meta_symbol_worker(
+    symbol: str,
+    cfg_dict: dict,
+    checkpoints_dir_str: str,
+    labels_dir_str: str,
+    features_dir_str: str,
+    models_dir_str: str,
+) -> tuple:
+    # Worker entry point for ProcessPoolExecutor — all args must be picklable.
+    # Reconstruct OmegaConf and Path objects inside the subprocess.
+    cfg = OmegaConf.create(cfg_dict)
+    return _train_meta_symbol(
+        symbol, cfg,
+        Path(checkpoints_dir_str),
+        Path(labels_dir_str),
+        Path(features_dir_str),
+        Path(models_dir_str),
+    )
+
+
 def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     if not force and is_stage_complete("meta_labeling"):
         logger.info("Stage 5 already complete, skipping.")
@@ -164,20 +190,38 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     models_dir = Path(cfg.data.models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    # GPU cannot be shared across processes — enforce serial when XGB_DEVICE=cuda
+    device = os.environ.get("XGB_DEVICE", "cpu")
+    max_workers = 1 if device == "cuda" else int(os.environ.get("META_WORKERS", 4))
+
+    # Serialize OmegaConf and Paths so they survive multiprocessing pickling
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    checkpoints_dir_str = str(checkpoints_dir)
+    labels_dir_str = str(labels_dir)
+    features_dir_str = str(features_dir)
+    models_dir_str = str(models_dir)
+
     issues = []
     success_count = 0
 
-    for symbol in symbol_names:
-        sym, result, err = _train_meta_symbol(
-            symbol, cfg, checkpoints_dir, labels_dir, features_dir, models_dir
-        )
-        if err:
-            logger.error(f"{sym}: meta-labeling failed — {err}")
-            issues.append(f"{sym}: {str(err)[:200]}")
-        else:
-            update_completed_symbol("meta_labeling", sym)
-            success_count += 1
-            logger.info(f"{sym}: meta-labeler registered — v{result['version'][:20]}...")
+    logger.info(f"Stage 5: meta-labeling {len(symbol_names)} symbols with max_workers={max_workers} (device={device})")
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _train_meta_symbol_worker,
+                sym, cfg_dict, checkpoints_dir_str, labels_dir_str, features_dir_str, models_dir_str,
+            ): sym
+            for sym in symbol_names
+        }
+        for future in as_completed(futures):
+            sym, result, err = future.result()
+            if err:
+                logger.error(f"{sym}: meta-labeling failed — {err}")
+                issues.append(f"{sym}: {str(err)[:200]}")
+            else:
+                update_completed_symbol("meta_labeling", sym)
+                success_count += 1
+                logger.info(f"{sym}: meta-labeler registered — v{result['version'][:20]}...")
 
     update_project_state("meta_labeling", "done", issues, output_dir=str(models_dir))
     logger.info(f"Stage 5 complete. {success_count}/{len(symbol_names)} meta-labelers trained.")

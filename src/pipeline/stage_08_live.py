@@ -29,6 +29,8 @@ from src.utils.state_manager import load_state, update_equity
 
 logger = get_logger("stage_08_live")
 
+_model_cache: dict = {}
+
 _SYMBOLS_PATH = Path("config/symbols.yaml")
 _TRADE_LOG_PATH = Path("results/live_trade_log.csv")
 _BAR_SECONDS = 15 * 60   # 15-minute bar in seconds
@@ -93,17 +95,16 @@ def _load_meta(symbol: str, cfg):
 
 
 def _predict(model, calibrator, meta_model, feature_series: pd.Series) -> tuple[float, float]:
-    X = feature_series.values.reshape(1, -1)
+    X_arr = feature_series.values.reshape(1, -1)
 
-    # Calibrated probability from isotonic calibrator
-    raw_prob = float(model.predict_proba(X)[0][1])
+    raw_prob = float(model.predict_proba(X_arr)[0][1])
     if calibrator is not None:
-        primary_prob = float(calibrator.predict_proba(X)[0][1])
+        primary_prob = float(calibrator.predict(np.array([raw_prob]))[0])
     else:
         primary_prob = raw_prob
 
     if meta_model is not None:
-        meta_prob = float(meta_model.predict_proba(X)[0][1])
+        meta_prob = float(meta_model.predict_proba(X_arr)[0][1])
         signal_strength = primary_prob * meta_prob
     else:
         signal_strength = primary_prob
@@ -131,14 +132,31 @@ def run(cfg, **kwargs) -> None:
 
     logger.info(f"Entering bar-wait loop — signal_floor={signal_floor} lookback={lookback_needed} bars")
 
+    state = load_state()
+    active_symbols = _get_active_symbols(cfg, state, all_symbols)
+
+    # Pre-load models for all active symbols at startup
+    for _sym in active_symbols:
+        try:
+            _model_cache[_sym] = {
+                "primary": _load_primary_model(_sym, cfg),
+                "meta": _load_meta(_sym, cfg),
+            }
+        except Exception as _e:
+            logger.warning(f"Could not pre-load model for {_sym}: {_e}")
+
     try:
         while True:
             wait = _seconds_until_next_bar() + _BAR_CLOSE_BUFFER
             logger.info(f"Sleeping {wait:.1f}s until next bar + buffer...")
-            # Heartbeat before sleep so DMS doesn't fire during the bar-wait period
-            order_manager.heartbeat()
-            time.sleep(wait)
-            order_manager.heartbeat()  # reset again right after waking
+            # Heartbeat every 30s throughout the bar-wait so DMS (60s timeout) never fires
+            _slept = 0.0
+            _hb_interval = 30.0
+            while _slept < wait:
+                _step = min(_hb_interval, wait - _slept)
+                time.sleep(_step)
+                _slept += _step
+                order_manager.heartbeat()
 
             bar_start = datetime.now(timezone.utc)
 
@@ -202,13 +220,12 @@ def _process_symbol(
     # Compute live features
     feature_series = compute_live_features(symbol, cfg, klines_df)
 
-    # Load models
-    primary_model, calibrator = _load_primary_model(symbol, cfg)
+    cached = _model_cache.get(symbol, {})
+    primary_model, calibrator = cached.get("primary", (None, None))
+    meta_model = cached.get("meta", None)
     if primary_model is None:
-        logger.debug(f"{symbol}: no primary model — skipping")
+        logger.warning(f"{symbol}: no cached model, skipping bar")
         return
-
-    meta_model = _load_meta(symbol, cfg)
 
     primary_prob, signal_strength = _predict(primary_model, calibrator, meta_model, feature_series)
 

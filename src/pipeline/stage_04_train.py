@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -89,20 +90,34 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     val_mask = (features_aligned.index > train_end) & (features_aligned.index <= val_end)
 
     X_train = features_aligned[train_mask].drop(columns=["is_warmup"], errors="ignore")
-    y_train = (labels_aligned.loc[train_mask, "label"] + 1) // 2  # convert {-1,0,1} → {0,0,1} binary
-    # For binary XGB: 1 = long (label=+1), 0 = short/neutral
-    y_train_binary = (labels_aligned.loc[train_mask, "label"] == 1).astype(int)
     w_train = weights_aligned[train_mask]
 
-    X_val = features_aligned[val_mask].drop(columns=["is_warmup"], errors="ignore")
-    y_val_binary = (labels_aligned.loc[val_mask, "label"] == 1).astype(int)
-
-    # Filter out warmup rows
+    # Filter warmup rows first
     if "is_warmup" in features_aligned.columns:
         warmup_mask_train = features_aligned.loc[train_mask, "is_warmup"] == 1
         X_train = X_train[~warmup_mask_train]
-        y_train_binary = y_train_binary[~warmup_mask_train]
         w_train = w_train[~warmup_mask_train]
+        train_label_series = labels_aligned.loc[train_mask, "label"][~warmup_mask_train]
+    else:
+        train_label_series = labels_aligned.loc[train_mask, "label"]
+
+    # Drop neutral (time-barrier) labels — keep only directional {-1, +1}
+    train_dir_mask = train_label_series != 0
+    X_train = X_train[train_dir_mask]
+    w_train = w_train[train_dir_mask]
+    y_train_binary = (train_label_series[train_dir_mask] == 1).astype(int)  # -1→0 (short), +1→1 (long)
+
+    X_val = features_aligned[val_mask].drop(columns=["is_warmup"], errors="ignore")
+    val_label_series = labels_aligned.loc[val_mask, "label"]
+    val_dir_mask = val_label_series != 0
+    X_val = X_val[val_dir_mask]
+    y_val_binary = (val_label_series[val_dir_mask] == 1).astype(int)
+
+    n_long = int(y_train_binary.sum())
+    n_short = int((y_train_binary == 0).sum())
+    pct_long = n_long / max(len(y_train_binary), 1)
+    logger.info(f"  {symbol}: directional label balance — n_long={n_long}, n_short={n_short}, pct_long={pct_long:.3f}")
+    scale_pos_weight = n_short / max(n_long, 1)
 
     if len(X_train) < 200:
         return symbol, None, f"Insufficient train samples after filtering: {len(X_train)}"
@@ -160,7 +175,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
 
     # Build DataFrames back from scaled arrays for splitter (needs index)
     X_train_final = pd.DataFrame(X_train_scaled, index=X_train_sel.index, columns=selected_features)
-    X_val_final = pd.DataFrame(X_val_scaled, index=X_val_sel.index, columns=X_val_sel.columns[:len(selected_features)])
+    X_val_final = pd.DataFrame(X_val_scaled, index=X_val_sel.index, columns=selected_features)
 
     # Step 3: Hyperparameter tuning with Optuna
     logger.info(f"  {symbol}: tuning hyperparameters ({cfg.model.optuna_n_trials} trials)")
@@ -169,6 +184,8 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     except Exception as e:
         logger.warning(f"  {symbol}: Optuna failed ({e}), using defaults")
         best_params = {}
+
+    best_params["scale_pos_weight"] = scale_pos_weight
 
     # Step 4: OOF predictions for meta-labeling (NEVER in-sample)
     logger.info(f"  {symbol}: computing OOF predictions")
@@ -269,13 +286,17 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         f"Tier={tier} folds_above_da={sum(1 for d in fold_da_list if d >= float(cfg.model.tier_A_da_min))}"
     )
 
-    # Step 8: SHAP importance
-    try:
-        shap_imp = compute_shap_importance(model, X_train_final, top_k=int(cfg.model.shap_top_k))
-        shap_path = models_dir / f"{symbol}_{_TF}_shap_importance.json"
-        shap_imp.to_json(shap_path)
-    except Exception as e:
-        logger.warning(f"  {symbol}: SHAP failed: {e}")
+    # Step 8: SHAP importance — skip on Kaggle (CPU-only, ~2-5 min/symbol) via SKIP_SHAP=1
+    skip_shap = os.environ.get("SKIP_SHAP", "0") == "1"
+    if not skip_shap:
+        try:
+            shap_imp = compute_shap_importance(model, X_train_final, top_k=int(cfg.model.shap_top_k))
+            shap_path = models_dir / f"{symbol}_{_TF}_shap_importance.json"
+            shap_imp.to_json(shap_path)
+        except Exception as e:
+            logger.warning(f"  {symbol}: SHAP failed: {e}")
+    else:
+        logger.info(f"  {symbol}: SHAP skipped (SKIP_SHAP=1)")
 
     # Step 9: Save model and register
     train_start_str = str(X_train_final.index.min().date())

@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import pickle
@@ -64,6 +65,7 @@ def train_meta_labeler(
     n_estimators = int(cfg.model.meta_n_estimators)
     max_depth = int(cfg.model.meta_max_depth)
 
+    device = os.environ.get("XGB_DEVICE", "cpu")
     model = XGBClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
@@ -74,6 +76,8 @@ def train_meta_labeler(
         eval_metric="logloss",
         use_label_encoder=False,
         tree_method="hist",
+        device=device,
+        n_jobs=-1 if device == "cpu" else 1,
         random_state=42,
         verbosity=0,
     )

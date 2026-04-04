@@ -113,6 +113,9 @@ model:
   tier_B_da_min: 0.51                          # tier B: minimum directional accuracy (lower bar)
   tier_B_leverage_max: 1                       # tier B: no leverage (1× only)
   fdr_alpha: 0.05                              # false discovery rate threshold for feature selection
+  # Kaggle GPU run reference values — applied via OmegaConf.update in notebook.py
+  optuna_n_trials_kaggle: 25                  # fewer trials on Kaggle (GPU trains each trial ~10x faster)
+  stability_n_bootstrap_kaggle: 20            # fewer bootstrap iterations on Kaggle
 
 portfolio:
   signal_floor_prob: 0.55                      # minimum signal_strength to enter a trade

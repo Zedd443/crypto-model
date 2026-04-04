@@ -107,9 +107,21 @@ for d in ["data/features", "data/processed", "data/labels", "results", "logs", "
 os.environ["XGB_DEVICE"] = "cuda"
 print("XGB_DEVICE=cuda — XGBoost will use GPU")
 
+# Kaggle GPU optimizations — parallel labeling (CPU), serial meta (GPU lock), skip SHAP
+os.environ["LABEL_WORKERS"] = "2"   # stage 3: 2 parallel CPU label workers (safe on Kaggle)
+os.environ["META_WORKERS"] = "1"    # stage 5: GPU forces max_workers=1 anyway, set explicitly
+os.environ["SKIP_SHAP"] = "1"       # SHAP is CPU-only, skip on Kaggle to save ~2-4h
+print("LABEL_WORKERS=2, META_WORKERS=1, SKIP_SHAP=1 — Kaggle parallelism + SHAP skip enabled")
+
 # ── 5. Load config ────────────────────────────────────────────────────────────
 from src.utils.config_loader import load_config
+from omegaconf import OmegaConf
 cfg = load_config()
+
+# Kaggle GPU: fewer Optuna trials and bootstrap iterations (GPU makes each trial ~10x faster)
+OmegaConf.update(cfg, "model.optuna_n_trials", 25, merge=True)
+OmegaConf.update(cfg, "model.stability_n_bootstrap", 20, merge=True)
+print(f"Kaggle overrides: optuna_n_trials=25, stability_n_bootstrap=20")
 
 # ── 6. Run pipeline stages ───────────────────────────────────────────────────
 from src.pipeline import (
