@@ -1,28 +1,26 @@
 {
-  "last_updated": "2026-04-03T22:59:33.960582+00:00",
+  "last_updated": "2026-04-04T11:49:50.384954+00:00",
   "stages": {
     "ingest": {
       "status": "done",
-      "hash": "e395fcf78cfca2534261135a59d2c62d",
-      "last_run": "2026-04-02T15:05:10.695942+00:00",
-      "issues": [
-        "Excluded for 1d: ['ASTERUSDT', 'LITUSDT', 'KITEUSDT', 'XPLUSDT', 'BARDUSDT']"
-      ]
+      "hash": "e137c70deced9b26888aa3ba26006d86",
+      "last_run": "2026-04-04T06:42:08.082084+00:00",
+      "issues": []
     },
     "features": {
       "status": "done",
-      "hash": "3cfd5c35662e5945844249d227f49b36",
-      "last_run": "2026-04-02T18:21:54.131338+00:00",
+      "hash": "213bcc98fc0f005168b49604f4bd4716",
+      "last_run": "2026-04-04T06:42:12.055857+00:00",
       "issues": []
     },
     "labels": {
       "status": "done",
-      "hash": "cd8519a2a2d0dc1b4e5e79ab5243198a",
-      "last_run": "2026-04-03T14:33:58.035720+00:00",
+      "hash": "a84a6ba1c8194f4dd4bfdd026e200a6f",
+      "last_run": "2026-04-04T06:50:17.685879+00:00",
       "issues": []
     },
     "training": {
-      "status": "pending",
+      "status": "done",
       "completed_symbols": [
         "BTCUSDT",
         "SOLUSDT",
@@ -42,28 +40,30 @@
         "INJUSDT"
       ],
       "failed_symbols": {},
-      "hash": null,
-      "last_run": null,
+      "hash": "7f8c85a93223e0cb5dd37e49490418d1",
+      "last_run": "2026-04-04T11:48:54.512683+00:00",
       "issues": []
     },
     "meta_labeling": {
-      "status": "pending",
-      "completed_symbols": [],
+      "status": "done",
+      "completed_symbols": [
+        "SOLUSDT"
+      ],
       "failed_symbols": {},
-      "hash": null,
-      "last_run": null,
+      "hash": "0f030f6912b33ada8c9a061f49550a34",
+      "last_run": "2026-04-04T11:49:14.959047+00:00",
       "issues": []
     },
     "portfolio": {
-      "status": "pending",
-      "hash": null,
-      "last_run": null,
+      "status": "done",
+      "hash": "f92e99e96fc67bfcf1206682b2de7279",
+      "last_run": "2026-04-04T11:49:33.271626+00:00",
       "issues": []
     },
     "backtest": {
-      "status": "pending",
-      "hash": null,
-      "last_run": null,
+      "status": "done",
+      "hash": "0b409a27cdbe6c8172c40cb93478d74e",
+      "last_run": "2026-04-04T11:49:50.384954+00:00",
       "issues": []
     }
   },

@@ -222,6 +222,9 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     except Exception:
         ic = 0.0
 
+    # MSE: mean squared error between calibrated val probabilities and binary labels
+    val_mse = float(np.mean((val_proba_cal - y_val_binary.values) ** 2))
+
     # Class balance on train and val sets
     pct_positive_train = float(y_train_binary.mean())
     pct_positive_val = float(y_val_binary.mean())
@@ -269,6 +272,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     metrics = {
         "da": da,
         "ic": ic,
+        "mse": val_mse,
         "pbo": pbo,
         "synthetic_sharpe": synthetic_sharpe,
         "conformal_q90": q90,
@@ -283,7 +287,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
 
     tier = _assign_tier(metrics, cfg)
     logger.info(
-        f"  {symbol}: DA={da:.3f} Sharpe={synthetic_sharpe:.3f} PBO={pbo:.3f} "
+        f"  {symbol}: DA={da:.3f} MSE={val_mse:.4f} Sharpe={synthetic_sharpe:.3f} PBO={pbo:.3f} "
         f"Tier={tier} folds_above_da={sum(1 for d in fold_da_list if d >= float(cfg.model.tier_A_da_min))}"
     )
 
@@ -324,7 +328,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     oof_path = oof_dir / f"{symbol}_{_TF}_oof_proba.npy"
     oof_idx_path = oof_dir / f"{symbol}_{_TF}_oof_index.npy"
     np.save(str(oof_path), oof_proba)
-    np.save(str(oof_idx_path), X_train_final.index.view("int64").values)  # store as ns-since-epoch int64
+    np.save(str(oof_idx_path), X_train_final.index.view("int64"))  # store as ns-since-epoch int64
 
     # Save feature selection result
     features_sel_path = checkpoints_dir / "feature_selection" / f"{symbol}_{_TF}_selected.json"

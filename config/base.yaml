@@ -68,8 +68,8 @@ regime:
 
 model:
   xgb_device: "cpu"                            # override to "cuda" on Kaggle GPU or set env XGB_DEVICE=cuda
-  xgb_n_estimators: 500                        # default tree count (Optuna may override)
-  xgb_max_depth: 6                             # default max tree depth
+  xgb_n_estimators: 10                        # default tree count (Optuna may override)
+  xgb_max_depth: 3                             # default max tree depth
   xgb_learning_rate: 0.05                      # default shrinkage rate
   xgb_subsample: 0.8                           # row subsampling ratio per tree
   xgb_colsample_bytree: 0.8                    # feature subsampling ratio per tree
@@ -77,13 +77,13 @@ model:
   xgb_reg_alpha: 0.1                           # L1 regularisation (feature sparsity)
   xgb_reg_lambda: 1.0                          # L2 regularisation (weight shrinkage)
   xgb_gamma: 0.1                               # minimum loss reduction to make a split
-  xgb_early_stopping_rounds: 50               # stop if no improvement for 50 rounds
+  xgb_early_stopping_rounds: 10               # stop if no improvement for 50 rounds
   cv_n_splits: 8                               # number of purged time-series CV folds
   embargo_pct: 0.01                            # fraction of data embargoed between train/val folds
   embargo_bars_min: 50                         # minimum embargo gap in bars regardless of pct
-  optuna_n_trials: 50                          # hyperparameter search trials per symbol
-  optuna_n_trials_wfo: 25                      # trials for walk-forward optimisation
-  optuna_patience: 20                          # early-stop Optuna if no improvement after N trials
+  optuna_n_trials: 1                          # hyperparameter search trials per symbol
+  optuna_n_trials_wfo: 1                      # trials for walk-forward optimisation
+  optuna_patience: 3                          # early-stop Optuna if no improvement after N trials
   objective_da_weight: 0.4                     # weight of directional accuracy in Optuna objective
   objective_ic_weight: 0.3                     # weight of information coefficient in objective
   objective_sharpe_weight: 0.3                 # weight of Sharpe ratio in objective
@@ -91,7 +91,7 @@ model:
   stability_n_bootstrap: 50                    # bootstrap iterations for stability selection
   variance_threshold: 1.0e-6                   # drop features with variance below this
   permutation_importance_top_k: 80            # keep top-k features by permutation importance
-  shap_top_k: 70                               # keep top-k features by SHAP importance
+  shap_top_k: 30                               # keep top-k features by SHAP importance
   importance_stability_spearman_min: 0.6       # min Spearman correlation of feature ranks across folds
   staleness_decay_days: 30                     # decay window for feature importance staleness check
   staleness_exclude_threshold: 0.3            # exclude feature if staleness score exceeds this
@@ -99,7 +99,7 @@ model:
   conformal_q_level: 0.90                      # conformal prediction quantile level
   conformal_width_full: 0.20                   # prediction interval width below this → full position size
   conformal_width_60pct: 0.40                  # width between 0.20–0.40 → 60% position size (above → 30%)
-  meta_n_estimators: 200                       # meta-labeler tree count
+  meta_n_estimators: 10                       # meta-labeler tree count
   meta_max_depth: 4                            # meta-labeler max depth (shallow to avoid overfit)
   meta_signal_floor: 0.55                      # minimum meta-prob to pass a signal
   tier_A_da_min: 0.53                          # tier A: minimum directional accuracy on validation

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from src.utils.config_loader import load_config, get_symbols
@@ -8,6 +10,25 @@ from src.features.feature_pipeline import build_features_for_symbol, save_featur
 import pandas as pd
 
 logger = get_logger("stage_02_features")
+
+
+def _feature_config_hash(cfg) -> str:
+    from omegaconf import OmegaConf
+    payload = {
+        "features": OmegaConf.to_container(cfg.features, resolve=True),
+        "train_end": str(cfg.data.train_end),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _read_saved_hash(features_dir: Path) -> str:
+    p = features_dir / "feature_config_hash.txt"
+    return p.read_text().strip() if p.exists() else ""
+
+
+def _write_saved_hash(features_dir: Path, h: str) -> None:
+    features_dir.mkdir(parents=True, exist_ok=True)
+    (features_dir / "feature_config_hash.txt").write_text(h)
 
 
 def _process_symbol(args: tuple) -> tuple:
@@ -71,11 +92,24 @@ def _process_symbol(args: tuple) -> tuple:
 
 
 def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
-    if not force and is_stage_complete("features"):
-        logger.info("Stage 2 already complete, skipping.")
-        return
-
     from omegaconf import OmegaConf
+
+    features_dir = Path(cfg.data.features_dir)
+    current_hash = _feature_config_hash(cfg)
+    saved_hash = _read_saved_hash(features_dir)
+    config_changed = current_hash != saved_hash
+
+    if not force and is_stage_complete("features"):
+        if not config_changed:
+            logger.info("Stage 2 already complete and feature config unchanged — skipping.")
+            return
+        logger.info(f"Stage 2: feature config changed (hash {saved_hash[:8]} → {current_hash[:8]}) — recomputing all features.")
+
+    if force:
+        logger.info("Stage 2: --force, recomputing all features.")
+    elif config_changed:
+        pass  # already logged above
+
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
     all_symbols = get_symbols(cfg)
