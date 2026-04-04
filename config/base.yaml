@@ -197,7 +197,7 @@ monitoring:
   model_stale_threshold: 0.3                  # flag model as stale if weight decays below this
 
 trading:
-  mode: "DEMO"                                 # active trading mode: DEMO / TESTNET / MAINNET
+  mode: "TESTNET"                              # active trading mode: DEMO / TESTNET / MAINNET
   endpoints:
     DEMO: "https://demo-fapi.binance.com"      # Binance paper trading FAPI (no real money)
     TESTNET: "https://testnet.binancefuture.com" # Binance futures testnet

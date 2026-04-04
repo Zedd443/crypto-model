@@ -24,8 +24,9 @@ def compute_live_features(symbol: str, cfg, lookback_df: pd.DataFrame) -> pd.Ser
     # Compute the full technical feature matrix on the lookback window
     feat_df = build_technical_features(lookback_df, cfg)
 
-    # Take only the last row — this is the just-closed bar
-    last_row = feat_df.iloc[[-1]].copy()
+    # Defragment — build_technical_features inserts columns incrementally leaving fragmented blocks
+    feat_df = feat_df.copy()
+    last_row = feat_df.iloc[[-1]]
 
     # Load imputer — fit was done on train split only (no leakage)
     imputer_path = Path(cfg.data.checkpoints_dir) / "imputers" / f"imputer_{symbol}_15m.pkl"

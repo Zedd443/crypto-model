@@ -341,6 +341,15 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
         all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) == symbol_filter]
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
+    # Skip symbols already trained in a prior run (pipeline is resumable)
+    from src.utils.state_manager import load_state
+    _state = load_state()
+    _completed = set(_state.get("stages", {}).get("training", {}).get("completed_symbols", []))
+    if _completed:
+        _pending = [s for s in symbol_names if s not in _completed]
+        logger.info(f"Resuming training — {len(_completed)} already done, {len(_pending)} remaining")
+        symbol_names = _pending
+
     checkpoints_dir = Path(cfg.data.checkpoints_dir)
     labels_dir = Path(cfg.data.labels_dir)
     features_dir = Path(cfg.data.features_dir)

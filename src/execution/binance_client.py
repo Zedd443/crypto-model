@@ -20,12 +20,21 @@ class BinanceClient:
         self._backoff_max = float(cfg.trading.rate_limit_backoff_max)
 
         # Select keys based on mode
+        # DEMO  → BINANCE_DEMO_API_KEY / BINANCE_DEMO_API_SECRET (demo-fapi.binance.com account)
+        # TESTNET → BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET
+        # MAINNET → BINANCE_API_KEY / BINANCE_API_SECRET
         if mode == "DEMO":
             self._api_key = os.environ.get("BINANCE_DEMO_API_KEY", "")
             self._api_secret = os.environ.get("BINANCE_DEMO_API_SECRET", "")
+        elif mode == "TESTNET":
+            self._api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
+            self._api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET", "")
         else:
             self._api_key = os.environ.get("BINANCE_API_KEY", "")
             self._api_secret = os.environ.get("BINANCE_API_SECRET", "")
+
+        if not self._api_key:
+            logger.warning(f"No API key found for mode={mode} — check .env (BINANCE_{mode}_API_KEY)")
 
         self._session = requests.Session()
         self._session.headers.update({
