@@ -41,8 +41,14 @@ def generate_signals(
         prob_long = primary_proba_df[prob_col]
         prob_short = 1.0 - prob_long
 
+    # Dead zone thresholds from config (FIX 5: no hardcoded values)
+    dead_zone_direction = float(cfg.portfolio.dead_zone_direction)
+    dead_zone_signal = float(cfg.portfolio.dead_zone_signal)
+
     direction = np.where(prob_long > 0.5, 1, -1)
-    primary_conf = np.where(direction == 1, prob_long, prob_short)
+    dead_zone = np.abs(prob_long - 0.5) < dead_zone_direction
+    direction = np.where(dead_zone, 0, direction)
+    primary_conf = np.where(direction == 1, prob_long, np.where(direction == -1, prob_short, 0.5))
 
     # Meta probability aligned to index
     meta_prob_aligned = meta_proba_series.reindex(primary_proba_df.index).fillna(0.5)
@@ -58,7 +64,7 @@ def generate_signals(
 
     is_signal = (signal_strength >= adaptive_thresh.values).astype(int)
     # No signal if direction is ambiguous (prob_long near 0.5)
-    is_signal = np.where(np.abs(prob_long - 0.5) < 0.02, 0, is_signal)
+    is_signal = np.where(np.abs(prob_long - 0.5) < dead_zone_signal, 0, is_signal)
 
     # Dominant regime state
     if regime_df is not None and len(regime_df) > 0:
@@ -95,7 +101,10 @@ def generate_signals(
     }, index=primary_proba_df.index)
 
     n_signals = int(is_signal.sum())
-    logger.info(f"Signals generated: {n_signals}/{len(signals)} bars have active signal")
+    n_long_sig = int((direction == 1).sum())
+    n_short_sig = int((direction == -1).sum())
+    n_dead = int((direction == 0).sum())
+    logger.info(f"Signals generated: {n_signals}/{len(signals)} active — long={n_long_sig}, short={n_short_sig}, dead_zone={n_dead}")
     return signals
 
 

@@ -3,6 +3,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import pandas as pd
 from omegaconf import OmegaConf
+from tqdm import tqdm
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state
 from src.utils.logger import get_logger
@@ -85,7 +86,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
             executor.submit(_label_symbol_worker, sym, cfg_dict, checkpoints_dir_str, labels_dir_str): sym
             for sym in symbol_names
         }
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="stage_03", unit="sym"):
             sym, err = future.result()
             if err:
                 logger.error(f"{sym}: labeling failed — {err}")

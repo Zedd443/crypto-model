@@ -10,7 +10,7 @@ from src.models.model_versioning import get_latest_model
 from src.models.primary_model import load_model
 from src.models.meta_labeler import load_meta_model, compute_signal_strength
 from src.models.imputer import transform_with_imputer, transform_with_scaler
-from src.portfolio.signal_generator import generate_signals, apply_h4_filter, apply_conformal_size_scaling
+from src.portfolio.signal_generator import generate_signals, apply_conformal_size_scaling
 from src.portfolio.position_sizer import compute_half_kelly, compute_position_size, apply_memecoin_rules
 from src.portfolio.correlation import fit_garch_per_asset, compute_dcc_correlations
 from src.portfolio.optimizer import optimize_portfolio_weights, equal_weight_fallback, rebalance_needed
@@ -132,7 +132,18 @@ def _generate_symbol_signals(
 
     # Compute position sizes
     equity = float(getattr(getattr(cfg, "account", None), "current_equity", None) or 120.0)
-    win_rate = 0.52  # will be updated from backtest results
+    backtest_summary_path = Path(cfg.data.results_dir) / "backtest_summary.json"
+    win_rate = 0.52
+    if backtest_summary_path.exists():
+        with open(backtest_summary_path) as _f:
+            _bs = json.load(_f)
+        _wr = _bs.get("hit_rate")
+        if _wr is not None and 0.3 <= float(_wr) <= 0.8:
+            win_rate = float(_wr)
+        else:
+            logger.warning(f"backtest_summary hit_rate={_wr} out of range, using fallback 0.52")
+    else:
+        logger.warning("backtest_summary.json not found, using win_rate=0.52 fallback")
     avg_win = float(cfg.labels.tp_atr_mult) * 0.01
     avg_loss = float(cfg.labels.sl_atr_mult) * 0.01
     half_kelly = compute_half_kelly(win_rate, avg_win, avg_loss)

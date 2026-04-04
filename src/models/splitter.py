@@ -47,8 +47,7 @@ class PurgedTimeSeriesSplit(BaseCrossValidator):
         return self.n_splits
 
     def _iter_test_indices(self, X=None, y=None, groups=None):
-        # Required by BaseCrossValidator but logic is in split()
-        pass
+        raise NotImplementedError("Use split() directly")
 
 
 def compute_pbo(fold_sharpes: list) -> float:

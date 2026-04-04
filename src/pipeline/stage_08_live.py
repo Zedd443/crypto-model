@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
+from tqdm import tqdm
 
 # Load .env before any Binance client is instantiated so API keys are in os.environ
 try:
@@ -33,8 +34,19 @@ _model_cache: dict = {}
 
 _SYMBOLS_PATH = Path("config/symbols.yaml")
 _TRADE_LOG_PATH = Path("results/live_trade_log.csv")
-_BAR_SECONDS = 15 * 60   # 15-minute bar in seconds
 _BAR_CLOSE_BUFFER = 5    # seconds after bar close before sampling
+
+
+def _parse_timeframe_seconds(tf: str) -> int:
+    # Convert timeframe string to seconds: "15m" -> 900, "1h" -> 3600, "4h" -> 14400, "1d" -> 86400
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 3600
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 86400
+    raise ValueError(f"Cannot parse timeframe seconds from: {tf!r}")
 
 
 def _load_symbol_list() -> list[str]:
@@ -44,39 +56,35 @@ def _load_symbol_list() -> list[str]:
     return list(raw.get("symbols", {}).keys())
 
 
-def _seconds_until_next_bar() -> float:
+def _seconds_until_next_bar(bar_seconds: int) -> float:
     now_ts = time.time()
-    # Next 15m boundary is the next multiple of 900s from epoch
-    next_boundary = (int(now_ts / _BAR_SECONDS) + 1) * _BAR_SECONDS
+    # Next bar boundary is the next multiple of bar_seconds from epoch
+    next_boundary = (int(now_ts / bar_seconds) + 1) * bar_seconds
     return next_boundary - now_ts
 
 
-def _get_active_symbols(cfg, state: dict, all_symbols: list[str]) -> list[str]:
+def _get_forecast_symbols(all_symbols: list[str], primary_timeframe: str) -> list[str]:
+    # Return all symbols that have a registered primary model — these get forecasted every bar
+    from src.models.model_versioning import get_latest_model
+    forecast = [s for s in all_symbols if get_latest_model(s, primary_timeframe, model_type="primary") is not None]
+    logger.info(f"Forecast symbols ({len(forecast)} with trained models): {forecast}")
+    return forecast
+
+
+def _get_trade_limit(cfg, state: dict) -> int:
+    # Growth gate: max simultaneous open positions allowed based on equity
     equity = float(state.get("account", {}).get("current_equity", 0.0))
     max_symbols, _ = get_growth_gate_limits(equity, cfg)
-
-    # Prefer symbols with a trained model; order: tier-A first, then tier-B
-    model_tiers = state.get("model_tiers", {})
-
-    tier_a = [s for s in all_symbols if model_tiers.get(s, {}).get("tier") == "A"]
-    tier_b = [s for s in all_symbols if model_tiers.get(s, {}).get("tier") == "B"]
-    ordered = tier_a + [s for s in tier_b if s not in tier_a]
-
-    # Fallback: if no tier info, use symbols in yaml order
-    if not ordered:
-        ordered = all_symbols
-
-    active = ordered[:max_symbols]
-    logger.info(f"Active symbols ({len(active)}/{max_symbols} allowed): {active}")
-    return active
+    return max_symbols
 
 
 def _load_primary_model(symbol: str, cfg):
-    entry = get_latest_model(symbol, "15m", model_type="primary")
+    primary_tf = str(cfg.data.primary_timeframe)
+    entry = get_latest_model(symbol, primary_tf, model_type="primary")
     if entry is None:
         return None, None
     try:
-        model, calibrator = load_model(symbol, "15m", entry["version"], cfg.data.models_dir)
+        model, calibrator = load_model(symbol, primary_tf, entry["version"], cfg.data.models_dir)
         return model, calibrator
     except Exception as exc:
         logger.warning(f"{symbol}: could not load primary model: {exc}")
@@ -84,11 +92,12 @@ def _load_primary_model(symbol: str, cfg):
 
 
 def _load_meta(symbol: str, cfg):
-    entry = get_latest_model(symbol, "15m", model_type="meta")
+    primary_tf = str(cfg.data.primary_timeframe)
+    entry = get_latest_model(symbol, primary_tf, model_type="meta")
     if entry is None:
         return None
     try:
-        return load_meta_model(symbol, "15m", entry["version"], cfg.data.models_dir)
+        return load_meta_model(symbol, primary_tf, entry["version"], cfg.data.models_dir)
     except Exception as exc:
         logger.debug(f"{symbol}: no meta model loaded: {exc}")
         return None
@@ -112,8 +121,33 @@ def _predict(model, calibrator, meta_model, feature_series: pd.Series) -> tuple[
     return primary_prob, signal_strength
 
 
+def _compute_daily_pnl_pct(trade_log_path: Path, equity: float) -> float:
+    # Read live_trade_log.csv, filter to today UTC, sum realized pnl_pct weighted by size_usd
+    if not trade_log_path.exists() or equity <= 0:
+        return 0.0
+    try:
+        df = pd.read_csv(trade_log_path)
+        if df.empty or "timestamp_exit" not in df.columns:
+            return 0.0
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # timestamp_exit is ISO string — filter rows where date portion matches today UTC
+        today_mask = df["timestamp_exit"].astype(str).str.startswith(today_str)
+        today_df = df[today_mask]
+        if today_df.empty:
+            return 0.0
+        # pnl in USD = pnl_pct * size_usd; daily_pnl_pct = sum(pnl_usd) / equity
+        pnl_usd = (today_df["pnl_pct"] * today_df["size_usd"]).sum()
+        return float(pnl_usd / equity)
+    except Exception as exc:
+        logger.warning(f"Could not compute daily PnL: {exc}")
+        return 0.0
+
+
 def run(cfg, **kwargs) -> None:
     logger.info("=== Stage 8: Live Execution Loop ===")
+
+    primary_tf = str(cfg.data.primary_timeframe)
+    bar_seconds = _parse_timeframe_seconds(primary_tf)
 
     all_symbols = _load_symbol_list()
     client = BinanceClient(cfg)
@@ -121,6 +155,7 @@ def run(cfg, **kwargs) -> None:
     lookback_needed = get_lookback_bars_needed(cfg)
     signal_floor = float(cfg.portfolio.signal_floor_prob)
     max_margin_pct = float(cfg.portfolio.max_total_margin_pct)
+    daily_profit_target = float(cfg.backtest.daily_profit_target_pct)
 
     # Verify connectivity — will raise if credentials or endpoint are wrong
     try:
@@ -130,13 +165,13 @@ def run(cfg, **kwargs) -> None:
         logger.error(f"Cannot connect to Binance: {exc}")
         raise
 
-    logger.info(f"Entering bar-wait loop — signal_floor={signal_floor} lookback={lookback_needed} bars")
+    logger.info(f"Entering bar-wait loop — timeframe={primary_tf} signal_floor={signal_floor} lookback={lookback_needed} bars")
 
     state = load_state()
-    active_symbols = _get_active_symbols(cfg, state, all_symbols)
+    forecast_symbols = _get_forecast_symbols(all_symbols, primary_tf)
 
-    # Pre-load models for all active symbols at startup
-    for _sym in active_symbols:
+    # Pre-load models for all forecast symbols at startup
+    for _sym in forecast_symbols:
         try:
             _model_cache[_sym] = {
                 "primary": _load_primary_model(_sym, cfg),
@@ -147,7 +182,7 @@ def run(cfg, **kwargs) -> None:
 
     try:
         while True:
-            wait = _seconds_until_next_bar() + _BAR_CLOSE_BUFFER
+            wait = _seconds_until_next_bar(bar_seconds) + _BAR_CLOSE_BUFFER
             logger.info(f"Sleeping {wait:.1f}s until next bar + buffer...")
             # Heartbeat every 30s throughout the bar-wait so DMS (60s timeout) never fires
             _slept = 0.0
@@ -161,10 +196,21 @@ def run(cfg, **kwargs) -> None:
             bar_start = datetime.now(timezone.utc)
 
             state = load_state()
-            active_symbols = _get_active_symbols(cfg, state, all_symbols)
             equity = float(state.get("account", {}).get("current_equity", 0.0))
+            trade_limit = _get_trade_limit(cfg, state)
+            open_count = len(order_manager.positions)
 
-            for symbol in active_symbols:
+            # FIX 3: check daily profit target before opening any new positions this bar
+            daily_pnl_pct = _compute_daily_pnl_pct(_TRADE_LOG_PATH, equity)
+            daily_target_hit = daily_pnl_pct >= daily_profit_target
+            if daily_target_hit:
+                logger.info(
+                    f"Daily profit target reached ({daily_pnl_pct:.2%} >= {daily_profit_target:.2%}) "
+                    "— no new position opens this bar (sync_fills and predictions still run)"
+                )
+
+            for symbol in tqdm(forecast_symbols, desc="stage_08", unit="sym", position=0, leave=False):
+                open_count = len(order_manager.positions)  # refresh after each symbol
                 try:
                     _process_symbol(
                         symbol=symbol,
@@ -176,6 +222,9 @@ def run(cfg, **kwargs) -> None:
                         max_margin_pct=max_margin_pct,
                         equity=equity,
                         state=state,
+                        trade_limit=trade_limit,
+                        open_count=open_count,
+                        skip_new_entries=daily_target_hit,
                     )
                 except Exception as exc:
                     logger.error(f"{symbol}: bar processing error: {exc}")
@@ -192,12 +241,28 @@ def run(cfg, **kwargs) -> None:
                 logger.warning(f"Could not refresh equity from exchange: {exc}")
 
             bar_elapsed = (datetime.now(timezone.utc) - bar_start).total_seconds()
-            logger.info(f"Bar loop complete in {bar_elapsed:.1f}s — {len(active_symbols)} symbols processed")
+            # FIX 1: was referencing undefined `active_symbols` — use forecast_symbols
+            logger.info(f"Bar loop complete in {bar_elapsed:.1f}s — {len(forecast_symbols)} symbols processed")
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received — cancelling all open positions before exit")
         order_manager.cancel_all_open()
         logger.info("Shutdown complete")
+
+
+def _compute_atr(klines_df: pd.DataFrame, period: int = 14) -> float:
+    # Wilder ATR on the fetched klines — matches triple-barrier logic in labels
+    high = klines_df["high"]
+    low = klines_df["low"]
+    close = klines_df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr_series = tr.ewm(span=period, min_periods=period, adjust=False).mean()
+    return float(atr_series.iloc[-1]) if not atr_series.empty else float(close.iloc[-1] * 0.01)
 
 
 def _process_symbol(
@@ -210,9 +275,14 @@ def _process_symbol(
     max_margin_pct: float,
     equity: float,
     state: dict,
+    trade_limit: int = 1,
+    open_count: int = 0,
+    skip_new_entries: bool = False,
 ) -> None:
+    primary_tf = str(cfg.data.primary_timeframe)
+
     # Fetch live OHLCV bars
-    klines_df = client.get_klines(symbol, "15m", limit=lookback_needed)
+    klines_df = client.get_klines(symbol, primary_tf, limit=lookback_needed)
     if len(klines_df) < lookback_needed // 2:
         logger.warning(f"{symbol}: insufficient kline data ({len(klines_df)} bars) — skipping")
         return
@@ -247,8 +317,17 @@ def _process_symbol(
     if symbol in order_manager.positions:
         return
 
+    # FIX 3: daily profit target gate — predictions still run, but no new entries
+    if skip_new_entries:
+        return
+
     # Skip if signal is below floor
     if signal_strength < signal_floor:
+        return
+
+    # Growth gate: skip opening new position if at max open positions
+    if open_count >= trade_limit:
+        logger.debug(f"{symbol}: signal={signal_strength:.3f} but trade_limit={trade_limit} reached ({open_count} open) — no new entry")
         return
 
     # Size the position
@@ -265,12 +344,12 @@ def _process_symbol(
         cfg=cfg,
     )
 
-    # Check portfolio capacity — skip if hard limit would be breached
+    # FIX 4: get scale_factor from portfolio capacity check and apply it
     current_positions_margin = {
         sym: {"margin": data.get("size_usd", 0) / max(float(leverage), 1)}
         for sym, data in order_manager.positions.items()
     }
-    _, should_skip = check_portfolio_capacity(
+    scale_factor, should_skip = check_portfolio_capacity(
         current_positions=current_positions_margin,
         new_position={"margin": pos_info["margin"]},
         total_equity=equity,
@@ -279,15 +358,31 @@ def _process_symbol(
     if should_skip:
         logger.info(f"{symbol}: portfolio margin limit reached — skipping entry")
         return
+    if scale_factor < 1.0:
+        # Scale down position proportionally when approaching soft limit
+        pos_info["margin"] = pos_info["margin"] * scale_factor
+        pos_info["size_usd"] = pos_info.get("size_usd", pos_info["margin"]) * scale_factor
+        pos_info["notional"] = pos_info["notional"] * scale_factor
+        logger.debug(f"{symbol}: portfolio soft-limit — position scaled to {scale_factor:.2f}×")
 
     # Use last close as entry price proxy (market order will fill near this)
     entry_price = float(klines_df["close"].iloc[-1])
 
-    tp_pct = float(cfg.labels.tp_atr_mult) * float(cfg.labels.tp_min_pct)
-    sl_pct = float(cfg.labels.sl_atr_mult) * float(cfg.labels.sl_min_pct)
+    # FIX 2: compute ATR-based TP/SL that matches engine.py logic
+    atr = _compute_atr(klines_df)
+    tp_atr_mult = float(cfg.labels.tp_atr_mult)
+    sl_atr_mult = float(cfg.labels.sl_atr_mult)
+    tp_min_pct = float(cfg.labels.tp_min_pct)
+    sl_min_pct = float(cfg.labels.sl_min_pct)
+    atr_pct = atr / max(entry_price, 1e-12)
+    # ATR-based percentage, floored by the configured minimum
+    tp_pct = max(tp_min_pct, atr_pct * tp_atr_mult)
+    sl_pct = max(sl_min_pct, atr_pct * sl_atr_mult)
 
     # Direction: model predicts probability of upward move (label=1 → long)
     direction = "long" if primary_prob >= 0.5 else "short"
+    # Direction-aware TP/SL is handled inside order_manager.submit_entry already
+    # (long: tp = entry*(1+tp_pct), sl = entry*(1-sl_pct); short: inverted)
 
     order_id = order_manager.submit_entry(
         symbol=symbol,
@@ -303,5 +398,6 @@ def _process_symbol(
     if order_id:
         logger.info(
             f"{symbol}: entry submitted — dir={direction} size_usd={pos_info['margin']:.2f} "
+            f"atr={atr:.6f} tp_pct={tp_pct:.4%} sl_pct={sl_pct:.4%} "
             f"signal={signal_strength:.3f} orderId={order_id}"
         )

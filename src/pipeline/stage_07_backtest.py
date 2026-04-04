@@ -2,6 +2,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import json
+from tqdm import tqdm
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state
 from src.utils.logger import get_logger
@@ -23,29 +24,6 @@ def _load_signals(symbol: str, signals_dir: Path) -> pd.DataFrame | None:
         return None
     return pd.read_parquet(signals_path)
 
-
-def _build_combined_signals_df(symbol_names: list, signals_dir: Path) -> pd.DataFrame:
-    # For single-symbol mode: return the symbol's signals directly
-    # For multi-symbol: combine into a per-timestamp lookup
-    all_sig_dfs = {}
-    for sym in symbol_names:
-        sig_df = _load_signals(sym, signals_dir)
-        if sig_df is not None:
-            all_sig_dfs[sym] = sig_df
-
-    if not all_sig_dfs:
-        return pd.DataFrame()
-
-    # For single symbol pipelines, return directly
-    if len(all_sig_dfs) == 1:
-        sym = list(all_sig_dfs.keys())[0]
-        return all_sig_dfs[sym]
-
-    # Multi-symbol: build wide DataFrame where each column-group is a symbol
-    # BacktestEngine expects signals_df with rows=timestamps, accessible by timestamp
-    # We store per-symbol signals separately and pass each to the engine
-    # Return the first symbol's signals for now (engine handles multi via prices_dict)
-    return pd.concat(list(all_sig_dfs.values()), keys=list(all_sig_dfs.keys()), axis=1)
 
 
 def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
@@ -89,12 +67,22 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     all_nav_series = []
     all_trade_logs = []
 
-    for sym in symbol_names:
+    for sym in tqdm(symbol_names, desc="stage_07", unit="sym"):
         sig_df = _load_signals(sym, signals_dir)
         if sig_df is None:
             logger.warning(f"No signals for {sym} — skipping from backtest")
             issues.append(f"{sym}: no signals checkpoint")
             continue
+
+        test_start_ts = pd.Timestamp(cfg.data.test_start, tz="UTC")
+        sig_df = sig_df[sig_df.index >= test_start_ts]
+        if len(sig_df) == 0:
+            logger.warning(f"{sym}: no signals after test_start filter ({cfg.data.test_start})")
+            continue
+        logger.info(f"{sym}: {len(sig_df)} signal bars after test_start filter")
+
+        if sym in prices_dict:
+            prices_dict[sym] = prices_dict[sym][prices_dict[sym].index >= test_start_ts]
 
         sym_prices = {sym: prices_dict[sym]} if sym in prices_dict else {}
         if not sym_prices:

@@ -30,8 +30,8 @@ class BacktestEngine:
             t for df in self.prices.values() for t in df.index
         ))
 
-        for ts in timestamps:
-            self._process_bar(ts)
+        for current_bar_idx, ts in enumerate(timestamps):
+            self._process_bar(ts, current_bar_idx)
 
         nav_series = pd.Series(
             [n["nav"] for n in self.nav],
@@ -47,7 +47,7 @@ class BacktestEngine:
             "final_equity": self.equity,
         }
 
-    def _process_bar(self, timestamp: pd.Timestamp) -> None:
+    def _process_bar(self, timestamp: pd.Timestamp, current_bar_idx: int = 0) -> None:
         # Reset daily state at day boundary
         if len(self.nav) > 0:
             last_ts = self.nav[-1]["timestamp"]
@@ -70,7 +70,7 @@ class BacktestEngine:
             self._close_position(fc["symbol"], fc["price"], timestamp, "delisted")
 
         # 2. Process exits (TP, SL, trailing stop, h4_exit flag)
-        exits = self._check_exits(current_prices, timestamp)
+        exits = self._check_exits(current_prices, timestamp, current_bar_idx)
         for ex in exits:
             self._close_position(ex["symbol"], ex["price"], timestamp, ex["reason"])
 
@@ -96,7 +96,7 @@ class BacktestEngine:
         if not self.trading_halted_today and not self.circuit_breaker_active:
             if timestamp in self.signals.index:
                 bar_signals = self.signals.loc[timestamp]
-                self._process_entries(bar_signals, current_prices, timestamp)
+                self._process_entries(bar_signals, current_prices, timestamp, current_bar_idx)
 
         # 5. Update NAV
         unrealized_pnl = self._compute_unrealized_pnl(current_prices)
@@ -110,13 +110,21 @@ class BacktestEngine:
         if self.equity > self.ath:
             self.ath = self.equity
 
-    def _check_exits(self, current_prices: dict, timestamp: pd.Timestamp) -> list:
+    def _check_exits(self, current_prices: dict, timestamp: pd.Timestamp, current_bar_idx: int = 0) -> list:
         exits = []
+        max_hold = getattr(getattr(self.cfg, "labels", None), "max_hold_bars", 16)
+
         for symbol, pos in list(self.positions.items()):
             if symbol not in current_prices:
                 continue
             price = current_prices[symbol]
             direction = pos["direction"]
+
+            # Time-barrier: force close when position has been held >= max_hold_bars
+            bars_held = current_bar_idx - pos.get("entry_bar_idx", current_bar_idx)
+            if bars_held >= max_hold:
+                exits.append({"symbol": symbol, "price": price, "reason": "time_barrier"})
+                continue
 
             if direction == 1:  # long
                 if price >= pos["tp"]:
@@ -160,14 +168,14 @@ class BacktestEngine:
                 existing = pos.get("trailing_sl")
                 pos["trailing_sl"] = min(existing, new_trail) if existing is not None else new_trail
 
-    def _process_entries(self, bar_signals, current_prices: dict, timestamp: pd.Timestamp) -> None:
+    def _process_entries(self, bar_signals, current_prices: dict, timestamp: pd.Timestamp, current_bar_idx: int = 0) -> None:
         # bar_signals: row from signals_df (could be Series indexed by symbol or dict-like)
         # Signals must be pre-computed — just iterate
         if isinstance(bar_signals, pd.Series):
             # Single-symbol: bar_signals is a Series with signal fields
             if "is_signal" in bar_signals.index:
                 # Treat index as symbol names if multi-symbol, else single symbol
-                self._try_enter_from_signal_row(bar_signals, current_prices, timestamp)
+                self._try_enter_from_signal_row(bar_signals, current_prices, timestamp, current_bar_idx)
             return
 
         # If bar_signals is a DataFrame row (per-symbol), iterate columns
@@ -176,9 +184,9 @@ class BacktestEngine:
                 if isinstance(sig, dict):
                     if not sig.get("is_signal"):
                         continue
-                    self._enter_position(symbol, sig, current_prices, timestamp)
+                    self._enter_position(symbol, sig, current_prices, timestamp, current_bar_idx)
 
-    def _try_enter_from_signal_row(self, sig_row: pd.Series, current_prices: dict, timestamp: pd.Timestamp) -> None:
+    def _try_enter_from_signal_row(self, sig_row: pd.Series, current_prices: dict, timestamp: pd.Timestamp, current_bar_idx: int = 0) -> None:
         # Single-symbol signal row
         if not sig_row.get("is_signal", 0):
             return
@@ -187,10 +195,10 @@ class BacktestEngine:
             if symbol not in self.positions:
                 sig_dict = sig_row.to_dict()
                 sig_dict["symbol"] = symbol
-                self._enter_position(symbol, sig_dict, current_prices, timestamp)
+                self._enter_position(symbol, sig_dict, current_prices, timestamp, current_bar_idx)
                 break
 
-    def _enter_position(self, symbol: str, sig: dict, current_prices: dict, timestamp: pd.Timestamp) -> None:
+    def _enter_position(self, symbol: str, sig: dict, current_prices: dict, timestamp: pd.Timestamp, current_bar_idx: int = 0) -> None:
         if symbol in self.positions:
             return
         if symbol not in current_prices:
@@ -217,6 +225,7 @@ class BacktestEngine:
             "size_usd": size_usd,
             "direction": direction,
             "entry_time": timestamp,
+            "entry_bar_idx": current_bar_idx,
             "tp": tp,
             "sl": sl,
             "atr": atr,

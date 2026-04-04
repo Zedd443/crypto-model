@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import json
+from tqdm import tqdm
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state, update_completed_symbol
 from src.utils.logger import get_logger
@@ -349,7 +350,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     issues = []
     training_summary = []
 
-    for symbol in symbol_names:
+    for symbol in tqdm(symbol_names, desc="stage_04", unit="sym"):
         sym, result, err = _train_symbol(symbol, cfg, checkpoints_dir, labels_dir, features_dir, models_dir)
         if err:
             logger.error(f"{sym}: training failed — {err}")

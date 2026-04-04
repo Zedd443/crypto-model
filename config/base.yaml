@@ -122,6 +122,8 @@ portfolio:
   max_position_size: 0.10                      # maximum single position as fraction of equity
   max_total_margin_pct: 0.80                   # maximum total margin deployed (80% of equity)
   kelly_fraction: 0.5                          # half-Kelly sizing fraction
+  dead_zone_direction: 0.03                    # prob distance from 0.5 below which direction=0
+  dead_zone_signal: 0.02                       # prob distance from 0.5 below which signal cancelled
   cvar_confidence_levels: [0.95, 0.99]         # CVaR confidence levels for tail risk estimation
   cvar_lambda_penalty: 0.5                     # CVaR penalty weight in position sizing
   dcc_fallback_ewm_span: 60                    # EWM span for correlation when DCC-GARCH unavailable
@@ -171,7 +173,7 @@ growth_gate:
   demo_trades_required: 500                    # minimum demo trades before mainnet is allowed
   tiers:                                       # symbol and leverage limits per equity tier
     - max_equity: 150                          # tier 1: equity ≤ $150
-      max_symbols: 1                           # trade 1 symbol only
+      max_symbols: 2                           # trade up to 2 symbols
       leverage_a_max: 2                        # tier A models: up to 2× leverage
     - max_equity: 300                          # tier 2: equity ≤ $300
       max_symbols: 3                           # trade up to 3 symbols

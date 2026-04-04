@@ -45,6 +45,10 @@ def build_xgb_params(trial_or_dict, cfg) -> dict:
             "n_estimators": d.get("n_estimators", int(cfg.model.xgb_n_estimators)),
         }
 
+    # Pass through scale_pos_weight if provided in the params dict
+    if isinstance(trial_or_dict, dict) and "scale_pos_weight" in trial_or_dict:
+        params["scale_pos_weight"] = trial_or_dict["scale_pos_weight"]
+
     # Fixed architecture params — device auto-detected via env var or config
     import os
     device = os.environ.get("XGB_DEVICE", getattr(getattr(cfg, "model", cfg), "xgb_device", "cpu"))
@@ -248,7 +252,7 @@ def compute_oof_predictions(
                 verbose=False,
             )
             proba = model.predict_proba(X_v)
-            oof_proba[val_idx] = proba
+            oof_proba[val_idx[val_split:]] = proba[val_split:]
         except Exception as e:
             logger.warning(f"OOF fold failed: {e}")
 
