@@ -18,9 +18,9 @@ Stage 2 (feature generation) has 3 modes, detected automatically:
 Stages 3-7 always run on GPU (XGB_DEVICE=cuda).
 
 Dataset mount paths on Kaggle:
-  /kaggle/input/crypto-model-raw-data/          <- raw OHLCV
-  /kaggle/input/crypto-model-checkpoints/       <- checkpoints + models
-  /kaggle/input/crypto-model-features-1/ .. -4/ <- pre-built features (Mode A)
+  /kaggle/input/crypto-model-raw-data/                              <- raw OHLCV
+  /kaggle/input/crypto-model-checkpoints/                           <- checkpoints + models
+  /kaggle/input/datasets/irfandragneel/crypto-model-features-{n}/  <- pre-built features (Mode A)
 """
 import os
 import sys
@@ -73,17 +73,13 @@ feat_dst.mkdir(exist_ok=True)
 
 _feat_count = 0
 for _batch_num in range(1, 5):
-    # Try both known Kaggle mount path formats
-    _candidates = [
-        Path(f"/kaggle/input/crypto-model-features-{_batch_num}"),
-        Path(f"/kaggle/input/datasets/irfandragneel/crypto-model-features-{_batch_num}"),
-    ]
-    _batch_dir = next((p for p in _candidates if p.exists()), None)
-    if _batch_dir is None:
-        print(f"  features-{_batch_num}: not attached (tried {[str(c) for c in _candidates]})")
+    # Kaggle mounts user datasets at /kaggle/input/datasets/{user}/{slug}/
+    _batch_dir = Path(f"/kaggle/input/datasets/irfandragneel/crypto-model-features-{_batch_num}")
+    if not _batch_dir.exists():
+        print(f"  features-{_batch_num}: not attached")
         continue
     print(f"  features-{_batch_num}: found at {_batch_dir}")
-    for _pq in _batch_dir.glob("**/*.parquet"):  # ** to catch any subdir
+    for _pq in _batch_dir.glob("**/*.parquet"):
         _link = feat_dst / _pq.name
         if not _link.exists():
             _link.symlink_to(_pq)
