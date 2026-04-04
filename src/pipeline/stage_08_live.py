@@ -21,7 +21,7 @@ from src.execution.live_features import compute_live_features, get_lookback_bars
 from src.execution.order_manager import OrderManager
 from src.models.model_versioning import get_latest_model
 from src.models.primary_model import load_model
-from src.models.meta_labeler import load_meta_model
+from src.models.meta_labeler import load_meta_model, build_meta_features
 from src.portfolio.position_sizer import (
     compute_position_size,
     get_growth_gate_limits,
@@ -115,7 +115,24 @@ def _predict(model, calibrator, meta_model, feature_series: pd.Series) -> tuple[
         primary_prob = raw_prob
 
     if meta_model is not None:
-        meta_prob = float(meta_model.predict_proba(X_arr)[0][1])
+        # Meta model was trained on build_meta_features() output — NOT primary features.
+        # Reconstruct the same feature space: prob_long/short, confidence, vol, zscore, ofi.
+        # Regime probs are not available live per-bar so we pass None (meta_df will have NaN cols).
+        oof_proba_1bar = np.array([[1.0 - primary_prob, primary_prob]])
+        # Column names may have suffixes (e.g. realized_vol_20, ofi_20) — find first match
+        _idx = feature_series.index
+        _vol_col = next((c for c in _idx if c.startswith("realized_vol")), None)
+        _zscore_col = next((c for c in _idx if c.startswith("volume_zscore")), None)
+        _ofi_col = next((c for c in _idx if c.startswith("ofi")), None)
+        realized_vol = pd.Series([feature_series[_vol_col] if _vol_col else np.nan])
+        volume_zscore = pd.Series([feature_series[_zscore_col] if _zscore_col else np.nan])
+        ofi = pd.Series([feature_series[_ofi_col] if _ofi_col else np.nan])
+        meta_X = build_meta_features(oof_proba_1bar, None, realized_vol, volume_zscore, ofi)
+        meta_X_arr = np.nan_to_num(meta_X.values, nan=0.0)
+        try:
+            meta_prob = float(meta_model.predict_proba(meta_X_arr)[0][1])
+        except Exception:
+            meta_prob = 0.5  # fallback if feature count mismatch (old model)
         signal_strength = primary_prob * meta_prob
     else:
         signal_strength = primary_prob

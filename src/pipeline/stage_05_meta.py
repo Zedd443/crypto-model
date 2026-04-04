@@ -102,7 +102,8 @@ def _train_meta_symbol(
     meta_y = create_meta_labels(y_train, oof_proba)
 
     # Build meta features from OOF predictions + regime + microstructure
-    train_features = features_df[features_df.index <= train_end]
+    # Use .loc slice instead of boolean mask to avoid OOM with 1.2GB DataFrames
+    train_features = features_df.loc[:train_end]
 
     # Extract regime prob columns — reindex to directional bars (aligned_index)
     aligned_index = train_labels_aligned.index
