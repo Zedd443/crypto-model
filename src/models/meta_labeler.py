@@ -43,9 +43,10 @@ def build_meta_features(
         "primary_confidence": primary_confidence,
     })
 
-    # Regime probabilities
+    # Regime probabilities — only raw prob columns, not derived rank/entropy cols
     if regime_probs_df is not None and len(regime_probs_df) > 0:
-        for col in regime_probs_df.columns:
+        prob_cols = [c for c in regime_probs_df.columns if not any(x in c for x in ("_rank", "_entropy", "_diff"))]
+        for col in prob_cols:
             meta_df[col] = regime_probs_df[col].values if len(regime_probs_df) == len(meta_df) else np.nan
 
     # Volatility and flow features
