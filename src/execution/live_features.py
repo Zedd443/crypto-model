@@ -52,8 +52,9 @@ def compute_live_features(symbol: str, cfg, lookback_df: pd.DataFrame) -> pd.Ser
     missing_cols = [c for c in selected_features if c not in last_row.columns]
     if missing_cols:
         logger.warning(f"{symbol}: {len(missing_cols)} feature cols missing from live compute — filling NaN")
-        for c in missing_cols:
-            last_row[c] = np.nan
+        # Use concat instead of per-column insert to avoid DataFrame fragmentation
+        fill_df = pd.DataFrame(np.nan, index=last_row.index, columns=missing_cols)
+        last_row = pd.concat([last_row, fill_df], axis=1)
 
     last_row = last_row[selected_features]
 

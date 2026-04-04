@@ -63,17 +63,27 @@ if not raw_link.exists():
     raw_link.symlink_to(RAW)
 
 # Mode A: symlink pre-built feature parquets from batch datasets
-# Kaggle mounts user datasets at /kaggle/input/{slug}/
+# Debug: print all available input dirs so we can verify mount paths
+print("Available /kaggle/input/ directories:")
+for _p in sorted(Path("/kaggle/input").iterdir()):
+    print(f"  {_p}")
+
 feat_dst = data_dir / "features"
 feat_dst.mkdir(exist_ok=True)
 
 _feat_count = 0
 for _batch_num in range(1, 5):
-    _batch_dir = Path(f"/kaggle/input/crypto-model-features-{_batch_num}")
-    if not _batch_dir.exists():
-        print(f"  features-{_batch_num}: not attached, skipping")
+    # Try both known Kaggle mount path formats
+    _candidates = [
+        Path(f"/kaggle/input/crypto-model-features-{_batch_num}"),
+        Path(f"/kaggle/input/datasets/irfandragneel/crypto-model-features-{_batch_num}"),
+    ]
+    _batch_dir = next((p for p in _candidates if p.exists()), None)
+    if _batch_dir is None:
+        print(f"  features-{_batch_num}: not attached (tried {[str(c) for c in _candidates]})")
         continue
-    for _pq in _batch_dir.glob("*.parquet"):
+    print(f"  features-{_batch_num}: found at {_batch_dir}")
+    for _pq in _batch_dir.glob("**/*.parquet"):  # ** to catch any subdir
         _link = feat_dst / _pq.name
         if not _link.exists():
             _link.symlink_to(_pq)
