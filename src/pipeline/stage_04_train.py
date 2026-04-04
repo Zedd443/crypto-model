@@ -318,16 +318,13 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     )
 
     # Save OOF predictions for meta-labeler (stage 05)
-    # Must carry X_train_final's DatetimeIndex (directional bars only) so stage_05 can align by index.
+    # Keep .npy for speed; save index separately so stage_05 can align by timestamp.
     oof_dir = checkpoints_dir / "oof"
     oof_dir.mkdir(parents=True, exist_ok=True)
-    oof_df = pd.DataFrame(
-        oof_proba,
-        index=X_train_final.index,
-        columns=["prob_short", "prob_long"],
-    )
-    oof_path = oof_dir / f"{symbol}_{_TF}_oof_proba.parquet"
-    oof_df.to_parquet(str(oof_path))
+    oof_path = oof_dir / f"{symbol}_{_TF}_oof_proba.npy"
+    oof_idx_path = oof_dir / f"{symbol}_{_TF}_oof_index.npy"
+    np.save(str(oof_path), oof_proba)
+    np.save(str(oof_idx_path), X_train_final.index.view("int64").values)  # store as ns-since-epoch int64
 
     # Save feature selection result
     features_sel_path = checkpoints_dir / "feature_selection" / f"{symbol}_{_TF}_selected.json"

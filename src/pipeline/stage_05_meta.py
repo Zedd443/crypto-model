@@ -31,13 +31,26 @@ def _train_meta_symbol(
     logger.info(f"Meta-labeling {symbol}")
     train_end = pd.Timestamp(cfg.data.train_end, tz="UTC")
 
-    # Load OOF predictions from stage 04 (parquet with DatetimeIndex — directional bars only)
-    oof_path = checkpoints_dir / "oof" / f"{symbol}_{_TF}_oof_proba.parquet"
+    # Load OOF predictions from stage 04 (.npy for speed + separate index file)
+    oof_path = checkpoints_dir / "oof" / f"{symbol}_{_TF}_oof_proba.npy"
+    oof_idx_path = checkpoints_dir / "oof" / f"{symbol}_{_TF}_oof_index.npy"
     if not oof_path.exists():
         return symbol, None, f"OOF predictions not found: {oof_path}"
 
-    oof_df = pd.read_parquet(str(oof_path))
-    # oof_df has columns [prob_short, prob_long], index = directional train bars
+    oof_arr = np.load(str(oof_path))  # shape (n_directional, 2)
+    if oof_idx_path.exists():
+        # New format: index saved as int64 ns-since-epoch
+        idx_int = np.load(str(oof_idx_path))
+        oof_index = pd.DatetimeIndex(idx_int.astype("datetime64[ns]"), tz="UTC")
+    else:
+        # Old format (pre-index-fix): no index file — fall back to positional alignment with warning
+        logger.warning(f"{symbol}: OOF index file missing — using positional alignment (less accurate). Retrain stage_04 to fix.")
+        oof_index = None
+
+    if oof_index is not None:
+        oof_df = pd.DataFrame(oof_arr, index=oof_index, columns=["prob_short", "prob_long"])
+    else:
+        oof_df = None  # handled below with positional fallback
 
     # Load labels
     labels_path = labels_dir / f"{symbol}_{_TF}_labels.parquet"
@@ -55,24 +68,31 @@ def _train_meta_symbol(
     except Exception as e:
         return symbol, None, f"Features not found: {e}"
 
-    # Train data only — filter to bars <= train_end then intersect with OOF index.
-    # OOF only exists for directional (non-neutral) bars; align by index, not position.
+    # Train data only
     train_labels_all = labels_df[labels_df.index <= train_end]
-    train_labels_aligned = train_labels_all.loc[
-        train_labels_all.index.intersection(oof_df.index)
-    ]
-    oof_df = oof_df.loc[train_labels_aligned.index]  # same index after intersection
+
+    if oof_df is not None:
+        # New format: align by DatetimeIndex — OOF only has directional bars
+        train_labels_aligned = train_labels_all.loc[
+            train_labels_all.index.intersection(oof_df.index)
+        ]
+        oof_df = oof_df.loc[train_labels_aligned.index]
+        oof_proba = oof_df[["prob_short", "prob_long"]].values
+    else:
+        # Old format fallback: drop neutrals positionally (less accurate alignment)
+        train_dir = train_labels_all[train_labels_all["label"] != 0]
+        min_len = min(len(train_dir), len(oof_arr))
+        train_labels_aligned = train_dir.iloc[:min_len]
+        oof_proba = oof_arr[:min_len]
 
     train_weights = sample_weights.reindex(train_labels_aligned.index).fillna(1.0)
     y_train_series = (train_labels_aligned["label"] == 1).astype(int)
     y_train = y_train_series.values
-    oof_proba = oof_df[["prob_short", "prob_long"]].values
 
     if len(y_train) != len(oof_proba):
-        # Should never happen after index alignment, but guard defensively
         return symbol, None, (
-            f"OOF/label index mismatch after alignment — y_train={len(y_train)}, "
-            f"oof_proba={len(oof_proba)}. Rerun stage_04 to regenerate OOF."
+            f"OOF/label mismatch after alignment — y_train={len(y_train)}, "
+            f"oof_proba={len(oof_proba)}. Rerun stage_04."
         )
 
     if len(y_train) < 100:
