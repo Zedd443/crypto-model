@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-04-02T15:05:10.695942+00:00",
+  "last_updated": "2026-04-03T22:59:33.960582+00:00",
   "stages": {
     "ingest": {
       "status": "done",
@@ -10,20 +10,37 @@
       ]
     },
     "features": {
-      "status": "pending",
-      "hash": null,
-      "last_run": null,
+      "status": "done",
+      "hash": "3cfd5c35662e5945844249d227f49b36",
+      "last_run": "2026-04-02T18:21:54.131338+00:00",
       "issues": []
     },
     "labels": {
-      "status": "pending",
-      "hash": null,
-      "last_run": null,
+      "status": "done",
+      "hash": "cd8519a2a2d0dc1b4e5e79ab5243198a",
+      "last_run": "2026-04-03T14:33:58.035720+00:00",
       "issues": []
     },
     "training": {
       "status": "pending",
-      "completed_symbols": [],
+      "completed_symbols": [
+        "BTCUSDT",
+        "SOLUSDT",
+        "AVAXUSDT",
+        "DOTUSDT",
+        "NEARUSDT",
+        "ATOMUSDT",
+        "ALGOUSDT",
+        "TRXUSDT",
+        "TONUSDT",
+        "HBARUSDT",
+        "SUIUSDT",
+        "ARBUSDT",
+        "OPUSDT",
+        "STRKUSDT",
+        "UNIUSDT",
+        "INJUSDT"
+      ],
       "failed_symbols": {},
       "hash": null,
       "last_run": null,

@@ -28,14 +28,14 @@ def compute_live_features(symbol: str, cfg, lookback_df: pd.DataFrame) -> pd.Ser
     last_row = feat_df.iloc[[-1]].copy()
 
     # Load imputer — fit was done on train split only (no leakage)
-    imputer_path = Path(cfg.data.checkpoints_dir) / "imputers" / f"{symbol}_15m_imputer.pkl"
+    imputer_path = Path(cfg.data.checkpoints_dir) / "imputers" / f"imputer_{symbol}_15m.pkl"
     if not imputer_path.exists():
         raise FileNotFoundError(f"Imputer not found: {imputer_path}")
     with open(imputer_path, "rb") as f:
         imputer = pickle.load(f)
 
     # Load scaler — fit was done on train split only (no leakage)
-    scaler_path = Path(cfg.data.checkpoints_dir) / "scalers" / f"{symbol}_15m_scaler.pkl"
+    scaler_path = Path(cfg.data.checkpoints_dir) / "imputers" / f"scaler_{symbol}_15m.pkl"
     if not scaler_path.exists():
         raise FileNotFoundError(f"Scaler not found: {scaler_path}")
     with open(scaler_path, "rb") as f:
