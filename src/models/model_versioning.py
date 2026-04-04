@@ -97,35 +97,47 @@ def register_model(
 def get_latest_model(symbol: str, tf: str, model_type: str = "primary") -> dict | None:
     if not _REGISTRY_PATH.exists():
         return None
-    with open(_REGISTRY_PATH) as f:
-        registry = json.load(f)
 
-    matching = [
-        m for m in registry.get("models", [])
-        if m["symbol"] == symbol and m["tf"] == tf and m["model_type"] == model_type
-    ]
+    # Acquire lock to prevent reading while concurrent write is in progress
+    _acquire_lock()
+    try:
+        with open(_REGISTRY_PATH) as f:
+            registry = json.load(f)
 
-    if not matching:
-        return None
+        matching = [
+            m for m in registry.get("models", [])
+            if m["symbol"] == symbol and m["tf"] == tf and m["model_type"] == model_type
+        ]
 
-    # Sort by created_at descending
-    matching.sort(key=lambda x: x["created_at"], reverse=True)
-    return matching[0]
+        if not matching:
+            return None
+
+        # Sort by created_at descending
+        matching.sort(key=lambda x: x["created_at"], reverse=True)
+        return matching[0]
+    finally:
+        _release_lock()
 
 
 def get_active_models() -> dict:
     if not _REGISTRY_PATH.exists():
         return {}
-    with open(_REGISTRY_PATH) as f:
-        registry = json.load(f)
 
-    # Group by (symbol, tf) and return latest primary model per pair
-    latest = {}
-    for m in registry.get("models", []):
-        if m["model_type"] != "primary":
-            continue
-        key = f"{m['symbol']}_{m['tf']}"
-        if key not in latest or m["created_at"] > latest[key]["created_at"]:
-            latest[key] = m
+    # Acquire lock to prevent reading while concurrent write is in progress
+    _acquire_lock()
+    try:
+        with open(_REGISTRY_PATH) as f:
+            registry = json.load(f)
 
-    return latest
+        # Group by (symbol, tf) and return latest primary model per pair
+        latest = {}
+        for m in registry.get("models", []):
+            if m["model_type"] != "primary":
+                continue
+            key = f"{m['symbol']}_{m['tf']}"
+            if key not in latest or m["created_at"] > latest[key]["created_at"]:
+                latest[key] = m
+
+        return latest
+    finally:
+        _release_lock()
