@@ -244,6 +244,14 @@ def run(cfg, **kwargs) -> None:
                     "— no new position opens this bar (sync_fills and predictions still run)"
                 )
 
+            # Fetch BTC 15m klines once per bar — reused by all non-BTC symbols for
+            # funding cross-coin divergence feature. None if fetch fails.
+            btc_klines_bar: pd.DataFrame | None = None
+            try:
+                btc_klines_bar = client.get_klines("BTCUSDT", primary_tf, limit=lookback_needed)
+            except Exception as _btc_exc:
+                logger.warning(f"Could not pre-fetch BTC klines: {_btc_exc}")
+
             bar_signals = []  # collect per-symbol signal data for dashboard
             for symbol in tqdm(forecast_symbols, desc="stage_08", unit="sym", position=0, leave=False):
                 open_count = len(order_manager.positions)  # refresh after each symbol
@@ -261,6 +269,7 @@ def run(cfg, **kwargs) -> None:
                         trade_limit=trade_limit,
                         open_count=open_count,
                         skip_new_entries=daily_target_hit,
+                        btc_klines_15m=btc_klines_bar,
                     )
                     if sig_info is not None:
                         bar_signals.append(sig_info)
@@ -337,18 +346,40 @@ def _process_symbol(
     trade_limit: int = 1,
     open_count: int = 0,
     skip_new_entries: bool = False,
+    btc_klines_15m: pd.DataFrame | None = None,
 ) -> dict | None:
     # Returns a signal-info dict for the dashboard, or None on hard failure
     primary_tf = str(cfg.data.primary_timeframe)
 
-    # Fetch live OHLCV bars
+    # Fetch live OHLCV bars — 15m (primary timeframe)
     klines_df = client.get_klines(symbol, primary_tf, limit=lookback_needed)
     if len(klines_df) < lookback_needed // 2:
         logger.warning(f"{symbol}: insufficient kline data ({len(klines_df)} bars) — skipping")
         return None
 
-    # Compute live features
-    feature_series = compute_live_features(symbol, cfg, klines_df)
+    # Fetch HTF klines for multi-timeframe features (1h, 4h, 1d)
+    # Each HTF uses the same lookback cap; 1500 bars of 1h = ~62 days, enough for all indicators.
+    klines_1h, klines_4h, klines_1d = None, None, None
+    for tf, limit in [("1h", 500), ("4h", 200), ("1d", 100)]:
+        try:
+            df_htf = client.get_klines(symbol, tf, limit=limit)
+            if tf == "1h":
+                klines_1h = df_htf
+            elif tf == "4h":
+                klines_4h = df_htf
+            elif tf == "1d":
+                klines_1d = df_htf
+        except Exception as _htf_exc:
+            logger.warning(f"{symbol}: could not fetch {tf} klines — HTF features will be missing: {_htf_exc}")
+
+    # Compute live features — full feature pipeline matching training
+    feature_series = compute_live_features(
+        symbol, cfg, klines_df,
+        klines_1h=klines_1h,
+        klines_4h=klines_4h,
+        klines_1d=klines_1d,
+        btc_klines_15m=btc_klines_15m,
+    )
 
     cached = _model_cache.get(symbol, {})
     primary_model, calibrator = cached.get("primary", (None, None))
@@ -410,7 +441,7 @@ def _process_symbol(
         return sig_info
 
     # Size the position
-    half_kelly = float(cfg.portfolio.kelly_fraction) * 0.5  # cfg already stores the full fraction; halve it
+    half_kelly = float(cfg.portfolio.kelly_fraction)  # already 0.5 = half-Kelly from config
 
     # Determine leverage from growth gate tier
     _, leverage = get_growth_gate_limits(equity, cfg)

@@ -267,10 +267,34 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ## Critical Path (Fix Order)
 
-ISSUE-001 through ISSUE-018 are all FIXED. Remaining open:
+ISSUE-001 through ISSUE-021 are all FIXED. Remaining open:
 
-1. ISSUE-006 PBO computation still returns ~0.5 (splitter.py) — Tier A gate unreliable, medium priority
-2. ISSUE-007 conformal width still inverted — position sizing backwards, medium priority
+1. ISSUE-006 PBO computation still returns ~0.5 (splitter.py) — Tier A gate unreliable, medium priority (acceptable for demo)
+2. Meta-labeling still needs re-run for all 15 symbols besides SOLUSDT (run `--stage 5 --force` then stages 6+7)
+
+### ISSUE-019: live_features.py was missing ~70% of model features — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/execution/live_features.py`
+- **Problem**: `compute_live_features` only called `build_technical_features`. All microstructure, funding, HMM regime, BOCPD, fracdiff, HTF, macro, and onchain features were absent. Missing features were NaN-imputed to train means → garbage predictions.
+- **Fix**: Expanded to call the full feature pipeline in the same order as `feature_pipeline.build_features_for_symbol`. New signature accepts `klines_1h/4h/1d` (fetched per-symbol in `_process_symbol`) and `btc_klines_15m` (fetched once per bar in the main loop). Also added global `shift(1)` before taking `last_row` to match training.
+- **Status**: FIXED
+
+### ISSUE-020: conformal_width inverted — certain signals got smallest position — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/pipeline/stage_06_portfolio.py:119`
+- **Problem**: `conformal_width = abs(raw_proba[:, 1] - 0.5) * 2` is a confidence score (0=uncertain, 1=certain). `apply_conformal_size_scaling` treats width < 0.20 as "narrow = full position". Combined: maximum confidence → 1.0 width → 0.3× scale. Backwards.
+- **Fix**: Changed to `1.0 - abs(raw_proba[:, 1] - 0.5) * 2`. Now width=0 means certain (full position), width=1 means uncertain (0.3× scale).
+- **Status**: FIXED
+
+### ISSUE-021: half_kelly double-halved in stage_08 — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/pipeline/stage_08_live.py:413`
+- **Problem**: `cfg.portfolio.kelly_fraction = 0.5` (already half-Kelly). Code did `kelly_fraction * 0.5` → effective 0.25× Kelly. Live positions were half the size that backtest used.
+- **Fix**: Changed to `half_kelly = float(cfg.portfolio.kelly_fraction)`.
+- **Status**: FIXED
 
 ### DECISION-R011: 2-notebook Kaggle split (CPU labels + GPU training)
 - **Date**: 2026-04-04

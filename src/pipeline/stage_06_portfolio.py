@@ -116,7 +116,8 @@ def _generate_symbol_signals(
     signals = generate_signals(proba_df, meta_proba_series, regime_df, cfg)
 
     # Apply conformal width scaling
-    conformal_width = abs(raw_proba[:, 1] - 0.5) * 2  # rough width proxy
+    # Invert so width=0 means certain (→ full position) and width=1 means uncertain (→ 30% position)
+    conformal_width = 1.0 - abs(raw_proba[:, 1] - 0.5) * 2  # 0=certain, 1=uncertain
     signals["conformal_width"] = conformal_width
 
     # Add ATR for position sizing
