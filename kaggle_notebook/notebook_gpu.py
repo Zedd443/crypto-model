@@ -44,11 +44,14 @@ OUT     = WORK / "output"
 OUT.mkdir(exist_ok=True)
 
 # ── 1. Clone latest code ───────────────────────────────────────────────────────
-subprocess.run([
-    "git", "clone", "--depth=1",
-    "https://github.com/Zedd443/crypto-model.git",
-    str(REPO)
-], check=True)
+if REPO.exists():
+    subprocess.run(["git", "-C", str(REPO), "pull", "--ff-only"], check=True)
+else:
+    subprocess.run([
+        "git", "clone", "--depth=1",
+        "https://github.com/Zedd443/crypto-model.git",
+        str(REPO)
+    ], check=True)
 
 sys.path.insert(0, str(REPO))
 os.chdir(REPO)
@@ -162,7 +165,10 @@ from src.pipeline import (
 
 import sys as _sys
 import traceback as _tb
-_sys.stdout.reconfigure(line_buffering=True)
+try:
+    _sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # Kaggle OutStream doesn't support reconfigure
 import logging as _logging
 _logging.basicConfig(stream=_sys.stdout, level=_logging.INFO, force=True)
 
