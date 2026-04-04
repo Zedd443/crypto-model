@@ -31,12 +31,13 @@ def _train_meta_symbol(
     logger.info(f"Meta-labeling {symbol}")
     train_end = pd.Timestamp(cfg.data.train_end, tz="UTC")
 
-    # Load OOF predictions from stage 04
-    oof_path = checkpoints_dir / "oof" / f"{symbol}_{_TF}_oof_proba.npy"
+    # Load OOF predictions from stage 04 (parquet with DatetimeIndex — directional bars only)
+    oof_path = checkpoints_dir / "oof" / f"{symbol}_{_TF}_oof_proba.parquet"
     if not oof_path.exists():
         return symbol, None, f"OOF predictions not found: {oof_path}"
 
-    oof_proba = np.load(str(oof_path))
+    oof_df = pd.read_parquet(str(oof_path))
+    # oof_df has columns [prob_short, prob_long], index = directional train bars
 
     # Load labels
     labels_path = labels_dir / f"{symbol}_{_TF}_labels.parquet"
@@ -54,20 +55,25 @@ def _train_meta_symbol(
     except Exception as e:
         return symbol, None, f"Features not found: {e}"
 
-    # Train data only (OOF predictions are from train period)
-    train_labels = labels_df[labels_df.index <= train_end]
-    train_weights = sample_weights.reindex(train_labels.index).fillna(1.0)
-    y_train = (train_labels["label"] == 1).astype(int).values
+    # Train data only — filter to bars <= train_end then intersect with OOF index.
+    # OOF only exists for directional (non-neutral) bars; align by index, not position.
+    train_labels_all = labels_df[labels_df.index <= train_end]
+    train_labels_aligned = train_labels_all.loc[
+        train_labels_all.index.intersection(oof_df.index)
+    ]
+    oof_df = oof_df.loc[train_labels_aligned.index]  # same index after intersection
+
+    train_weights = sample_weights.reindex(train_labels_aligned.index).fillna(1.0)
+    y_train_series = (train_labels_aligned["label"] == 1).astype(int)
+    y_train = y_train_series.values
+    oof_proba = oof_df[["prob_short", "prob_long"]].values
 
     if len(y_train) != len(oof_proba):
-        min_len = min(len(y_train), len(oof_proba))
-        logger.warning(
-            f"{symbol}: OOF/label length mismatch — y_train={len(y_train)}, "
-            f"oof_proba={len(oof_proba)}, trimming to {min_len}. Check stage_04 OOF alignment."
+        # Should never happen after index alignment, but guard defensively
+        return symbol, None, (
+            f"OOF/label index mismatch after alignment — y_train={len(y_train)}, "
+            f"oof_proba={len(oof_proba)}. Rerun stage_04 to regenerate OOF."
         )
-        y_train = y_train[:min_len]
-        oof_proba = oof_proba[:min_len]
-        train_weights = train_weights.iloc[:min_len]
 
     if len(y_train) < 100:
         return symbol, None, f"Insufficient train samples for meta-labeling: {len(y_train)}"
@@ -78,43 +84,42 @@ def _train_meta_symbol(
     # Build meta features from OOF predictions + regime + microstructure
     train_features = features_df[features_df.index <= train_end]
 
-    # Extract regime prob columns
+    # Extract regime prob columns — reindex to directional bars (aligned_index)
+    aligned_index = train_labels_aligned.index
     regime_cols = [c for c in train_features.columns if c.startswith("regime_prob_")]
-    regime_probs = train_features[regime_cols].reindex(train_labels.index) if regime_cols else None
+    regime_probs = train_features[regime_cols].reindex(aligned_index) if regime_cols else None
 
     # Realized vol proxy (volume_zscore or rv_daily)
     realized_vol = (
-        train_features["rv_daily"].reindex(train_labels.index)
+        train_features["rv_daily"].reindex(aligned_index)
         if "rv_daily" in train_features.columns
-        else pd.Series(0.0, index=train_labels.index)
+        else pd.Series(0.0, index=aligned_index)
     )
 
     volume_zscore = (
-        train_features["volume_surprise_20"].reindex(train_labels.index)
+        train_features["volume_surprise_20"].reindex(aligned_index)
         if "volume_surprise_20" in train_features.columns
-        else pd.Series(0.0, index=train_labels.index)
+        else pd.Series(0.0, index=aligned_index)
     )
 
     ofi = (
-        train_features["ofi_20"].reindex(train_labels.index)
+        train_features["ofi_20"].reindex(aligned_index)
         if "ofi_20" in train_features.columns
-        else pd.Series(0.0, index=train_labels.index)
+        else pd.Series(0.0, index=aligned_index)
     )
 
-    # Align regime probs to oof length
-    if regime_probs is not None:
-        regime_probs = regime_probs.iloc[:len(y_train)]
-    realized_vol_arr = realized_vol.iloc[:len(y_train)]
-    volume_zscore_arr = volume_zscore.iloc[:len(y_train)]
-    ofi_arr = ofi.iloc[:len(y_train)]
+    # regime_probs, realized_vol, volume_zscore, ofi are already on aligned_index
+    realized_vol_arr = realized_vol
+    volume_zscore_arr = volume_zscore
+    ofi_arr = ofi
 
     meta_X = build_meta_features(
         oof_proba, regime_probs, realized_vol_arr, volume_zscore_arr, ofi_arr
     )
     meta_X = meta_X.fillna(0.0)
 
-    # Align weights
-    w_meta = train_weights.iloc[:len(meta_y)]
+    # Align weights (already on aligned_index, same length as meta_y)
+    w_meta = train_weights
 
     # Train meta-labeler
     try:

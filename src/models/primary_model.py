@@ -226,17 +226,21 @@ def compute_oof_predictions(
     early_stop_rounds = int(cfg.model.xgb_early_stopping_rounds)
 
     for train_idx, val_idx in splitter.split(X, y):
-        X_tr = X.iloc[train_idx].values
-        y_tr = y.iloc[train_idx].values
-        w_tr = weights.iloc[train_idx].values if hasattr(weights, "iloc") else weights[train_idx]
+        X_t = X.iloc[train_idx].values
+        y_t = y.iloc[train_idx].values
+        w_t = weights.iloc[train_idx].values if hasattr(weights, "iloc") else weights[train_idx]
         X_v = X.iloc[val_idx].values
         y_v = y.iloc[val_idx].values
 
         xgb_params = build_xgb_params(params, cfg)
         n_estimators = xgb_params.pop("n_estimators")
-        # For OOF we split val further for early stopping
-        val_split = max(int(len(X_v) * 0.2), 1)
-        X_es, y_es = X_v[:val_split], y_v[:val_split]
+
+        # Use TAIL of train fold for early stopping — keeps ALL val_idx bars available for OOF.
+        # Cap the ES holdout at 200 bars to avoid shrinking small train folds too much.
+        train_split = max(int(len(X_t) * 0.8), len(X_t) - 200)
+        X_t_fit, y_t_fit = X_t[:train_split], y_t[:train_split]
+        w_t_fit = w_t[:train_split]
+        X_es, y_es = X_t[train_split:], y_t[train_split:]
 
         model = XGBClassifier(
             **xgb_params,
@@ -246,13 +250,14 @@ def compute_oof_predictions(
         )
         try:
             model.fit(
-                X_tr, y_tr,
-                sample_weight=w_tr,
+                X_t_fit, y_t_fit,
+                sample_weight=w_t_fit,
                 eval_set=[(X_es, y_es)],
                 verbose=False,
             )
+            # ALL val fold bars receive real OOF predictions — no wasted 0.5 defaults
             proba = model.predict_proba(X_v)
-            oof_proba[val_idx[val_split:]] = proba[val_split:]
+            oof_proba[val_idx] = proba
         except Exception as e:
             logger.warning(f"OOF fold failed: {e}")
 

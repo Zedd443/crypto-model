@@ -197,11 +197,10 @@ monitoring:
   model_stale_threshold: 0.3                  # flag model as stale if weight decays below this
 
 trading:
-  mode: "TESTNET"                              # active trading mode: DEMO / TESTNET / MAINNET
+  mode: "DEMO"                                 # active trading mode: DEMO / MAINNET
   endpoints:
-    DEMO: "https://demo-fapi.binance.com"      # Binance paper trading FAPI (no real money)
-    TESTNET: "https://testnet.binancefuture.com" # Binance futures testnet
-    MAINNET: "https://fapi.binance.com"        # Binance live futures API
+    DEMO: "https://testnet.binancefuture.com"  # Binance paper trading futures (no real money)
+    MAINNET: "https://fapi.binance.com"        # Binance live futures — NEVER use accidentally
   websocket_ping_interval: 30                  # WebSocket keepalive ping interval (seconds)
   websocket_reconnect_delay: 5                 # seconds to wait before reconnecting a dropped WS
   rate_limit_backoff_base: 2                   # exponential backoff base (seconds) on 429 errors

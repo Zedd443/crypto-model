@@ -140,6 +140,52 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 - **Rationale**: With $120 starting equity, 1 symbol is too conservative for demo phase. 2 symbols with 2× leverage is still within safe risk limits (max total margin = 80% equity).
 - **Status**: CONFIRMED
 
+### ISSUE-012: Backtest costs never applied in engine.py — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/backtest/engine.py`, `_close_position`
+- **Problem**: `_close_position` computed raw PnL with no cost deduction. Reported results were pre-cost and thus optimistic.
+- **Fix**: Imported `compute_total_trade_cost` from `src.backtest.costs`. Called in `_close_position` after computing `pnl_usd`, subtracted `cost["total_cost_usd"]`. `hold_hours` derived from `hold_bars * 0.25`. `adv_usd=0` (market impact via slippage_pct only), `funding_rate=0` (no per-position funding data). Added `cost_usd` field to trade_log.
+- **Status**: FIXED
+
+### ISSUE-013: Market impact triple-counted in costs.py — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/backtest/costs.py`, `compute_total_trade_cost`
+- **Problem**: `compute_sqrt_market_impact()` was baked into both `entry_slippage_pct` and `exit_slippage_pct`, then a standalone `market_impact` variable was separately added to `total`. Result: market impact counted 3× (entry slippage + exit slippage + standalone).
+- **Fix**: Removed standalone `market_impact` variable and its addition to total. Renamed return key `"total"` → `"total_cost_usd"`. Total = slippage_entry + slippage_exit + commission_entry + commission_exit + funding only.
+- **Status**: FIXED
+
+### ISSUE-014: hit_rate wrong dict nesting in stage_06 — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/pipeline/stage_06_portfolio.py`, `_generate_symbol_signals`
+- **Problem**: `_bs.get("hit_rate")` returned `None` because `backtest_summary.json` nests metrics under a `"metrics"` key. win_rate always fell back to 0.52 hardcoded value, ignoring backtest results.
+- **Fix**: Changed to `_bs.get("metrics", {}).get("hit_rate")`.
+- **Status**: FIXED
+
+### ISSUE-015: OOF index misalignment between stage_04 and stage_05 — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/pipeline/stage_04_train.py` (save), `src/pipeline/stage_05_meta.py` (load)
+- **Problem**: Stage_04 saved OOF as a raw `.npy` array (no index). Stage_05 loaded it and tried to align with `y_train` (all labels, including neutral) by position — length mismatch and off-by-one misalignment for every symbol.
+- **Fix**: Stage_04 now saves OOF as a parquet DataFrame with columns `[prob_short, prob_long]` and the DatetimeIndex of `X_train_final` (directional bars only). Stage_05 loads the parquet, intersects `train_labels.index` with `oof_df.index` to produce `train_labels_aligned`, then reindexes all auxiliary series to `aligned_index`. Length-based trim logic removed entirely.
+- **Status**: FIXED
+
+### ISSUE-016: OOF early-stopping consumed val fold bars — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/models/primary_model.py`, `compute_oof_predictions`
+- **Problem**: First 20% of each val fold was used as the early-stopping eval set. Those bars were never filled with real predictions (retained 0.5 default). ~20% of each fold's OOF was garbage, degrading meta-labeler training.
+- **Fix**: Early-stopping eval set is now the LAST 20% of the TRAIN fold (capped at 200 bars). Model fit uses the first 80% of the train fold. ALL `val_idx` bars receive real predictions: `oof_proba[val_idx] = proba`. The `val_split` variable removed entirely.
+- **Status**: FIXED
+
+### DECISION-R008: Binance modes simplified to DEMO/MAINNET only — FIXED
+- **Date**: 2026-04-04
+- **Decision**: Removed TESTNET mode from `config/base.yaml` and `binance_client.py`. Only two modes exist: `DEMO` (→ `testnet.binancefuture.com`, keys `BINANCE_DEMO_*`) and `MAINNET` (→ `fapi.binance.com`, keys `BINANCE_API_*`). Active mode set to `DEMO`.
+- **Rationale**: `testnet.binancefuture.com` IS the Binance paper trading / demo futures environment. Calling it "DEMO" removes the confusing TESTNET/DEMO distinction. `.env` updated with `BINANCE_DEMO_API_KEY` / `BINANCE_DEMO_API_SECRET` mirroring the existing testnet credentials.
+- **Status**: CONFIRMED
+
 ---
 
 ## Confirmed Decisions from Git History

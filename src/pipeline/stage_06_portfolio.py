@@ -137,11 +137,11 @@ def _generate_symbol_signals(
     if backtest_summary_path.exists():
         with open(backtest_summary_path) as _f:
             _bs = json.load(_f)
-        _wr = _bs.get("hit_rate")
+        _wr = _bs.get("metrics", {}).get("hit_rate")
         if _wr is not None and 0.3 <= float(_wr) <= 0.8:
             win_rate = float(_wr)
         else:
-            logger.warning(f"backtest_summary hit_rate={_wr} out of range, using fallback 0.52")
+            logger.warning(f"backtest_summary metrics.hit_rate={_wr} out of range or missing, using fallback 0.52")
     else:
         logger.warning("backtest_summary.json not found, using win_rate=0.52 fallback")
     avg_win = float(cfg.labels.tp_atr_mult) * 0.01

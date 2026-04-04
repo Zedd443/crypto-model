@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from src.backtest.survivorship import check_delistings
+from src.backtest.costs import compute_total_trade_cost
 from src.utils.logger import get_logger
 
 logger = get_logger("engine")
@@ -243,7 +244,6 @@ class BacktestEngine:
 
         pnl_pct = (price - entry_price) / (entry_price + 1e-9) * direction
         pnl_usd = pnl_pct * size_usd
-        self.equity += pnl_usd
 
         hold_bars = 0
         if pos["entry_time"] is not None:
@@ -254,6 +254,25 @@ class BacktestEngine:
             except Exception:
                 hold_bars = 0
 
+        # Deduct trade costs: slippage (entry + exit) + commissions + funding
+        # adv_usd=0 so sqrt market impact term is zero — market impact already baked into
+        # slippage_pct in config.  funding_rate=0 avoids needing per-symbol funding data.
+        hold_hours = hold_bars * 0.25  # each bar is 15 minutes = 0.25 hours
+        cost = compute_total_trade_cost(
+            entry_price=entry_price,
+            exit_price=price,
+            size_usd=size_usd,
+            direction=direction,
+            adv_usd=0.0,
+            funding_rate=0.0,
+            hold_hours=hold_hours,
+            cfg=self.cfg,
+        )
+        pnl_usd -= cost["total_cost_usd"]
+        logger.debug(f"Exit: {symbol} reason={reason} pnl_usd={pnl_usd:.2f} cost_usd={cost['total_cost_usd']:.4f}")
+
+        self.equity += pnl_usd
+
         self.trade_log.append({
             "symbol": symbol,
             "entry_time": pos["entry_time"],
@@ -263,11 +282,11 @@ class BacktestEngine:
             "exit_price": price,
             "pnl_pct": pnl_pct,
             "pnl_usd": pnl_usd,
+            "cost_usd": cost["total_cost_usd"],
             "exit_reason": reason,
             "size_usd": size_usd,
             "hold_bars": hold_bars,
         })
-        logger.debug(f"Exit: {symbol} reason={reason} pnl_pct={pnl_pct:.4f} pnl_usd={pnl_usd:.2f}")
 
     def _close_all_positions(self, current_prices: dict, timestamp: pd.Timestamp, reason: str) -> None:
         for symbol in list(self.positions.keys()):

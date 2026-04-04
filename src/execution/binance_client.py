@@ -14,22 +14,18 @@ logger = get_logger("binance_client")
 
 class BinanceClient:
     def __init__(self, cfg):
-        mode = cfg.trading.mode  # "DEMO", "TESTNET", or "MAINNET"
+        mode = cfg.trading.mode  # "DEMO" or "MAINNET"
         self._base_url = cfg.trading.endpoints[mode]
         self._backoff_base = float(cfg.trading.rate_limit_backoff_base)
         self._backoff_max = float(cfg.trading.rate_limit_backoff_max)
 
         # Select keys based on mode
-        # DEMO  → BINANCE_DEMO_API_KEY / BINANCE_DEMO_API_SECRET (demo-fapi.binance.com account)
-        # TESTNET → BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET
-        # MAINNET → BINANCE_API_KEY / BINANCE_API_SECRET
+        # DEMO    → BINANCE_DEMO_API_KEY / BINANCE_DEMO_API_SECRET (testnet.binancefuture.com — paper trading)
+        # MAINNET → BINANCE_API_KEY / BINANCE_API_SECRET (fapi.binance.com — real money)
         if mode == "DEMO":
             self._api_key = os.environ.get("BINANCE_DEMO_API_KEY", "")
             self._api_secret = os.environ.get("BINANCE_DEMO_API_SECRET", "")
-        elif mode == "TESTNET":
-            self._api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
-            self._api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET", "")
-        else:
+        else:  # MAINNET
             self._api_key = os.environ.get("BINANCE_API_KEY", "")
             self._api_secret = os.environ.get("BINANCE_API_SECRET", "")
 

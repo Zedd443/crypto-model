@@ -65,13 +65,12 @@ def compute_total_trade_cost(
 
     commission_exit = compute_commission(size_usd, commission_pct)
 
-    # Market impact (combined)
-    market_impact = compute_sqrt_market_impact(size_usd, adv_usd, impact_coef) * size_usd * 2
-
     # Funding
     funding = compute_funding_cost(funding_rate, hold_hours) * size_usd
 
-    total = slippage_entry + slippage_exit + commission_entry + commission_exit + funding + market_impact
+    # Market impact is already included inside entry_slippage_pct and exit_slippage_pct
+    # via compute_sqrt_market_impact — do NOT add a separate market_impact term here.
+    total_cost_usd = slippage_entry + slippage_exit + commission_entry + commission_exit + funding
 
     return {
         "slippage_entry": float(slippage_entry),
@@ -79,6 +78,5 @@ def compute_total_trade_cost(
         "commission_entry": float(commission_entry),
         "commission_exit": float(commission_exit),
         "funding": float(funding),
-        "market_impact": float(market_impact),
-        "total": float(total),
+        "total_cost_usd": float(total_cost_usd),
     }
