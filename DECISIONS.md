@@ -15,14 +15,7 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 ### ISSUE-011: Data split dates are stale — train/val/test should be updated before each retrain
 - **Date discovered**: 2026-04-03
 - **Location**: `config/base.yaml` lines 12-15
-- **Problem**: `train_end: 2024-06-30`, `val_end: 2024-09-30`, `test_start: 2024-10-01` were set at project start. Data now extends to 2026. These dates are never updated automatically.
-- **Decision**: Dates must be updated manually before each retrain cycle. Recommended schedule:
-  - **Current (stale)**: train_end=2024-06-30, val_end=2024-09-30, test_start=2024-10-01
-  - **Next retrain (recommended)**: train_end=2025-09-30, val_end=2025-10-01–2025-12-31, test_start=2026-01-01
-  - Rule: test set = last 3 months of available data. Val set = 3 months before that. Train = everything before val.
-- **Impact**: HIGH — using stale dates means 18 months of data (2024-10 to 2026-04) is sitting in "test" and never trained on. Model is suboptimal.
-- **Status**: NOT FIXED (requires manual config update before next retrain)
-- **Owner**: Before next retrain session
+- **Status**: FIXED (2026-04-04) — Updated to train_end=2025-09-30, val_end=2025-12-31, test_start=2026-01-01
 
 ---
 
@@ -274,11 +267,16 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ## Critical Path (Fix Order)
 
-ISSUE-001 through ISSUE-010 are all FIXED. Remaining open:
+ISSUE-001 through ISSUE-018 are all FIXED. Remaining open:
 
-1. **ISSUE-011** (stale train/val/test dates) — fix before next retrain
-2. ISSUE-006 PBO computation still returns ~0.5 (splitter.py) — Tier A gate unreliable, medium priority
-3. ISSUE-007 conformal width still inverted — position sizing backwards, medium priority
+1. ISSUE-006 PBO computation still returns ~0.5 (splitter.py) — Tier A gate unreliable, medium priority
+2. ISSUE-007 conformal width still inverted — position sizing backwards, medium priority
+
+### DECISION-R011: 2-notebook Kaggle split (CPU labels + GPU training)
+- **Date**: 2026-04-04
+- **Decision**: Split monolithic notebook into `notebook_cpu.py` (stage 3 labels, no GPU) and `notebook_gpu.py` (stages 4-7, GPU, auto-push output).
+- **Rationale**: Labels rarely change, CPU-only. Training is GPU-critical. Split reduces GPU quota waste and enables crash recovery per stage.
+- **Status**: CONFIRMED
 
 ## Data Integrity Notes
 

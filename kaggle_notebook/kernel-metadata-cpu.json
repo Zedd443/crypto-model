@@ -1,0 +1,16 @@
+{
+  "id": "irfandragneel/crypto-model-cpu",
+  "title": "crypto-model-cpu",
+  "code_file": "notebook_cpu.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "irfandragneel/crypto-model-raw-data",
+    "irfandragneel/crypto-model-checkpoints"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

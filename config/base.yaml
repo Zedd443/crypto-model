@@ -9,10 +9,10 @@ data:
   checkpoints_dir: "data/checkpoints"          # scalers, imputers, HMM states, XS stats
   timeframes: ["15m", "1h", "4h", "1d"]        # timeframes fetched and aligned per symbol
   primary_timeframe: "15m"                     # timeframe used for model training and signals
-  train_end: "2024-06-30"                      # last date of training set (inclusive)
-  val_start: "2024-07-01"                      # validation set start (hyperparameter selection)
-  val_end: "2024-09-30"                        # validation set end
-  test_start: "2024-10-01"                     # held-out test set start (never touched during tuning)
+  train_end: "2025-09-30"                      # last date of training set (inclusive)
+  val_start: "2025-10-01"                      # validation set start (hyperparameter selection)
+  val_end: "2025-12-31"                        # validation set end
+  test_start: "2026-01-01"                     # held-out test set start (never touched during tuning)
   min_history_bars: 5000                       # minimum bars required to include a symbol
   min_align_bars: 200                          # minimum overlapping bars across timeframes
 
