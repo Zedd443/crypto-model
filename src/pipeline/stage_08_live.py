@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed — keys must be set in environment manually
 
+from src.dashboard.live_dashboard import LiveDashboard
 from src.execution.binance_client import BinanceClient
 from src.execution.live_features import compute_live_features, get_lookback_bars_needed
 from src.execution.order_manager import OrderManager
@@ -146,12 +148,33 @@ def _compute_daily_pnl_pct(trade_log_path: Path, equity: float) -> float:
 def run(cfg, **kwargs) -> None:
     logger.info("=== Stage 8: Live Execution Loop ===")
 
+    # --- FIX 2: MAINNET safety interlock ---
+    trading_mode = str(cfg.trading.mode).upper()
+    logger.info(f"=== Trading mode: {trading_mode} ===")
+    if trading_mode == "MAINNET":
+        _confirm = os.environ.get("CONFIRM_MAINNET_TRADING", "").lower()
+        if _confirm != "yes":
+            raise RuntimeError(
+                "MAINNET mode requires CONFIRM_MAINNET_TRADING=yes in environment. "
+                "Set this env var only after completing demo_trades_required demo trades."
+            )
+        logger.warning("!!! MAINNET MODE — REAL MONEY ORDERS WILL BE PLACED !!!")
+
+    # --- FIX 6: warn if mainnet API key is loaded but mode=DEMO ---
+    if trading_mode == "DEMO" and os.environ.get("BINANCE_API_KEY"):
+        logger.warning(
+            "Mainnet BINANCE_API_KEY is present in environment but mode=DEMO — "
+            "ensure you are not accidentally using mainnet keys"
+        )
+
     primary_tf = str(cfg.data.primary_timeframe)
     bar_seconds = _parse_timeframe_seconds(primary_tf)
 
     all_symbols = _load_symbol_list()
     client = BinanceClient(cfg)
-    order_manager = OrderManager(client, cfg, _TRADE_LOG_PATH)
+    # Pass trading_mode so OrderManager can track demo trades correctly
+    order_manager = OrderManager(client, cfg, _TRADE_LOG_PATH, mode=trading_mode)
+    dashboard = LiveDashboard(cfg)
     lookback_needed = get_lookback_bars_needed(cfg)
     signal_floor = float(cfg.portfolio.signal_floor_prob)
     max_margin_pct = float(cfg.portfolio.max_total_margin_pct)
@@ -169,6 +192,18 @@ def run(cfg, **kwargs) -> None:
 
     state = load_state()
     forecast_symbols = _get_forecast_symbols(all_symbols, primary_tf)
+
+    # --- FIX 7: remove symbols missing imputer/scaler artifacts before first bar ---
+    _valid_symbols = []
+    for _sym in forecast_symbols:
+        _imp = Path(cfg.data.checkpoints_dir) / "imputers" / f"imputer_{_sym}_15m.pkl"
+        _scl = Path(cfg.data.checkpoints_dir) / "imputers" / f"scaler_{_sym}_15m.pkl"
+        if _imp.exists() and _scl.exists():
+            _valid_symbols.append(_sym)
+        else:
+            logger.warning(f"{_sym}: missing imputer or scaler — excluded from forecast")
+    forecast_symbols = _valid_symbols
+    logger.info(f"Forecast symbols after artifact check: {len(forecast_symbols)}")
 
     # Pre-load models for all forecast symbols at startup
     for _sym in forecast_symbols:
@@ -209,10 +244,11 @@ def run(cfg, **kwargs) -> None:
                     "— no new position opens this bar (sync_fills and predictions still run)"
                 )
 
+            bar_signals = []  # collect per-symbol signal data for dashboard
             for symbol in tqdm(forecast_symbols, desc="stage_08", unit="sym", position=0, leave=False):
                 open_count = len(order_manager.positions)  # refresh after each symbol
                 try:
-                    _process_symbol(
+                    sig_info = _process_symbol(
                         symbol=symbol,
                         client=client,
                         order_manager=order_manager,
@@ -226,6 +262,8 @@ def run(cfg, **kwargs) -> None:
                         open_count=open_count,
                         skip_new_entries=daily_target_hit,
                     )
+                    if sig_info is not None:
+                        bar_signals.append(sig_info)
                 except Exception as exc:
                     logger.error(f"{symbol}: bar processing error: {exc}")
                     import traceback
@@ -238,7 +276,28 @@ def run(cfg, **kwargs) -> None:
                 update_equity(live_equity)
                 logger.info(f"Equity updated: {live_equity:.2f} USDT")
             except Exception as exc:
+                live_equity = equity
                 logger.warning(f"Could not refresh equity from exchange: {exc}")
+
+            # Render dashboard after each bar
+            try:
+                _state_now = load_state()
+                _demo_done = int(_state_now.get("account", {}).get("demo_trades_completed", 0))
+                _demo_req = int(cfg.growth_gate.demo_trades_required)
+                _daily_pnl = _compute_daily_pnl_pct(_TRADE_LOG_PATH, live_equity)
+                dashboard.update({
+                    "mode": trading_mode,
+                    "equity": live_equity,
+                    "daily_pnl_pct": _daily_pnl,
+                    "open_positions": dict(order_manager.positions),
+                    "signals": bar_signals,
+                    "demo_trades_completed": _demo_done,
+                    "demo_trades_required": _demo_req,
+                    "daily_target_pct": daily_profit_target,
+                })
+                dashboard.render()
+            except Exception as _dash_exc:
+                logger.debug(f"Dashboard render error (non-fatal): {_dash_exc}")
 
             bar_elapsed = (datetime.now(timezone.utc) - bar_start).total_seconds()
             # FIX 1: was referencing undefined `active_symbols` — use forecast_symbols
@@ -278,14 +337,15 @@ def _process_symbol(
     trade_limit: int = 1,
     open_count: int = 0,
     skip_new_entries: bool = False,
-) -> None:
+) -> dict | None:
+    # Returns a signal-info dict for the dashboard, or None on hard failure
     primary_tf = str(cfg.data.primary_timeframe)
 
     # Fetch live OHLCV bars
     klines_df = client.get_klines(symbol, primary_tf, limit=lookback_needed)
     if len(klines_df) < lookback_needed // 2:
         logger.warning(f"{symbol}: insufficient kline data ({len(klines_df)} bars) — skipping")
-        return
+        return None
 
     # Compute live features
     feature_series = compute_live_features(symbol, cfg, klines_df)
@@ -295,7 +355,7 @@ def _process_symbol(
     meta_model = cached.get("meta", None)
     if primary_model is None:
         logger.warning(f"{symbol}: no cached model, skipping bar")
-        return
+        return None
 
     primary_prob, signal_strength = _predict(primary_model, calibrator, meta_model, feature_series)
 
@@ -313,22 +373,41 @@ def _process_symbol(
         f"open_position={symbol in order_manager.positions}"
     )
 
+    # Encode direction for dashboard: 1=long, -1=short, 0=flat (near 0.5)
+    if abs(primary_prob - 0.5) < float(cfg.portfolio.dead_zone_direction):
+        direction_int = 0
+    else:
+        direction_int = 1 if primary_prob >= 0.5 else -1
+
+    # Build base signal info dict — enriched with action below
+    sig_info = {
+        "symbol": symbol,
+        "primary_prob": round(primary_prob, 4),
+        "signal_strength": round(signal_strength, 4),
+        "direction": direction_int,
+        "action": "NO_SIGNAL",
+    }
+
     # Skip if already in a position for this symbol
     if symbol in order_manager.positions:
-        return
+        sig_info["action"] = "HOLD"
+        return sig_info
 
     # FIX 3: daily profit target gate — predictions still run, but no new entries
     if skip_new_entries:
-        return
+        sig_info["action"] = "SKIP_DAILY"
+        return sig_info
 
     # Skip if signal is below floor
     if signal_strength < signal_floor:
-        return
+        sig_info["action"] = "SKIP_FLOOR"
+        return sig_info
 
     # Growth gate: skip opening new position if at max open positions
     if open_count >= trade_limit:
         logger.debug(f"{symbol}: signal={signal_strength:.3f} but trade_limit={trade_limit} reached ({open_count} open) — no new entry")
-        return
+        sig_info["action"] = "SKIP_LIMIT"
+        return sig_info
 
     # Size the position
     half_kelly = float(cfg.portfolio.kelly_fraction) * 0.5  # cfg already stores the full fraction; halve it
@@ -357,7 +436,8 @@ def _process_symbol(
     )
     if should_skip:
         logger.info(f"{symbol}: portfolio margin limit reached — skipping entry")
-        return
+        sig_info["action"] = "SKIP_LIMIT"
+        return sig_info
     if scale_factor < 1.0:
         # Scale down position proportionally when approaching soft limit
         pos_info["margin"] = pos_info["margin"] * scale_factor
@@ -396,8 +476,11 @@ def _process_symbol(
     )
 
     if order_id:
+        sig_info["action"] = "ENTERED"
         logger.info(
             f"{symbol}: entry submitted — dir={direction} size_usd={pos_info['margin']:.2f} "
             f"atr={atr:.6f} tp_pct={tp_pct:.4%} sl_pct={sl_pct:.4%} "
             f"signal={signal_strength:.3f} orderId={order_id}"
         )
+
+    return sig_info

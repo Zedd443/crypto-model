@@ -33,9 +33,11 @@ class BinanceClient:
             logger.warning(f"No API key found for mode={mode} — check .env (BINANCE_{mode}_API_KEY)")
 
         self._session = requests.Session()
+        # Only set the API key header — do NOT set Content-Type here.
+        # POST endpoints require application/x-www-form-urlencoded; requests sets
+        # the correct Content-Type automatically based on whether data= or params= is used.
         self._session.headers.update({
             "X-MBX-APIKEY": self._api_key,
-            "Content-Type": "application/json",
         })
         logger.info(f"BinanceClient initialised — mode={mode} endpoint={self._base_url}")
 
@@ -161,6 +163,10 @@ class BinanceClient:
     def cancel_all_orders(self, symbol: str) -> list:
         logger.info(f"cancel_all_orders {symbol}")
         return self._request("DELETE", "/fapi/v1/allOpenOrders", params={"symbol": symbol}, signed=True)
+
+    def get_recent_trades(self, symbol: str, limit: int = 10) -> list:
+        # GET /fapi/v1/userTrades — signed, returns recent fills for this account/symbol
+        return self._request("GET", "/fapi/v1/userTrades", params={"symbol": symbol, "limit": limit}, signed=True)
 
     def get_server_time(self) -> int:
         data = self._request("GET", "/fapi/v1/time")

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from src.execution.binance_client import BinanceClient
 from src.utils.logger import get_logger
+from src.utils.state_manager import increment_demo_trades
 
 logger = get_logger("order_manager")
 
@@ -25,11 +26,12 @@ _TRADE_LOG_COLS = [
 
 
 class OrderManager:
-    def __init__(self, client: BinanceClient, cfg, trade_log_path: Path):
+    def __init__(self, client: BinanceClient, cfg, trade_log_path: Path, mode: str = "DEMO"):
         self._client = client
         self._cfg = cfg
         self._log_path = Path(trade_log_path)
         self._dms_seconds = float(cfg.trading.dead_man_switch_seconds)
+        self._mode = mode.upper()
 
         # {symbol: {order_id, direction, entry_price, size_usd,
         #           tp_price, sl_price, entry_time,
@@ -98,6 +100,8 @@ class OrderManager:
 
         tp_order_id = None
         sl_order_id = None
+        tp_failed = False
+        sl_failed = False
 
         # Limit TP order
         try:
@@ -108,6 +112,7 @@ class OrderManager:
             tp_order_id = tp_resp.get("orderId")
         except Exception as exc:
             logger.warning(f"{symbol}: TP bracket order failed: {exc}")
+            tp_failed = True
 
         # Stop-market SL order
         try:
@@ -118,6 +123,45 @@ class OrderManager:
             sl_order_id = sl_resp.get("orderId")
         except Exception as exc:
             logger.warning(f"{symbol}: SL bracket order failed: {exc}")
+            sl_failed = True
+
+        # If BOTH bracket orders failed, position is unprotected — close immediately
+        if tp_failed and sl_failed:
+            logger.critical(
+                f"{symbol}: BOTH TP and SL bracket orders failed — closing position immediately to avoid naked exposure"
+            )
+            try:
+                self._client.place_order(symbol, close_side, qty, order_type="MARKET", reduce_only=True)
+                logger.info(f"{symbol}: emergency market close placed after double bracket failure")
+            except Exception as close_exc:
+                logger.critical(f"{symbol}: emergency market close ALSO failed: {close_exc}")
+            return None
+
+        # If only one bracket failed, retry once after 2 seconds
+        if tp_failed or sl_failed:
+            time.sleep(2)
+            if tp_failed:
+                try:
+                    tp_resp = self._client.place_order(
+                        symbol, close_side, qty, order_type="LIMIT",
+                        price=tp_price, reduce_only=True,
+                    )
+                    tp_order_id = tp_resp.get("orderId")
+                    tp_failed = False
+                    logger.info(f"{symbol}: TP bracket retry succeeded — orderId={tp_order_id}")
+                except Exception as exc:
+                    logger.warning(f"{symbol}: TP bracket retry also failed — keeping partial bracket: {exc}")
+            if sl_failed:
+                try:
+                    sl_resp = self._client.place_order(
+                        symbol, close_side, qty, order_type="STOP_MARKET",
+                        stop_price=sl_price, reduce_only=True,
+                    )
+                    sl_order_id = sl_resp.get("orderId")
+                    sl_failed = False
+                    logger.info(f"{symbol}: SL bracket retry succeeded — orderId={sl_order_id}")
+                except Exception as exc:
+                    logger.warning(f"{symbol}: SL bracket retry also failed — keeping partial bracket: {exc}")
 
         self.positions[symbol] = {
             "order_id": order_id,
@@ -184,8 +228,13 @@ class OrderManager:
         if abs(live_pos["positionAmt"]) > 1e-9:
             return None  # still open
 
-        # Fill detected — compute PnL
-        exit_price = live_pos.get("entryPrice", pos["entry_price"])  # last known price as proxy
+        # Fill detected — query recent trades to get actual exit fill price.
+        # Binance zeroes entryPrice when position is closed, so it cannot be used as exit proxy.
+        try:
+            trades = self._client.get_recent_trades(symbol, limit=10)
+            exit_price = float(trades[-1]["price"]) if trades else float(live_pos.get("markPrice", 0))
+        except Exception:
+            exit_price = float(live_pos.get("markPrice", 0))
         entry_price = pos["entry_price"]
 
         if pos["direction"] == "long":
@@ -229,6 +278,15 @@ class OrderManager:
         with open(self._log_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=_TRADE_LOG_COLS)
             writer.writerow({col: row.get(col, "") for col in _TRADE_LOG_COLS})
+
+        # Increment demo trade counter when a fill is recorded in DEMO mode
+        if self._mode == "DEMO":
+            try:
+                count = increment_demo_trades()
+                demo_required = int(self._cfg.growth_gate.demo_trades_required)
+                logger.info(f"Demo trades: {count}/{demo_required}")
+            except Exception as exc:
+                logger.warning(f"Could not increment demo_trades_completed: {exc}")
 
     def _dead_man_switch_loop(self) -> None:
         # Background daemon: cancel everything if heartbeat goes silent

@@ -180,6 +180,34 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 - **Fix**: Early-stopping eval set is now the LAST 20% of the TRAIN fold (capped at 200 bars). Model fit uses the first 80% of the train fold. ALL `val_idx` bars receive real predictions: `oof_proba[val_idx] = proba`. The `val_split` variable removed entirely.
 - **Status**: FIXED
 
+### ISSUE-017: Content-Type header caused all POST orders to fail — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/execution/binance_client.py`, `__init__`
+- **Problem**: Session header `"Content-Type": "application/json"` applied to ALL requests. Binance FAPI POST endpoints (`/fapi/v1/order`, `/fapi/v1/allOpenOrders`) require `application/x-www-form-urlencoded`. Every `place_order`, `cancel_order`, `cancel_all_orders` returned HTTP 400.
+- **Fix**: Removed `"Content-Type": "application/json"` from `self._session.headers.update`. `requests` now sets the correct Content-Type automatically (form-encoded for POST with `data=`, no content-type for GET with `params=`).
+- **Status**: FIXED
+
+### ISSUE-018: sync_fills used zeroed entryPrice as exit proxy — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `src/execution/order_manager.py`, `sync_fills`
+- **Problem**: When a position closes, Binance zeroes `entryPrice` in the positionRisk response. Code used `live_pos.get("entryPrice")` as `exit_price`, which evaluated to 0.0 on all closed positions, making every realized PnL calculation wildly wrong.
+- **Fix**: On position close, query `/fapi/v1/userTrades` via `client.get_recent_trades(symbol, limit=10)` and use `trades[-1]["price"]` as actual exit price. Falls back to `markPrice` if query fails.
+- **Status**: FIXED
+
+### DECISION-R009: Mainnet interlock requires CONFIRM_MAINNET_TRADING=yes env var
+- **Date**: 2026-04-04
+- **Decision**: `stage_08_live.py` `run()` checks `cfg.trading.mode == "MAINNET"` immediately after config load. If true, `os.environ.get("CONFIRM_MAINNET_TRADING")` must equal `"yes"` (case-insensitive). If not set, raises `RuntimeError` before any BinanceClient is created.
+- **Rationale**: Prevents accidental MAINNET trades if config is edited without intent. Operator must explicitly set `CONFIRM_MAINNET_TRADING=yes` AND have completed `demo_trades_required` demo trades.
+- **Status**: CONFIRMED
+
+### DECISION-R010: Live dashboard added (src/dashboard/live_dashboard.py)
+- **Date**: 2026-04-04
+- **Decision**: `LiveDashboard` class renders per-bar summary to terminal using `rich` (with plain-terminal fallback). Updated at end of each bar loop in `stage_08_live.py`. Shows mode, equity, P&L, open positions, last signals, and demo trade progress.
+- **Rationale**: Operators running live need real-time visibility without tailing raw log files. Dashboard is non-fatal — any render error is logged as DEBUG and skipped.
+- **Status**: CONFIRMED
+
 ### DECISION-R008: Binance modes simplified to DEMO/MAINNET only — FIXED
 - **Date**: 2026-04-04
 - **Decision**: Removed TESTNET mode from `config/base.yaml` and `binance_client.py`. Only two modes exist: `DEMO` (→ `testnet.binancefuture.com`, keys `BINANCE_DEMO_*`) and `MAINNET` (→ `fapi.binance.com`, keys `BINANCE_API_*`). Active mode set to `DEMO`.

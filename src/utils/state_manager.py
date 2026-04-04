@@ -117,6 +117,17 @@ def update_project_state(stage: str, status: str, issues: list[str] | None = Non
     save_state(state)
 
 
+def increment_demo_trades() -> int:
+    # Thread-safe increment of account.demo_trades_completed; returns new count
+    state = load_state()
+    account = state.setdefault("account", {})
+    current = int(account.get("demo_trades_completed", 0))
+    account["demo_trades_completed"] = current + 1
+    save_state(state)
+    logger.debug(f"demo_trades_completed incremented to {current + 1}")
+    return current + 1
+
+
 def update_equity(equity: float, state_path: Path = Path("project_state.json")) -> None:
     state = load_state()
     account = state.setdefault("account", {})
@@ -155,6 +166,7 @@ def _default_state() -> dict:
             "active_symbol_count": 1,
             "growth_gate_unlocked": False,
             "growth_gate_threshold": 300.0,
+            "demo_trades_completed": 0,
         },
         "global_alerts": [],
         "next_scheduled_retrain": None,
