@@ -212,14 +212,15 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     corr_matrix_df = None
     if len(all_signals) > 1:
         try:
-            # Build returns panel from feature files (log_return column)
+            # Build returns panel from feature files (log_return column, train period only to avoid leakage)
             returns_parts = {}
-            train_end = str(cfg.data.train_end)
+            train_end = pd.Timestamp(cfg.data.train_end, tz="UTC")
             for sym in all_signals:
                 try:
                     feat_df = read_features(sym, _TF, features_dir)
                     if "log_return" in feat_df.columns:
-                        returns_parts[sym] = feat_df["log_return"]
+                        # Fit GARCH on train data only — never on test/val
+                        returns_parts[sym] = feat_df.loc[:train_end, "log_return"]
                 except Exception:
                     pass
 
