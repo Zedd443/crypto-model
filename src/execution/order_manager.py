@@ -1,4 +1,5 @@
 import csv
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -89,27 +90,29 @@ class OrderManager:
             )
             qty = round(max_qty / qty_step) * qty_step
 
-        # Adapt qty to meet exchange MIN_NOTIONAL if possible, otherwise skip
+        # Adapt qty to meet exchange MIN_NOTIONAL
         effective_notional = qty * entry_price
         min_notional = self._client.get_min_notional(symbol)
         if effective_notional < min_notional:
-            qty_needed = min_notional / entry_price
-            qty_bumped = round(qty_needed / qty_step) * qty_step
-            bumped_notional = qty_bumped * entry_price
-            # Safety cap: don't bump more than 2× the originally intended notional
-            if qty_bumped <= max_qty and bumped_notional <= size_usd * 2.0:
-                logger.info(
-                    f"{symbol}: notional {effective_notional:.2f} < min {min_notional:.2f} "
-                    f"— bumping qty {qty} → {qty_bumped} (notional {bumped_notional:.2f})"
-                )
-                qty = qty_bumped
-                effective_notional = bumped_notional
-            else:
+            # Check if it's physically possible: max_qty × price must be >= min_notional
+            max_possible_notional = max_qty * entry_price
+            if max_possible_notional < min_notional:
+                # Coin structurally untradeable at this price (e.g. FORMUSDT: max_qty=120 × $0.20 = $24 < $100 min)
                 logger.warning(
-                    f"{symbol}: notional {effective_notional:.2f} < min {min_notional:.2f} "
-                    f"and bump would exceed max_qty or 2× intended — skipping entry"
+                    f"{symbol}: max possible notional {max_possible_notional:.2f} < min_notional {min_notional:.2f} "
+                    f"— coin untradeable at current price, skipping"
                 )
                 return None
+            # Bump qty to min_notional × 1.1 (10% buffer, same pattern as testnet_trader.py)
+            qty_bumped = math.floor((min_notional * 1.1) / entry_price / qty_step) * qty_step
+            qty_bumped = min(qty_bumped, max_qty)  # never exceed exchange max
+            bumped_notional = qty_bumped * entry_price
+            logger.info(
+                f"{symbol}: notional {effective_notional:.2f} < min {min_notional:.2f} "
+                f"— bumping qty {qty} → {qty_bumped} (notional {bumped_notional:.2f})"
+            )
+            qty = qty_bumped
+            effective_notional = bumped_notional
 
         # Market entry
         entry_side = "BUY" if direction == "long" else "SELL"
