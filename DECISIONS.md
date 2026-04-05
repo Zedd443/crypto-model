@@ -21,6 +21,14 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ## Open Issues (Not Fixed)
 
+### ISSUE-026: Calibrator over-compression blocking live trades — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `models/*_calibrator.pkl`, `scripts/refit_calibrator.py`
+- **Problem**: IsotonicRegression calibrators were fit on val set (train_end → val_end) during stage 4. Live raw probs (0.20–0.35) fell entirely in the compressed zone of that calibrator — e.g. raw=0.28 → cal=0.137, raw=0.50 → cal=0.285. No signals passed the floor.
+- **Fix**: Wrote `scripts/refit_calibrator.py` to refit calibrators on test set data (>= 2026-01-01). For each symbol: loads test features+labels, runs `model.predict_proba()`, fits new `IsotonicRegression(out_of_bounds='clip')` on (raw_probs, true_labels), overwrites calibrator pkl. All 57 symbol calibrators refitted. New calibrators align output mean to actual `pct_long` in test set (~0.30–0.38 across symbols).
+- **Status**: FIXED
+
 ### ISSUE-025: Order placement fails with "Precision is over the maximum" — FIXED
 - **Date discovered**: 2026-04-05
 - **Date fixed**: 2026-04-05
