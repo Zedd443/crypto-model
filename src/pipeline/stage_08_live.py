@@ -133,9 +133,12 @@ def _predict(model, calibrator, meta_model, feature_series: pd.Series) -> tuple[
             meta_prob = float(meta_model.predict_proba(meta_X_arr)[0][1])
         except Exception:
             meta_prob = 0.5  # fallback if feature count mismatch (old model)
-        signal_strength = primary_prob * meta_prob
+        # signal_strength = directional confidence × meta_prob
+        # confidence = distance from 0.5 (works symmetrically for long AND short)
+        confidence = abs(primary_prob - 0.5) * 2.0  # 0=uncertain, 1=max confident
+        signal_strength = confidence * meta_prob
     else:
-        signal_strength = primary_prob
+        signal_strength = abs(primary_prob - 0.5) * 2.0
 
     return primary_prob, signal_strength
 
