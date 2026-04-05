@@ -89,14 +89,27 @@ class OrderManager:
             )
             qty = round(max_qty / qty_step) * qty_step
 
-        # Skip if resulting notional is below exchange minimum (e.g. coin too cheap + small max_qty)
+        # Adapt qty to meet exchange MIN_NOTIONAL if possible, otherwise skip
         effective_notional = qty * entry_price
         min_notional = self._client.get_min_notional(symbol)
         if effective_notional < min_notional:
-            logger.warning(
-                f"{symbol}: effective notional {effective_notional:.2f} USD < min_notional {min_notional:.2f} — skipping entry"
-            )
-            return None
+            qty_needed = min_notional / entry_price
+            qty_bumped = round(qty_needed / qty_step) * qty_step
+            bumped_notional = qty_bumped * entry_price
+            # Safety cap: don't bump more than 2× the originally intended notional
+            if qty_bumped <= max_qty and bumped_notional <= size_usd * 2.0:
+                logger.info(
+                    f"{symbol}: notional {effective_notional:.2f} < min {min_notional:.2f} "
+                    f"— bumping qty {qty} → {qty_bumped} (notional {bumped_notional:.2f})"
+                )
+                qty = qty_bumped
+                effective_notional = bumped_notional
+            else:
+                logger.warning(
+                    f"{symbol}: notional {effective_notional:.2f} < min {min_notional:.2f} "
+                    f"and bump would exceed max_qty or 2× intended — skipping entry"
+                )
+                return None
 
         # Market entry
         entry_side = "BUY" if direction == "long" else "SELL"
