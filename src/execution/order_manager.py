@@ -150,7 +150,7 @@ class OrderManager:
                     tp_failed = False
                     logger.info(f"{symbol}: TP bracket retry succeeded — orderId={tp_order_id}")
                 except Exception as exc:
-                    logger.warning(f"{symbol}: TP bracket retry also failed — keeping partial bracket: {exc}")
+                    logger.warning(f"{symbol}: TP bracket retry also failed: {exc}")
             if sl_failed:
                 try:
                     sl_resp = self._client.place_order(
@@ -161,7 +161,20 @@ class OrderManager:
                     sl_failed = False
                     logger.info(f"{symbol}: SL bracket retry succeeded — orderId={sl_order_id}")
                 except Exception as exc:
-                    logger.warning(f"{symbol}: SL bracket retry also failed — keeping partial bracket: {exc}")
+                    logger.warning(f"{symbol}: SL bracket retry also failed: {exc}")
+
+        # After retry: if either bracket still missing, position is unprotected — close immediately
+        if tp_failed or sl_failed:
+            missing = ("TP" if tp_failed else "") + (" SL" if sl_failed else "")
+            logger.critical(
+                f"{symbol}: {missing.strip()} bracket failed after retry — closing position to avoid naked exposure"
+            )
+            try:
+                self._client.place_order(symbol, close_side, qty, order_type="MARKET", reduce_only=True)
+                logger.info(f"{symbol}: emergency market close placed after single bracket failure")
+            except Exception as close_exc:
+                logger.critical(f"{symbol}: emergency market close ALSO failed: {close_exc}")
+            return None
 
         self.positions[symbol] = {
             "order_id": order_id,
@@ -261,13 +274,24 @@ class OrderManager:
         return fill
 
     def cancel_all_open(self) -> None:
-        logger.warning("cancel_all_open: cancelling all tracked positions (dead-man-switch or shutdown)")
-        for symbol in list(self.positions.keys()):
+        logger.warning("cancel_all_open: flattening all tracked positions (dead-man-switch or shutdown)")
+        for symbol, pos in list(self.positions.items()):
+            if pos is None:
+                continue
+            # Cancel bracket orders first to prevent double-fill race
             try:
                 self._client.cancel_all_orders(symbol)
-                logger.info(f"{symbol}: all orders cancelled")
+                logger.info(f"{symbol}: bracket orders cancelled")
             except Exception as exc:
-                logger.error(f"{symbol}: cancel_all_orders failed: {exc}")
+                logger.warning(f"{symbol}: cancel_all_orders failed (continuing to market close): {exc}")
+            # Issue market close to actually flatten the exchange position
+            close_side = "SELL" if pos["direction"] == "long" else "BUY"
+            qty = round(pos["size_usd"] / pos["entry_price"], 6)
+            try:
+                self._client.place_order(symbol, close_side, qty, order_type="MARKET", reduce_only=True)
+                logger.info(f"{symbol}: market close issued by DMS/shutdown")
+            except Exception as exc:
+                logger.critical(f"{symbol}: DMS market close FAILED — position may remain open on exchange: {exc}")
         self.positions.clear()
 
     # ------------------------------------------------------------------

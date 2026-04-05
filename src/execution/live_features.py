@@ -8,6 +8,7 @@ from src.features.technical import build_technical_features
 from src.features.microstructure import build_microstructure_features
 from src.features.funding_rates import build_funding_features
 from src.features.fracdiff import load_d_values, apply_fracdiff_transform
+from src.features.cross_sectional import apply_cross_sectional_ranks
 from src.features.regime import (
     load_hmm_artifacts,
     get_regime_probs,
@@ -196,6 +197,14 @@ def compute_live_features(
 
     # 10. Remove duplicate columns (can arise from HTF merge or multi-module concat)
     all_features = all_features.loc[:, ~all_features.columns.duplicated()]
+
+    # 10b. Apply cross-sectional rank transforms — uses pre-fitted stats from training
+    cs_stats_path = checkpoints_dir / "cross_sectional_stats.pkl"
+    if cs_stats_path.exists():
+        feature_cols_for_rank = all_features.select_dtypes(include=[np.float32, np.float64, float]).columns.tolist()
+        all_features = apply_cross_sectional_ranks(all_features, cs_stats_path, feature_cols_for_rank)
+    else:
+        logger.debug(f"{symbol}: cross_sectional_stats not found at {cs_stats_path} — rank features will be NaN")
 
     # 11. Apply global shift(1) to match training pipeline
     # In feature_pipeline.py all feature columns are shifted by 1 bar so that feature[t]

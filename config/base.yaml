@@ -101,7 +101,7 @@ model:
   conformal_width_60pct: 0.40                  # width between 0.20–0.40 → 60% position size (above → 30%)
   meta_n_estimators: 10                       # meta-labeler tree count
   meta_max_depth: 4                            # meta-labeler max depth (shallow to avoid overfit)
-  meta_signal_floor: 0.55                      # minimum meta-prob to pass a signal
+  meta_signal_floor: 0.1                      # minimum meta-prob to pass a signal
   tier_A_da_min: 0.53                          # tier A: minimum directional accuracy on validation
   tier_A_da_min_folds: 6                       # tier A: DA threshold must hold in at least N folds
   tier_A_dsr_min: 0.0                          # tier A: minimum deflated Sharpe ratio
@@ -118,7 +118,7 @@ model:
   stability_n_bootstrap_kaggle: 20            # fewer bootstrap iterations on Kaggle
 
 portfolio:
-  signal_floor_prob: 0.55                      # minimum signal_strength to enter a trade
+  signal_floor_prob: 0.2                      # minimum signal_strength to enter a trade
   max_position_size: 0.10                      # maximum single position as fraction of equity
   max_total_margin_pct: 0.80                   # maximum total margin deployed (80% of equity)
   kelly_fraction: 0.5                          # half-Kelly sizing fraction

@@ -66,6 +66,10 @@ def main():
         help="Run specific stage only (1-8). Omit to run all stages sequentially."
     )
     parser.add_argument(
+        "--from-stage", type=int, choices=range(1, 9), dest="from_stage",
+        help="Run stages from this stage onwards (e.g. --from-stage 4 runs stages 4-7)."
+    )
+    parser.add_argument(
         "--symbol", type=str, default=None,
         help="Restrict to a single symbol (e.g. BTCUSDT). Useful for debugging."
     )
@@ -81,7 +85,12 @@ def main():
 
     cfg = load_config(args.config)
 
-    stages_to_run = [args.stage] if args.stage else list(range(1, 8))  # 8 (live) not in batch run
+    if args.stage:
+        stages_to_run = [args.stage]
+    elif args.from_stage:
+        stages_to_run = list(range(args.from_stage, 8))  # 8 (live) not in batch run
+    else:
+        stages_to_run = list(range(1, 8))
 
     for stage_num in stages_to_run:
         stage_name = STAGE_NAMES[stage_num]

@@ -79,11 +79,21 @@ def register_model(
 
     _acquire_lock()
     try:
+        registry = {"models": []}
         if _REGISTRY_PATH.exists():
-            with open(_REGISTRY_PATH) as f:
-                registry = json.load(f)
-        else:
-            registry = {"models": []}
+            try:
+                with open(_REGISTRY_PATH) as f:
+                    loaded = json.load(f)
+                # Handle both {"models": [...]} dict and legacy bare-list formats
+                if isinstance(loaded, dict) and "models" in loaded:
+                    registry = loaded
+                elif isinstance(loaded, list):
+                    logger.warning("model_registry.json was a bare list — converting to {models: []} format")
+                    registry = {"models": loaded}
+                else:
+                    logger.warning(f"model_registry.json has unexpected format ({type(loaded).__name__}) — starting fresh")
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Could not read model_registry.json ({e}) — starting fresh")
 
         registry["models"].append(entry)
 
@@ -94,50 +104,54 @@ def register_model(
         _release_lock()
 
 
+def _read_registry() -> dict:
+    # Read registry without holding the write lock — reads are safe to race with other reads.
+    # If the file is being written concurrently, retry up to 3 times with a short backoff.
+    for attempt in range(3):
+        try:
+            with open(_REGISTRY_PATH) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and "models" in loaded:
+                return loaded
+            if isinstance(loaded, list):
+                return {"models": loaded}
+            return {"models": []}
+        except (json.JSONDecodeError, OSError):
+            if attempt < 2:
+                time.sleep(0.1)
+    return {"models": []}
+
+
 def get_latest_model(symbol: str, tf: str, model_type: str = "primary") -> dict | None:
     if not _REGISTRY_PATH.exists():
         return None
 
-    # Acquire lock to prevent reading while concurrent write is in progress
-    _acquire_lock()
-    try:
-        with open(_REGISTRY_PATH) as f:
-            registry = json.load(f)
+    registry = _read_registry()
+    matching = [
+        m for m in registry.get("models", [])
+        if m["symbol"] == symbol and m["tf"] == tf and m["model_type"] == model_type
+    ]
 
-        matching = [
-            m for m in registry.get("models", [])
-            if m["symbol"] == symbol and m["tf"] == tf and m["model_type"] == model_type
-        ]
+    if not matching:
+        return None
 
-        if not matching:
-            return None
-
-        # Sort by created_at descending
-        matching.sort(key=lambda x: x["created_at"], reverse=True)
-        return matching[0]
-    finally:
-        _release_lock()
+    # Sort by created_at descending
+    matching.sort(key=lambda x: x["created_at"], reverse=True)
+    return matching[0]
 
 
 def get_active_models() -> dict:
     if not _REGISTRY_PATH.exists():
         return {}
 
-    # Acquire lock to prevent reading while concurrent write is in progress
-    _acquire_lock()
-    try:
-        with open(_REGISTRY_PATH) as f:
-            registry = json.load(f)
+    registry = _read_registry()
+    # Group by (symbol, tf) and return latest primary model per pair
+    latest = {}
+    for m in registry.get("models", []):
+        if m["model_type"] != "primary":
+            continue
+        key = f"{m['symbol']}_{m['tf']}"
+        if key not in latest or m["created_at"] > latest[key]["created_at"]:
+            latest[key] = m
 
-        # Group by (symbol, tf) and return latest primary model per pair
-        latest = {}
-        for m in registry.get("models", []):
-            if m["model_type"] != "primary":
-                continue
-            key = f"{m['symbol']}_{m['tf']}"
-            if key not in latest or m["created_at"] > latest[key]["created_at"]:
-                latest[key] = m
-
-        return latest
-    finally:
-        _release_lock()
+    return latest

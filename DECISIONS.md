@@ -19,6 +19,27 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ---
 
+## Open Issues (Not Fixed)
+
+### ISSUE-023: Missing cross-sectional rank features in live inference — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/live_features.py`
+- **Problem**: `apply_cross_sectional_ranks()` was never called during live feature computation. All `_rank` features (e.g., `bb_pct_1h_rank`, `vwap_deviation_4h_rank`, `bv_rank`, `rsi_5_1h_rank`) were missing, causing 88/203 features to be NaN-filled on every bar. The pre-fitted stats file (`cross_sectional_stats.pkl`) existed but was never loaded or used.
+- **Fix**: Added `apply_cross_sectional_ranks` import from `src.features.cross_sectional`. After deduplication (step 10) and before global shift (step 11), added call: `all_features = apply_cross_sectional_ranks(all_features, cs_stats_path, feature_cols_for_rank)` where `feature_cols_for_rank` is the list of numeric columns.
+- **Status**: FIXED
+
+### ISSUE-024: Fracdiff d-values not cached for live inference — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `data/checkpoints/fracdiff/` (missing directory), `src/features/fracdiff.py`
+- **Problem**: The fracdiff cache directory did not exist. Price/volume columns (`close_5_mean`, `obv`, `vwap_20`, etc.) were differenced during training but not at inference time due to missing d-value cache files, causing feature distribution mismatch.
+- **Root cause**: `fit_and_save_d_values()` is only called during stage 02 feature building when `is_train_period=True`. The condition was not triggered (likely due to data extending past `train_end`), so the cache directory was never created.
+- **Fix**: Ran one-off repair script `scripts/repair_fracdiff_cache.py` which: (1) reads all 59 symbol feature parquets, (2) slices to `train_end=2025-09-30`, (3) calls `fit_and_save_d_values()` to populate `data/checkpoints/fracdiff/fracdiff_d_{symbol}_15m.json` for all symbols. All 59 cache files created successfully. Script saved for future use if fracdiff cache is lost.
+- **Status**: FIXED
+
+---
+
 ## Resolved Decisions
 
 ### ISSUE-001: Label encoding collapse (majority-class baseline = free DA)
@@ -132,6 +153,16 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 - **Decision**: Tier 1 (equity <= $150) now allows max_symbols=2 (was 1). Updated in `config/base.yaml`.
 - **Rationale**: With $120 starting equity, 1 symbol is too conservative for demo phase. 2 symbols with 2× leverage is still within safe risk limits (max total margin = 80% equity).
 - **Status**: CONFIRMED
+
+### ISSUE-022: Stage 6 ALL symbols fail "No primary model found" — FIXED
+- **Date discovered**: 2026-04-04
+- **Date fixed**: 2026-04-04
+- **Location**: `model_registry.json`, `src/models/model_versioning.py`
+- **Problem**: `model_registry.json` contained 57 meta entries and 0 primary entries. Registry was created fresh at 17:25:31 when the final `--force` run of stage 5 started — all 57 primary entries registered by stage 4 were lost because the registry file had been deleted between runs. Stage 5 workers initializing `{"models": []}` each time they found no file, overwriting prior content. Additionally `get_latest_model` and `get_active_models` held the exclusive write lock during reads, serializing all parallel stage 5 workers and creating lock contention risk.
+- **Fix (immediate)**: Re-injected all 57 primary model entries into `model_registry.json` by reading version strings from `models/training_summary.csv` and feature names from `data/checkpoints/feature_selection/`. All model files confirmed present on disk.
+- **Fix (structural)**: `register_model` now handles corrupt/list-format registry files defensively (try/except + format conversion). Extracted `_read_registry()` helper that reads without the write lock and retries on JSON decode error. `get_latest_model` and `get_active_models` now use `_read_registry()` instead of holding the exclusive lock during reads — eliminates lock serialization in parallel stage 5 workers.
+- **Root cause prevention**: Never delete `model_registry.json` between pipeline runs. The registry accumulates primary entries from stage 4 that are needed by stage 5 (to link meta to primary version) and all downstream stages. If `--force` re-run of stage 5 is needed, the registry must persist.
+- **Status**: FIXED
 
 ### ISSUE-012: Backtest costs never applied in engine.py — FIXED
 - **Date discovered**: 2026-04-04

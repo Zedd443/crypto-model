@@ -139,6 +139,12 @@ def tune_hyperparams(
                 proba = model.predict_proba(X_v)
                 score = compute_objective(y_v, proba, ret_v)
                 fold_scores.append(score)
+                # Report intermediate value so HyperbandPruner can kill bad trials early
+                trial.report(score, step=len(fold_scores) - 1)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+            except optuna.exceptions.TrialPruned:
+                raise  # let Optuna handle pruning signal — don't swallow it
             except Exception as e:
                 logger.warning(f"Trial {trial.number} fold failed: {e}")
                 continue
@@ -155,11 +161,18 @@ def tune_hyperparams(
             if all(v <= recent[0] for v in recent[1:]):
                 study.stop()
 
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=1),
+        pruner=optuna.pruners.HyperbandPruner(),
+    )
     study.optimize(objective, n_trials=n_trials, callbacks=[_no_improvement_callback], show_progress_bar=False)
 
     best_params = study.best_params
-    logger.info(f"Optuna best score: {study.best_value:.4f}, params: {best_params}")
+    logger.info(
+        f"Optuna best score: {study.best_value:.4f}, params: {best_params} "
+        f"[n_estimators={best_params.get('n_estimators','?')} — actual trees determined by early stopping]"
+    )
     return best_params
 
 
@@ -207,8 +220,12 @@ def train_xgb(
     calibrator.fit(val_proba_raw, y_val_arr)
 
     best_iter = model.best_iteration
-    logger.info(f"XGBoost trained: best_iteration={best_iter}")
-    return model, calibrator
+    # evals_result_ is populated by XGBoost after fit when eval_set is provided
+    evals = model.evals_result_ if hasattr(model, "evals_result_") else {}
+    val_loss_curve = list(evals.get("validation_0", {}).get("logloss", []))
+    best_val_loss = val_loss_curve[best_iter] if val_loss_curve and best_iter < len(val_loss_curve) else float("nan")
+    logger.info(f"XGBoost trained: best_iteration={best_iter} val_logloss@best={best_val_loss:.4f}")
+    return model, calibrator, val_loss_curve, best_iter
 
 
 def compute_oof_predictions(
@@ -218,12 +235,15 @@ def compute_oof_predictions(
     splitter: PurgedTimeSeriesSplit,
     params: dict,
     cfg,
-) -> np.ndarray:
+) -> tuple:
     # OOF predictions via PurgedTimeSeriesSplit — NEVER in-sample
+    # Returns: (oof_proba, fold_val_losses, fold_best_iterations)
     oof_proba = np.zeros((len(X), 2))
     oof_proba[:, 0] = 0.5
     oof_proba[:, 1] = 0.5
     early_stop_rounds = int(cfg.model.xgb_early_stopping_rounds)
+    fold_val_losses = []
+    fold_best_iterations = []
 
     for train_idx, val_idx in splitter.split(X, y):
         X_t = X.iloc[train_idx].values
@@ -258,10 +278,19 @@ def compute_oof_predictions(
             # ALL val fold bars receive real OOF predictions — no wasted 0.5 defaults
             proba = model.predict_proba(X_v)
             oof_proba[val_idx] = proba
+            # Capture per-fold diagnostics
+            best_iter = model.best_iteration
+            fold_best_iterations.append(int(best_iter))
+            evals = model.evals_result_ if hasattr(model, "evals_result_") else {}
+            loss_curve = list(evals.get("validation_0", {}).get("logloss", []))
+            best_loss = loss_curve[best_iter] if loss_curve and best_iter < len(loss_curve) else float("nan")
+            fold_val_losses.append(float(best_loss))
         except Exception as e:
             logger.warning(f"OOF fold failed: {e}")
+            fold_val_losses.append(float("nan"))
+            fold_best_iterations.append(0)
 
-    return oof_proba
+    return oof_proba, fold_val_losses, fold_best_iterations
 
 
 def compute_shap_importance(model, X_train: pd.DataFrame, top_k: int = 20) -> pd.Series:

@@ -66,6 +66,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     # Run backtest per symbol (single-symbol engine, aggregate results)
     all_nav_series = []
     all_trade_logs = []
+    per_symbol_metrics = []
 
     for sym in tqdm(symbol_names, desc="stage_07", unit="sym"):
         sig_df = _load_signals(sym, signals_dir)
@@ -116,6 +117,11 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
         if n_trades > 0:
             trades.to_csv(results_dir / f"{sym}_{_TF}_trades.csv", index=False)
 
+        # Compute per-symbol metrics (reuse same function as portfolio — no extra compute cost)
+        sym_metrics = compute_all_metrics(nav, trades, cfg)
+        sym_metrics["symbol"] = sym
+        per_symbol_metrics.append(sym_metrics)
+
         all_nav_series.append(nav)
         if n_trades > 0:
             all_trade_logs.append(trades)
@@ -141,6 +147,22 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     combined_nav.to_frame("nav").to_parquet(results_dir / "portfolio_nav.parquet")
     if len(combined_trades) > 0:
         combined_trades.to_csv(results_dir / "trade_log.csv", index=False)
+
+    # Save per-symbol metrics CSV
+    if per_symbol_metrics:
+        sym_df = pd.DataFrame(per_symbol_metrics)
+        # Put symbol column first
+        cols = ["symbol"] + [c for c in sym_df.columns if c != "symbol"]
+        sym_df[cols].to_csv(results_dir / "per_symbol_metrics.csv", index=False)
+        logger.info(f"Per-symbol metrics saved: {results_dir / 'per_symbol_metrics.csv'}")
+
+    # Generate per-symbol summary chart from training_summary.csv
+    try:
+        from src.visualization.training_diagnostics import plot_per_symbol_summary
+        training_summary_csv = Path(cfg.data.models_dir) / "training_summary.csv"
+        plot_per_symbol_summary(training_summary_csv, results_dir / "diagnostics")
+    except Exception as e:
+        logger.debug(f"Per-symbol summary chart skipped: {e}")
 
     # Survivorship note
     survivorship_note = compute_survivorship_note(delisted_dict, symbol_names)

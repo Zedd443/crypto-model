@@ -190,8 +190,12 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
 
     # Step 4: OOF predictions for meta-labeling (NEVER in-sample)
     logger.info(f"  {symbol}: computing OOF predictions")
+    fold_val_losses = []
+    fold_best_iterations = []
     try:
-        oof_proba = compute_oof_predictions(X_train_final, y_train_binary, w_train, splitter, best_params, cfg)
+        oof_proba, fold_val_losses, fold_best_iterations = compute_oof_predictions(
+            X_train_final, y_train_binary, w_train, splitter, best_params, cfg
+        )
     except Exception as e:
         logger.warning(f"  {symbol}: OOF failed ({e})")
         oof_proba = np.full((len(X_train_final), 2), 0.5)
@@ -199,7 +203,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     # Step 5: Train final model on all train data
     logger.info(f"  {symbol}: training final model")
     try:
-        model, calibrator = train_xgb(
+        model, calibrator, val_loss_curve, best_iteration = train_xgb(
             X_train_final, y_train_binary,
             X_val_final, y_val_binary,
             w_train, best_params, cfg
@@ -269,6 +273,19 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     pbo = compute_pbo(fold_sharpes)
     synthetic_sharpe = float(np.mean(fold_sharpes)) if fold_sharpes else 0.0
 
+    # overfit_ratio: train_logloss / val_logloss at best_iteration
+    # Closer to 1.0 = less overfit. < 0.85 = model likely memorizing train set.
+    train_loss_at_best = float("nan")
+    val_loss_at_best = val_loss_curve[best_iteration] if val_loss_curve and best_iteration < len(val_loss_curve) else float("nan")
+    # Train logloss: approximate from OOF predictions on train set
+    try:
+        from sklearn.metrics import log_loss
+        train_loss_at_best = float(log_loss(y_train_binary.values, oof_proba[:, 1]))
+    except Exception:
+        pass
+    overfit_ratio = float(train_loss_at_best / val_loss_at_best) if not (np.isnan(train_loss_at_best) or np.isnan(val_loss_at_best) or val_loss_at_best == 0) else float("nan")
+    fold_da_std = float(np.std(fold_da_list)) if fold_da_list else float("nan")
+
     metrics = {
         "da": da,
         "ic": ic,
@@ -283,6 +300,10 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         "pct_positive_train": pct_positive_train,
         "pct_positive_val": pct_positive_val,
         "fold_da_list": fold_da_list,
+        "best_iteration": int(best_iteration),
+        "overfit_ratio": overfit_ratio,
+        "fold_da_std": fold_da_std,
+        "val_logloss": val_loss_at_best,
     }
 
     tier = _assign_tier(metrics, cfg)
@@ -291,7 +312,30 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         f"Tier={tier} folds_above_da={sum(1 for d in fold_da_list if d >= float(cfg.model.tier_A_da_min))}"
     )
 
-    # Step 8: SHAP importance — skip on Kaggle (CPU-only, ~2-5 min/symbol) via SKIP_SHAP=1
+    # Step 8a: Save training diagnostics JSON for overfitting analysis
+    try:
+        diagnostics_dir = checkpoints_dir / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics = {
+            "symbol": symbol,
+            "version": "",  # filled after version is generated below
+            "val_logloss_curve": val_loss_curve,
+            "best_iteration": int(best_iteration),
+            "fold_val_losses": fold_val_losses,
+            "fold_best_iterations": fold_best_iterations,
+            "fold_da_list": fold_da_list,
+            "overfit_ratio": overfit_ratio,
+            "fold_da_std": fold_da_std,
+            "val_logloss_best": val_loss_at_best,
+            "train_logloss_oof": train_loss_at_best,
+        }
+        diag_path = diagnostics_dir / f"{symbol}_{_TF}_train_diagnostics.json"
+        with open(diag_path, "w") as f:
+            json.dump(diagnostics, f)
+    except Exception as e:
+        logger.warning(f"  {symbol}: diagnostics save failed: {e}")
+
+    # Step 8b: SHAP importance — skip on Kaggle (CPU-only, ~2-5 min/symbol) via SKIP_SHAP=1
     skip_shap = os.environ.get("SKIP_SHAP", "0") == "1"
     if not skip_shap:
         try:
@@ -309,6 +353,19 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     version = generate_version_string(symbol, _TF, selected_features, best_params, train_start_str, train_end_str)
 
     save_model(model, calibrator, symbol, _TF, version, models_dir)
+
+    # Update version in diagnostics file now that we have it
+    try:
+        diag_path = checkpoints_dir / "diagnostics" / f"{symbol}_{_TF}_train_diagnostics.json"
+        if diag_path.exists():
+            with open(diag_path) as f:
+                diag_data = json.load(f)
+            diag_data["version"] = version
+            with open(diag_path, "w") as f:
+                json.dump(diag_data, f)
+    except Exception:
+        pass
+
     register_model(
         symbol=symbol,
         tf=_TF,
@@ -335,6 +392,25 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     features_sel_path.parent.mkdir(parents=True, exist_ok=True)
     with open(features_sel_path, "w") as f:
         json.dump(selected_features, f)
+
+    # Generate diagnostic plots (non-fatal — skip on error)
+    try:
+        from src.visualization.training_diagnostics import generate_all_diagnostics
+        diag_dir = checkpoints_dir / "diagnostics"
+        results_dir = Path(cfg.data.results_dir)
+        generate_all_diagnostics(
+            symbol=symbol,
+            val_loss_curve=val_loss_curve,
+            best_iteration=best_iteration,
+            fold_da_list=fold_da_list,
+            fold_val_losses=fold_val_losses,
+            val_proba_cal=val_proba_cal,
+            y_val=y_val_binary.values,
+            overfit_ratio=overfit_ratio,
+            output_dir=results_dir / "diagnostics",
+        )
+    except Exception as e:
+        logger.warning(f"  {symbol}: diagnostic plots failed (non-fatal): {e}")
 
     return symbol, {"version": version, "tier": tier, "metrics": metrics}, None
 
