@@ -39,10 +39,11 @@ class BinanceClient:
         self._session.headers.update({
             "X-MBX-APIKEY": self._api_key,
         })
-        # Cache for symbol exchange info (step size, max qty, min notional)
+        # Cache for symbol exchange info (step size, max qty, min notional, tick size)
         self._qty_step_cache: dict[str, float] = {}
         self._qty_max_cache: dict[str, float] = {}      # max order qty from MARKET_LOT_SIZE / LOT_SIZE
         self._min_notional_cache: dict[str, float] = {}  # min notional from MIN_NOTIONAL filter
+        self._tick_size_cache: dict[str, float] = {}     # price tick size from PRICE_FILTER
         logger.info(f"BinanceClient initialised — mode={mode} endpoint={self._base_url}")
 
     def _sign(self, params: dict) -> dict:
@@ -140,15 +141,20 @@ class BinanceClient:
         price: float | None = None,
         stop_price: float | None = None,
         reduce_only: bool = False,
+        close_position: bool = False,
     ) -> dict:
         params: dict = {
             "symbol": symbol,
             "side": side,
             "type": order_type,
-            "quantity": qty,
         }
-        if reduce_only:
-            params["reduceOnly"] = "true"
+        # STOP_MARKET / TAKE_PROFIT_MARKET with closePosition=true must NOT include quantity
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = qty
+            if reduce_only:
+                params["reduceOnly"] = "true"
         if price is not None:
             params["price"] = price
             params["timeInForce"] = "GTC"
@@ -198,10 +204,15 @@ class BinanceClient:
                 elif ft == "MIN_NOTIONAL":
                     min_notional = float(filt.get("notional", filt.get("minNotional", 5.0)))
                     self._min_notional_cache[symbol] = min_notional
+                elif ft == "PRICE_FILTER":
+                    tick = float(filt.get("tickSize", 0.01))
+                    if tick > 0:
+                        self._tick_size_cache[symbol] = tick
             logger.debug(
                 f"{symbol}: step={self._qty_step_cache.get(symbol)} "
                 f"max_qty={self._qty_max_cache.get(symbol)} "
-                f"min_notional={self._min_notional_cache.get(symbol)}"
+                f"min_notional={self._min_notional_cache.get(symbol)} "
+                f"tick={self._tick_size_cache.get(symbol)}"
             )
         except Exception as e:
             logger.warning(f"{symbol}: could not fetch exchange info — {e}")
@@ -225,3 +236,14 @@ class BinanceClient:
         if symbol not in self._qty_step_cache:
             self._fetch_symbol_info(symbol)
         return self._min_notional_cache.get(symbol, 5.0)
+
+    def get_tick_size(self, symbol: str) -> float:
+        """Price tick size for a symbol. Default 0.01."""
+        if symbol not in self._qty_step_cache:
+            self._fetch_symbol_info(symbol)
+        return self._tick_size_cache.get(symbol, 0.01)
+
+    def round_price(self, symbol: str, price: float) -> float:
+        """Round price to the symbol's tick size."""
+        tick = self.get_tick_size(symbol)
+        return round(round(price / tick) * tick, 10)

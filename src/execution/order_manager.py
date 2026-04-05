@@ -108,14 +108,14 @@ class OrderManager:
 
         order_id = str(entry_resp.get("orderId", ""))
 
-        # Compute TP / SL prices
+        # Compute TP / SL prices — rounded to symbol's tick size
         if direction == "long":
-            tp_price = round(entry_price * (1.0 + tp_pct), 8)
-            sl_price = round(entry_price * (1.0 - sl_pct), 8)
+            tp_price = self._client.round_price(symbol, entry_price * (1.0 + tp_pct))
+            sl_price = self._client.round_price(symbol, entry_price * (1.0 - sl_pct))
             close_side = "SELL"
         else:
-            tp_price = round(entry_price * (1.0 - tp_pct), 8)
-            sl_price = round(entry_price * (1.0 + sl_pct), 8)
+            tp_price = self._client.round_price(symbol, entry_price * (1.0 - tp_pct))
+            sl_price = self._client.round_price(symbol, entry_price * (1.0 + sl_pct))
             close_side = "BUY"
 
         tp_order_id = None
@@ -123,22 +123,22 @@ class OrderManager:
         tp_failed = False
         sl_failed = False
 
-        # Limit TP order
+        # Limit TP order (TAKE_PROFIT_MARKET with closePosition avoids qty precision issues)
         try:
             tp_resp = self._client.place_order(
-                symbol, close_side, qty, order_type="LIMIT",
-                price=tp_price, reduce_only=True,
+                symbol, close_side, qty, order_type="TAKE_PROFIT_MARKET",
+                stop_price=tp_price, close_position=True,
             )
             tp_order_id = tp_resp.get("orderId")
         except Exception as exc:
             logger.warning(f"{symbol}: TP bracket order failed: {exc}")
             tp_failed = True
 
-        # Stop-market SL order
+        # Stop-market SL order with closePosition=True (no qty required, avoids precision issues)
         try:
             sl_resp = self._client.place_order(
                 symbol, close_side, qty, order_type="STOP_MARKET",
-                stop_price=sl_price, reduce_only=True,
+                stop_price=sl_price, close_position=True,
             )
             sl_order_id = sl_resp.get("orderId")
         except Exception as exc:
