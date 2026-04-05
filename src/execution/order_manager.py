@@ -80,6 +80,15 @@ class OrderManager:
         qty_step = self._client.get_qty_step(symbol)
         qty = round(qty_raw / qty_step) * qty_step
 
+        # Cap to exchange max order quantity (some small-cap coins have low max qty)
+        max_qty = self._client.get_max_qty(symbol, entry_price)
+        if qty > max_qty:
+            logger.warning(
+                f"{symbol}: qty {qty} exceeds exchange max_qty {max_qty} — capping. "
+                f"Effective notional={max_qty * entry_price:.2f} USD (wallet too large for this coin)"
+            )
+            qty = round(max_qty / qty_step) * qty_step
+
         # Market entry
         entry_side = "BUY" if direction == "long" else "SELL"
         try:

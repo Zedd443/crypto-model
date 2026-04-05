@@ -39,8 +39,10 @@ class BinanceClient:
         self._session.headers.update({
             "X-MBX-APIKEY": self._api_key,
         })
-        # Cache for symbol quantity precision (step size)
-        self._qty_step_cache = {}
+        # Cache for symbol exchange info (step size, max qty, max notional)
+        self._qty_step_cache: dict[str, float] = {}
+        self._qty_max_cache: dict[str, float] = {}   # max order qty from LOT_SIZE
+        self._notional_max_cache: dict[str, float] = {}  # max notional from MARKET_LOT_SIZE / MIN_NOTIONAL
         logger.info(f"BinanceClient initialised — mode={mode} endpoint={self._base_url}")
 
     def _sign(self, params: dict) -> dict:
@@ -174,24 +176,42 @@ class BinanceClient:
         data = self._request("GET", "/fapi/v1/time")
         return int(data["serverTime"])
 
-    def get_qty_step(self, symbol: str) -> float:
-        """Get the minimum quantity step (lot size) for a symbol from exchange info."""
-        if symbol in self._qty_step_cache:
-            return self._qty_step_cache[symbol]
-
+    def _fetch_symbol_info(self, symbol: str) -> None:
+        """Fetch and cache all relevant exchange filters for a symbol (one API call)."""
         try:
             data = self._request("GET", "/fapi/v1/exchangeInfo", {"symbol": symbol})
-            if "symbols" in data and len(data["symbols"]) > 0:
-                sym_info = data["symbols"][0]
-                for filt in sym_info.get("filters", []):
-                    if filt.get("filterType") == "LOT_SIZE":
-                        step = float(filt.get("stepSize", 1.0))
-                        self._qty_step_cache[symbol] = step
-                        logger.debug(f"{symbol}: qty step = {step}")
-                        return step
+            if "symbols" not in data or len(data["symbols"]) == 0:
+                raise ValueError("empty symbols list")
+            sym_info = data["symbols"][0]
+            for filt in sym_info.get("filters", []):
+                ft = filt.get("filterType")
+                if ft == "LOT_SIZE":
+                    self._qty_step_cache[symbol] = float(filt.get("stepSize", 1.0))
+                    max_qty = float(filt.get("maxQty", 0))
+                    if max_qty > 0:
+                        self._qty_max_cache[symbol] = max_qty
+                elif ft == "MARKET_LOT_SIZE":
+                    max_qty = float(filt.get("maxQty", 0))
+                    if max_qty > 0:
+                        # MARKET_LOT_SIZE overrides LOT_SIZE max for market orders
+                        self._qty_max_cache[symbol] = max_qty
+            logger.debug(
+                f"{symbol}: step={self._qty_step_cache.get(symbol)} "
+                f"max_qty={self._qty_max_cache.get(symbol)}"
+            )
         except Exception as e:
-            logger.warning(f"{symbol}: could not fetch qty step — {e}")
+            logger.warning(f"{symbol}: could not fetch exchange info — {e}")
+            # Fallbacks
+            self._qty_step_cache.setdefault(symbol, 1.0)
 
-        # Fallback: use 1.0 (no decimal precision)
-        self._qty_step_cache[symbol] = 1.0
-        return 1.0
+    def get_qty_step(self, symbol: str) -> float:
+        """Minimum quantity step size for a symbol (lot size precision)."""
+        if symbol not in self._qty_step_cache:
+            self._fetch_symbol_info(symbol)
+        return self._qty_step_cache.get(symbol, 1.0)
+
+    def get_max_qty(self, symbol: str, price: float) -> float:
+        """Maximum order quantity for a symbol. Returns inf if no limit found."""
+        if symbol not in self._qty_step_cache:
+            self._fetch_symbol_info(symbol)
+        return self._qty_max_cache.get(symbol, float("inf"))
