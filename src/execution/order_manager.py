@@ -89,6 +89,15 @@ class OrderManager:
             )
             qty = round(max_qty / qty_step) * qty_step
 
+        # Skip if resulting notional is below exchange minimum (e.g. coin too cheap + small max_qty)
+        effective_notional = qty * entry_price
+        min_notional = self._client.get_min_notional(symbol)
+        if effective_notional < min_notional:
+            logger.warning(
+                f"{symbol}: effective notional {effective_notional:.2f} USD < min_notional {min_notional:.2f} — skipping entry"
+            )
+            return None
+
         # Market entry
         entry_side = "BUY" if direction == "long" else "SELL"
         try:

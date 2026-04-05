@@ -39,10 +39,10 @@ class BinanceClient:
         self._session.headers.update({
             "X-MBX-APIKEY": self._api_key,
         })
-        # Cache for symbol exchange info (step size, max qty, max notional)
+        # Cache for symbol exchange info (step size, max qty, min notional)
         self._qty_step_cache: dict[str, float] = {}
-        self._qty_max_cache: dict[str, float] = {}   # max order qty from LOT_SIZE
-        self._notional_max_cache: dict[str, float] = {}  # max notional from MARKET_LOT_SIZE / MIN_NOTIONAL
+        self._qty_max_cache: dict[str, float] = {}      # max order qty from MARKET_LOT_SIZE / LOT_SIZE
+        self._min_notional_cache: dict[str, float] = {}  # min notional from MIN_NOTIONAL filter
         logger.info(f"BinanceClient initialised — mode={mode} endpoint={self._base_url}")
 
     def _sign(self, params: dict) -> dict:
@@ -195,9 +195,13 @@ class BinanceClient:
                     if max_qty > 0:
                         # MARKET_LOT_SIZE overrides LOT_SIZE max for market orders
                         self._qty_max_cache[symbol] = max_qty
+                elif ft == "MIN_NOTIONAL":
+                    min_notional = float(filt.get("notional", filt.get("minNotional", 5.0)))
+                    self._min_notional_cache[symbol] = min_notional
             logger.debug(
                 f"{symbol}: step={self._qty_step_cache.get(symbol)} "
-                f"max_qty={self._qty_max_cache.get(symbol)}"
+                f"max_qty={self._qty_max_cache.get(symbol)} "
+                f"min_notional={self._min_notional_cache.get(symbol)}"
             )
         except Exception as e:
             logger.warning(f"{symbol}: could not fetch exchange info — {e}")
@@ -215,3 +219,9 @@ class BinanceClient:
         if symbol not in self._qty_step_cache:
             self._fetch_symbol_info(symbol)
         return self._qty_max_cache.get(symbol, float("inf"))
+
+    def get_min_notional(self, symbol: str) -> float:
+        """Minimum order notional (USD value) for a symbol. Default 5.0."""
+        if symbol not in self._qty_step_cache:
+            self._fetch_symbol_info(symbol)
+        return self._min_notional_cache.get(symbol, 5.0)

@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-04-05T03:02:59.372332+00:00",
+  "last_updated": "2026-04-05T03:33:42.416003+00:00",
   "stages": {
     "ingest": {
       "status": "done",
@@ -179,7 +179,7 @@
   },
   "model_tiers": {},
   "account": {
-    "current_equity": 5376.84222948,
+    "current_equity": 5376.5571575,
     "active_symbol_count": 1,
     "growth_gate_unlocked": false,
     "growth_gate_threshold": 300.0
