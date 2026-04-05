@@ -457,41 +457,21 @@ def _process_symbol(
         sig_info["action"] = "SKIP_LIMIT"
         return sig_info
 
-    # Size the position
-    half_kelly = float(cfg.portfolio.kelly_fraction)  # already 0.5 = half-Kelly from config
-
-    # Determine leverage from growth gate tier
+    # Size the position — wallet-based sizing (mirrors Est Profit.xlsx logic)
+    # margin = equity / max_symbols_allowed  (equity split evenly across open slots)
+    # notional = margin × leverage (volume from tier)
+    # This matches the Excel model: Volume = Saldo × leverage, trade full wallet each bar.
     _, leverage = get_growth_gate_limits(equity, cfg)
-
-    pos_info = compute_position_size(
-        meta_prob=signal_strength,
-        half_kelly=half_kelly,
-        equity=equity,
-        leverage=float(leverage),
-        cfg=cfg,
-    )
-
-    # FIX 4: get scale_factor from portfolio capacity check and apply it
-    current_positions_margin = {
-        sym: {"margin": data.get("size_usd", 0) / max(float(leverage), 1)}
-        for sym, data in order_manager.positions.items()
+    max_symbols, _ = get_growth_gate_limits(equity, cfg)
+    margin = equity / max(max_symbols, 1)
+    notional = margin * float(leverage)
+    pos_info = {
+        "margin": float(margin),
+        "notional": float(notional),
+        "leverage_used": float(leverage),
+        "size_usd": float(margin),
     }
-    scale_factor, should_skip = check_portfolio_capacity(
-        current_positions=current_positions_margin,
-        new_position={"margin": pos_info["margin"]},
-        total_equity=equity,
-        cfg=cfg,
-    )
-    if should_skip:
-        logger.info(f"{symbol}: portfolio margin limit reached — skipping entry")
-        sig_info["action"] = "SKIP_LIMIT"
-        return sig_info
-    if scale_factor < 1.0:
-        # Scale down position proportionally when approaching soft limit
-        pos_info["margin"] = pos_info["margin"] * scale_factor
-        pos_info["size_usd"] = pos_info.get("size_usd", pos_info["margin"]) * scale_factor
-        pos_info["notional"] = pos_info["notional"] * scale_factor
-        logger.debug(f"{symbol}: portfolio soft-limit — position scaled to {scale_factor:.2f}×")
+    logger.debug(f"{symbol}: wallet sizing — equity={equity:.2f} max_symbols={max_symbols} leverage={leverage}× margin={margin:.2f} notional={notional:.2f}")
 
     # Use last close as entry price proxy (market order will fill near this)
     entry_price = float(klines_df["close"].iloc[-1])
@@ -515,7 +495,7 @@ def _process_symbol(
     order_id = order_manager.submit_entry(
         symbol=symbol,
         direction=direction,
-        size_usd=pos_info["margin"],
+        size_usd=pos_info["notional"],
         entry_price=entry_price,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
@@ -526,7 +506,7 @@ def _process_symbol(
     if order_id:
         sig_info["action"] = "ENTERED"
         logger.info(
-            f"{symbol}: entry submitted — dir={direction} size_usd={pos_info['margin']:.2f} "
+            f"{symbol}: entry submitted — dir={direction} notional={pos_info['notional']:.2f} margin={pos_info['margin']:.2f} "
             f"atr={atr:.6f} tp_pct={tp_pct:.4%} sl_pct={sl_pct:.4%} "
             f"signal={signal_strength:.3f} orderId={order_id}"
         )
