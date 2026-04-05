@@ -21,6 +21,14 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ## Open Issues (Not Fixed)
 
+### ISSUE-025: Order placement fails with "Precision is over the maximum" — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/order_manager.py`, `src/execution/binance_client.py`
+- **Problem**: Order quantity was rounded to 6 decimals unconditionally (`round(qty, 6)`). Some symbols (NEARUSDT, 1INCHUSDT) have different lot size (step size) requirements. Binance rejected orders with HTTP 400 "Precision is over the maximum defined for this asset".
+- **Fix**: Added `get_qty_step(symbol)` method to `BinanceClient` that fetches symbol info from `/fapi/v1/exchangeInfo` and caches the LOT_SIZE filter. Updated `submit_entry()` and market close logic to round quantities: `qty = round(qty_raw / qty_step) * qty_step` instead of hardcoded 6 decimals. Three locations fixed: entry orders, close_position, and DMS shutdown.
+- **Status**: FIXED
+
 ### ISSUE-023: Missing cross-sectional rank features in live inference — FIXED
 - **Date discovered**: 2026-04-05
 - **Date fixed**: 2026-04-05

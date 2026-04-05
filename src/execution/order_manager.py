@@ -75,8 +75,10 @@ class OrderManager:
             logger.warning(f"{symbol}: submit_entry called but position already tracked — skipping")
             return None
 
-        # Convert USD size to contract quantity using current price
-        qty = round(size_usd / entry_price, 6)
+        # Convert USD size to contract quantity using current price, rounded to symbol's step size
+        qty_raw = size_usd / entry_price
+        qty_step = self._client.get_qty_step(symbol)
+        qty = round(qty_raw / qty_step) * qty_step
 
         # Market entry
         entry_side = "BUY" if direction == "long" else "SELL"
@@ -214,7 +216,9 @@ class OrderManager:
 
         # Flatten with a market close
         close_side = "SELL" if pos["direction"] == "long" else "BUY"
-        qty = round(pos["size_usd"] / pos["entry_price"], 6)
+        qty_raw = pos["size_usd"] / pos["entry_price"]
+        qty_step = self._client.get_qty_step(symbol)
+        qty = round(qty_raw / qty_step) * qty_step
         try:
             self._client.place_order(symbol, close_side, qty, order_type="MARKET", reduce_only=True)
             logger.info(f"{symbol}: market exit placed")
@@ -286,7 +290,9 @@ class OrderManager:
                 logger.warning(f"{symbol}: cancel_all_orders failed (continuing to market close): {exc}")
             # Issue market close to actually flatten the exchange position
             close_side = "SELL" if pos["direction"] == "long" else "BUY"
-            qty = round(pos["size_usd"] / pos["entry_price"], 6)
+            qty_raw = pos["size_usd"] / pos["entry_price"]
+            qty_step = self._client.get_qty_step(symbol)
+            qty = round(qty_raw / qty_step) * qty_step
             try:
                 self._client.place_order(symbol, close_side, qty, order_type="MARKET", reduce_only=True)
                 logger.info(f"{symbol}: market close issued by DMS/shutdown")

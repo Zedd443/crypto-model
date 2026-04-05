@@ -39,6 +39,8 @@ class BinanceClient:
         self._session.headers.update({
             "X-MBX-APIKEY": self._api_key,
         })
+        # Cache for symbol quantity precision (step size)
+        self._qty_step_cache = {}
         logger.info(f"BinanceClient initialised — mode={mode} endpoint={self._base_url}")
 
     def _sign(self, params: dict) -> dict:
@@ -171,3 +173,25 @@ class BinanceClient:
     def get_server_time(self) -> int:
         data = self._request("GET", "/fapi/v1/time")
         return int(data["serverTime"])
+
+    def get_qty_step(self, symbol: str) -> float:
+        """Get the minimum quantity step (lot size) for a symbol from exchange info."""
+        if symbol in self._qty_step_cache:
+            return self._qty_step_cache[symbol]
+
+        try:
+            data = self._request("GET", "/fapi/v1/exchangeInfo", {"symbol": symbol})
+            if "symbols" in data and len(data["symbols"]) > 0:
+                sym_info = data["symbols"][0]
+                for filt in sym_info.get("filters", []):
+                    if filt.get("filterType") == "LOT_SIZE":
+                        step = float(filt.get("stepSize", 1.0))
+                        self._qty_step_cache[symbol] = step
+                        logger.debug(f"{symbol}: qty step = {step}")
+                        return step
+        except Exception as e:
+            logger.warning(f"{symbol}: could not fetch qty step — {e}")
+
+        # Fallback: use 1.0 (no decimal precision)
+        self._qty_step_cache[symbol] = 1.0
+        return 1.0
