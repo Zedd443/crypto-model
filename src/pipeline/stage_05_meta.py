@@ -99,7 +99,8 @@ def _train_meta_symbol(
         return symbol, None, f"Insufficient train samples for meta-labeling: {len(y_train)}"
 
     # Create meta labels: 1 if primary model was correct, 0 otherwise
-    meta_y = create_meta_labels(y_train, oof_proba)
+    # Dead-zone bars excluded — primary near 0.5 is noise, not signal
+    meta_y = create_meta_labels(y_train, oof_proba, dead_zone=float(cfg.model.objective_dead_zone))
 
     # Build meta features from OOF predictions + regime + microstructure
     # Use .loc slice instead of boolean mask to avoid OOM with 1.2GB DataFrames
@@ -129,13 +130,22 @@ def _train_meta_symbol(
         else pd.Series(0.0, index=aligned_index)
     )
 
-    # regime_probs, realized_vol, volume_zscore, ofi are already on aligned_index
-    realized_vol_arr = realized_vol
-    volume_zscore_arr = volume_zscore
-    ofi_arr = ofi
+    spread_series = (
+        train_features["spread_proxy_20"].reindex(aligned_index)
+        if "spread_proxy_20" in train_features.columns
+        else None
+    )
+
+    atr_series = (
+        train_features["atr_14"].reindex(aligned_index)
+        if "atr_14" in train_features.columns
+        else None
+    )
 
     meta_X = build_meta_features(
-        oof_proba, regime_probs, realized_vol_arr, volume_zscore_arr, ofi_arr
+        oof_proba, regime_probs, realized_vol, volume_zscore, ofi,
+        spread_series=spread_series,
+        atr_series=atr_series,
     )
     meta_X = meta_X.fillna(0.0)
 
@@ -151,7 +161,7 @@ def _train_meta_symbol(
     # Meta model accuracy on train (informational only)
     meta_pred = (meta_model.predict_proba(meta_X.values)[:, 1] > 0.5).astype(int)
     meta_acc = float(np.mean(meta_pred == meta_y))
-    logger.info(f"  {symbol}: meta accuracy on OOF = {meta_acc:.3f}")
+    logger.info(f"  {symbol}: meta accuracy on train (in-sample) = {meta_acc:.3f}")
 
     # Version and register meta model
     primary_model_entry = get_latest_model(symbol, _TF, model_type="primary")
@@ -170,7 +180,7 @@ def _train_meta_symbol(
         symbol=symbol,
         tf=_TF,
         version=version,
-        metrics={"meta_accuracy_oof": meta_acc},
+        metrics={"meta_accuracy_train": meta_acc},
         feature_names=meta_X.columns.tolist(),
         hyperparams={"primary_version": primary_version},
         train_period=(str(train_labels_aligned.index.min().date()), str(train_labels_aligned.index.max().date())),

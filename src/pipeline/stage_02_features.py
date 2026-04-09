@@ -32,7 +32,7 @@ def _write_saved_hash(features_dir: Path, h: str) -> None:
 
 
 def _process_symbol(args: tuple) -> tuple:
-    symbol, cfg_dict, train_end = args
+    symbol, cfg_dict, train_end, force = args
     from omegaconf import OmegaConf
     cfg = OmegaConf.create(cfg_dict)
 
@@ -44,12 +44,16 @@ def _process_symbol(args: tuple) -> tuple:
     if not checkpoint_exists("ingest", symbol, "15m", checkpoints_dir):
         return symbol, None, f"No ingest checkpoint for {symbol} 15m"
 
-    # Skip if feature file already exists (allows resuming after cross-sectional OOM)
+    # Skip if feature file already exists (allows resuming after cross-sectional OOM).
+    # With --force, delete the existing file so features are recomputed from scratch.
     feature_path = features_dir / f"{symbol}_15m_features.parquet"
     if feature_path.exists():
-        import pyarrow.parquet as _pq
-        existing_cols = _pq.read_schema(str(feature_path)).names
-        return symbol, existing_cols, None
+        if force:
+            feature_path.unlink()
+        else:
+            import pyarrow.parquet as _pq
+            existing_cols = _pq.read_schema(str(feature_path)).names
+            return symbol, existing_cols, None
 
     try:
         df_15m = read_checkpoint("ingest", symbol, "15m", checkpoints_dir)
@@ -123,7 +127,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     # Phase 1: per-symbol features — parallel with ProcessPoolExecutor
     # Use max_workers=4 to avoid OOM on large feature sets
-    args_list = [(sym, cfg_dict, train_end) for sym in symbol_names]
+    args_list = [(sym, cfg_dict, train_end, force) for sym in symbol_names]
 
     with ProcessPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_process_symbol, args): args[0] for args in args_list}

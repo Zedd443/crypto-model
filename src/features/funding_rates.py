@@ -52,6 +52,14 @@ def compute_pre_funding_window(hours_to_funding: pd.Series, threshold: float = 1
     return flag.rename(f"pre_funding_window_{threshold}")
 
 
+def compute_funding_sign_persistence(proxy: pd.Series, window: int = 8) -> pd.Series:
+    # Count how many bars in rolling window have same sign as the current bar
+    sign = np.sign(proxy)
+    return sign.rolling(window, min_periods=1).apply(
+        lambda x: np.sum(np.sign(x[-1]) == np.sign(x)), raw=True
+    ).rename(f"funding_sign_persistence_{window}")
+
+
 def compute_cross_coin_funding_divergence(funding_proxy: pd.Series, btc_funding_proxy: pd.Series) -> pd.Series:
     # Align by index before subtracting
     aligned_btc = btc_funding_proxy.reindex(funding_proxy.index)
@@ -78,6 +86,7 @@ def build_funding_features(df: pd.DataFrame, btc_df, cfg) -> pd.DataFrame:
         compute_funding_percentile(proxy, pct_window).to_frame(),
         compute_hours_to_funding(df.index).to_frame(),
         compute_pre_funding_window(compute_hours_to_funding(df.index), 1.0).to_frame(),
+        compute_funding_sign_persistence(proxy, 8).to_frame(),
     ]
 
     if btc_df is not None:

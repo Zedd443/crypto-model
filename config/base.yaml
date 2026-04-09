@@ -23,6 +23,7 @@ features:
   ofi_window: 20                               # order flow imbalance rolling window (bars)
   amihud_window: 20                            # Amihud illiquidity ratio window (bars)
   kyle_window: 20                              # Kyle lambda price-impact window (bars)
+  acf_window: 96                               # rolling ACF lag-1 and lag-5 window (96 × 15m = 24h)
   rv_daily_bars: 96                            # bars in one trading day (96 × 15m = 24h)
   rv_weekly_days: 5                            # trading days in one week for weekly RV
   rv_monthly_days: 22                          # trading days in one month for monthly RV
@@ -44,64 +45,70 @@ features:
     "1d": 96                                   # 1d feature stale after 96 × 15m bars
 
 labels:
-  tp_atr_mult: 2.5                             # take-profit = ATR × 2.5 (risk-reward numerator)
-  sl_atr_mult: 1.5                             # stop-loss = ATR × 1.5 (risk-reward denominator)
+  tp_atr_mult: 2.0                             # take-profit = ATR × 2.0 (2:1 R:R numerator)
+  sl_atr_mult: 1.0                             # stop-loss = ATR × 1.0 (2:1 R:R denominator)
   tp_min_pct: 0.015                            # minimum take-profit distance (1.5% of price)
   tp_max_pct: 0.06                             # maximum take-profit distance (6% of price)
   sl_min_pct: 0.01                             # minimum stop-loss distance (1%)
   sl_max_pct: 0.05                             # maximum stop-loss distance (5%)
   vol_lookback: 20                             # ATR lookback window for barrier sizing
-  max_hold_bars: 16                            # time barrier — exit after 16 bars (4h) if no hit
+  max_hold_bars: 32                            # time barrier — exit after 32 bars (8h) if no hit
+  fee_adjust_labels: true                      # reclassify marginal TP hits below round-trip cost as neutral
+  round_trip_cost_pct: 0.006                   # total round-trip cost: 2×0.002 slippage + 0.001 fee each side
   h1_rolling_median_window: 480                # 1h volume median window for liquidity filter
   weight_clip_min: 0.1                         # minimum sample weight after clipping
   weight_clip_max: 3.0                         # maximum sample weight after clipping
   dead_zone_cost_multiple: 0.5                 # penalty weight for dead-zone (no-trade) labels
 
 regime:
-  n_states: 4                                  # HMM states: low_vol_range, high_vol_range, trending, crisis
-  hmm_covariance_type: "full"                  # full covariance matrix per HMM state
+  n_states: 3                                  # HMM states: bull / bear / sideways (ablation from 4-state)
+  hmm_covariance_type: "diag"                  # diagonal covariance — fewer params, more stable with 3 states
   hmm_n_iter: 100                              # EM iterations for HMM fitting
-  hmm_retrain_hours: 24                        # retrain HMM every 24h in live mode
+  hmm_retrain_hours: 6                         # retrain HMM every 6h in live mode (immediate for regime shifts)
   hmm_burnin_bars: 100                         # bars discarded before HMM state assignment
   bocpd_min_size: 50                           # minimum segment size for BOCPD changepoint detection
   bocpd_penalty: "bic"                         # model selection penalty for BOCPD (BIC/AIC)
 
 model:
   xgb_device: "cpu"                            # override to "cuda" on Kaggle GPU or set env XGB_DEVICE=cuda
-  xgb_n_estimators: 10                        # default tree count (Optuna may override)
-  xgb_max_depth: 3                             # default max tree depth
+  xgb_n_estimators: 500                        # default tree count (Optuna may override)
+  xgb_max_depth: 4                             # default max tree depth
   xgb_learning_rate: 0.05                      # default shrinkage rate
   xgb_subsample: 0.8                           # row subsampling ratio per tree
   xgb_colsample_bytree: 0.8                    # feature subsampling ratio per tree
-  xgb_min_child_weight: 10                     # minimum sum of sample weights in a leaf
+  xgb_min_child_weight: 20                     # minimum sum of sample weights in a leaf
   xgb_reg_alpha: 0.1                           # L1 regularisation (feature sparsity)
   xgb_reg_lambda: 1.0                          # L2 regularisation (weight shrinkage)
-  xgb_gamma: 0.1                               # minimum loss reduction to make a split
-  xgb_early_stopping_rounds: 10               # stop if no improvement for 50 rounds
-  cv_n_splits: 8                               # number of purged time-series CV folds
-  embargo_pct: 0.01                            # fraction of data embargoed between train/val folds
-  embargo_bars_min: 50                         # minimum embargo gap in bars regardless of pct
-  optuna_n_trials: 1                          # hyperparameter search trials per symbol
-  optuna_n_trials_wfo: 1                      # trials for walk-forward optimisation
-  optuna_patience: 3                          # early-stop Optuna if no improvement after N trials
-  objective_da_weight: 0.4                     # weight of directional accuracy in Optuna objective
+  xgb_gamma: 0.05                               # minimum loss reduction to make a split
+  xgb_early_stopping_rounds: 50               # stop if no improvement for 50 rounds
+  cv_n_splits: 8                               # number of purged time-series CV folds (was 5)
+  embargo_pct: 0.02                            # fraction of data embargoed between train/val folds (was 0.01)
+  embargo_bars_min: 192                        # minimum embargo gap in bars — 192×15m = 48h (was 50)
+  optuna_n_trials: 20                          # hyperparameter search trials per symbol (faster with better objective)
+  optuna_n_trials_wfo: 5                      # trials for walk-forward optimisation (dead code — unused)
+  optuna_patience: 5                          # early-stop Optuna if no improvement after N trials
+  objective_da_weight: 0.2                     # weight of directional accuracy in Optuna objective (was 0.4)
   objective_ic_weight: 0.3                     # weight of information coefficient in objective
-  objective_sharpe_weight: 0.3                 # weight of Sharpe ratio in objective
-  stability_threshold: 0.6                     # minimum selection frequency for stability selection
-  stability_n_bootstrap: 50                    # bootstrap iterations for stability selection
+  objective_sharpe_weight: 0.5                 # weight of Calmar-adjusted Sharpe in objective (was 0.3)
+  objective_cvar_weight: 0.1                   # weight of CVaR 95% tail penalty in objective (NEW)
+  objective_dead_zone: 0.05                    # prob distance from 0.5 treated as no-signal in objective (NEW, was hardcoded 0.03)
+  stability_threshold: 0.75                    # minimum selection frequency for stability selection (was 0.70)
+  stability_n_bootstrap: 100                   # bootstrap iterations for stability selection (was 30)
+  stability_rf_n_estimators: 50               # RF trees per bootstrap in stability selection (was hardcoded 30)
+  stability_rf_max_depth: 8                   # RF max depth per bootstrap in stability selection (was hardcoded 5)
   variance_threshold: 1.0e-6                   # drop features with variance below this
   permutation_importance_top_k: 80            # keep top-k features by permutation importance
   shap_top_k: 30                               # keep top-k features by SHAP importance
   importance_stability_spearman_min: 0.6       # min Spearman correlation of feature ranks across folds
   staleness_decay_days: 30                     # decay window for feature importance staleness check
   staleness_exclude_threshold: 0.3            # exclude feature if staleness score exceeds this
-  calibration_method: "isotonic"               # probability calibration method (isotonic / sigmoid)
-  conformal_q_level: 0.90                      # conformal prediction quantile level
+  calibration_method: "sigmoid"                # probability calibration method — sigmoid (Platt) is more robust than isotonic on small val sets
+  conformal_q_level: 0.85                      # conformal prediction quantile level (was 0.90)
   conformal_width_full: 0.20                   # prediction interval width below this → full position size
   conformal_width_60pct: 0.40                  # width between 0.20–0.40 → 60% position size (above → 30%)
-  meta_n_estimators: 10                       # meta-labeler tree count
-  meta_max_depth: 4                            # meta-labeler max depth (shallow to avoid overfit)
-  meta_signal_floor: 0.1                      # minimum meta-prob to pass a signal
+  meta_n_estimators: 300                      # meta-labeler tree count (was 100)
+  meta_max_depth: 6                            # meta-labeler max depth (was 4)
+  meta_signal_floor: 0.25                     # minimum meta-prob to pass a signal (was 0.1)
   tier_A_da_min: 0.53                          # tier A: minimum directional accuracy on validation
   tier_A_da_min_folds: 6                       # tier A: DA threshold must hold in at least N folds
   tier_A_dsr_min: 0.0                          # tier A: minimum deflated Sharpe ratio
@@ -119,11 +126,12 @@ model:
 
 portfolio:
   signal_floor_prob: 0.2                      # minimum signal_strength to enter a trade
+  max_volume_usdt: 0                           # hard cap on volume per trade in USDT (0 = no cap, use full wallet × leverage)
   max_position_size: 0.10                      # maximum single position as fraction of equity
   max_total_margin_pct: 0.80                   # maximum total margin deployed (80% of equity)
   kelly_fraction: 0.5                          # half-Kelly sizing fraction
-  dead_zone_direction: 0.03                    # prob distance from 0.5 below which direction=0
-  dead_zone_signal: 0.02                       # prob distance from 0.5 below which signal cancelled
+  dead_zone_direction: 0.05                    # prob distance from 0.5 below which direction=0 (was 0.03)
+  dead_zone_signal: 0.03                       # prob distance from 0.5 below which signal cancelled (was 0.02)
   cvar_confidence_levels: [0.95, 0.99]         # CVaR confidence levels for tail risk estimation
   cvar_lambda_penalty: 0.5                     # CVaR penalty weight in position sizing
   dcc_fallback_ewm_span: 60                    # EWM span for correlation when DCC-GARCH unavailable
@@ -151,8 +159,8 @@ backtest:
   limit_requote_seconds: 15                    # wait N seconds before requoting a stale limit order
   limit_skip_seconds: 30                       # cancel limit order and skip if unfilled after N seconds
   partial_fill_min_ratio: 0.90                 # accept partial fill only if at least 90% filled
-  sl_atr_mult: 1.5                             # stop-loss distance in ATR multiples (backtest)
-  tp_atr_mult: 2.5                             # take-profit distance in ATR multiples (backtest)
+  sl_atr_mult: 1.0                             # stop-loss distance in ATR multiples — matches labels (was 1.5)
+  tp_atr_mult: 2.0                             # take-profit distance in ATR multiples — matches labels (was 2.5)
   trailing_trigger_pct: 0.005                  # activate trailing stop after 0.5% favourable move
   trailing_atr_mult: 1.0                       # trailing stop distance in ATR multiples
   funding_skip_net_pnl_threshold: 0.003        # skip entry if projected funding cost exceeds net PnL
@@ -171,7 +179,15 @@ backtest:
 growth_gate:
   threshold: 300.0                             # equity target to unlock multi-symbol live trading
   demo_trades_required: 500                    # minimum demo trades before mainnet is allowed
-  tiers:                                       # symbol and leverage limits per equity tier
+
+  # ── KONTROL UTAMA — ubah bagian ini saja ────────────────────────────
+  max_open_positions: 2                        # max posisi terbuka bersamaan (0 = ikuti tier)
+  fixed_leverage: 2                            # leverage tetap semua posisi (0 = ikuti tier)
+  tp_fixed_pct: 0.0                            # TP fixed pct disabled — use ATR-based TP matching training labels (tp_atr_mult=2.5)
+  sl_fixed_pct: 0.0                            # SL fixed pct disabled — use ATR-based SL matching training labels (sl_atr_mult=1.5)
+  # ─────────────────────────────────────────────────────────────────────
+
+  tiers:                                       # symbol dan leverage per tier (hanya aktif jika fixed_leverage=0)
     - max_equity: 150                          # tier 1: equity ≤ $150
       max_symbols: 2                           # trade up to 2 symbols
       leverage_a_max: 2                        # tier A models: up to 2× leverage
@@ -198,8 +214,9 @@ monitoring:
 
 trading:
   mode: "DEMO"                                 # active trading mode: DEMO / MAINNET
+  leverage: 2                                  # leverage untuk semua posisi live (alias fixed_leverage di growth_gate)
   endpoints:
-    DEMO: "https://testnet.binancefuture.com"  # Binance paper trading futures (no real money)
+    DEMO: "https://demo-fapi.binance.com"       # Binance paper trading futures (no real money)
     MAINNET: "https://fapi.binance.com"        # Binance live futures — NEVER use accidentally
   websocket_ping_interval: 30                  # WebSocket keepalive ping interval (seconds)
   websocket_reconnect_delay: 5                 # seconds to wait before reconnecting a dropped WS

@@ -136,6 +136,17 @@ def label_all_bars(close: pd.Series, high: pd.Series, low: pd.Series, cfg) -> pd
     labels_df = labels_df.join(barriers[["tp_level", "sl_level", "atr", "natr"]], how="left")
     labels_df.index.name = "t0"
 
+    # Fee-adjusted label reclassification: TP hits where gain < round-trip cost → neutral
+    if getattr(getattr(cfg, 'labels', cfg), 'fee_adjust_labels', False):
+        cost = float(getattr(cfg.labels, 'round_trip_cost_pct', 0.006))
+        if "tp_level" in labels_df.columns:
+            tp_mask = labels_df["label"] == 1
+            marginal_tp = tp_mask & (labels_df["tp_level"] < cost)
+            n_reclassified = marginal_tp.sum()
+            if n_reclassified > 0:
+                labels_df.loc[marginal_tp, "label"] = 0
+                logger.info(f"Fee-adjust: reclassified {n_reclassified} marginal TP hits as neutral (cost={cost:.4f})")
+
     n_long = (labels_df["label"] == 1).sum()
     n_short = (labels_df["label"] == -1).sum()
     n_neutral = (labels_df["label"] == 0).sum()

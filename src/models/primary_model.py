@@ -16,6 +16,17 @@ logger = get_logger("primary_model")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
+class _SigmoidCalibrator:
+    # Thin wrapper: exposes .predict(raw_probs) → calibrated probs, matching IsotonicRegression interface.
+    # Internally uses a LogisticRegression fit on (raw_probs.reshape(-1,1), y_true).
+    def __init__(self, lr_model):
+        self._lr = lr_model
+
+    def predict(self, raw_probs):
+        arr = np.asarray(raw_probs).reshape(-1, 1)
+        return self._lr.predict_proba(arr)[:, 1]
+
+
 def build_xgb_params(trial_or_dict, cfg) -> dict:
     if hasattr(trial_or_dict, "suggest_float"):
         trial = trial_or_dict
@@ -64,11 +75,14 @@ def build_xgb_params(trial_or_dict, cfg) -> dict:
     return params
 
 
-def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.ndarray) -> float:
-    # Combined objective: 0.4*DA + 0.3*IC + 0.3*Sharpe_synthetic
-    da_weight = 0.4
-    ic_weight = 0.3
-    sharpe_weight = 0.3
+def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.ndarray, cfg=None) -> float:
+    # Weights from config with fallbacks
+    da_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_da_weight', 0.2)) if cfg is not None else 0.2
+    ic_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_ic_weight', 0.3)) if cfg is not None else 0.3
+    sharpe_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_sharpe_weight', 0.5)) if cfg is not None else 0.5
+    cvar_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_cvar_weight', 0.1)) if cfg is not None else 0.1
+    dead_zone = float(getattr(getattr(cfg, 'model', cfg), 'objective_dead_zone', 0.05)) if cfg is not None else 0.05
+    fee_cost = float(getattr(getattr(cfg, 'labels', cfg), 'round_trip_cost_pct', 0.006)) if cfg is not None else 0.006
 
     # Directional accuracy
     pred_dir = (y_pred_proba[:, 1] > 0.5).astype(int)
@@ -83,15 +97,41 @@ def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.
     except Exception:
         ic = 0.0
 
-    # Synthetic Sharpe from signal-based PnL
-    positions = np.where(y_pred_proba[:, 1] > 0.5, 1.0, -1.0)
-    pnl = positions * returns
-    std_pnl = pnl.std()
-    synthetic_sharpe = float(pnl.mean() / (std_pnl + 1e-9)) * np.sqrt(252 * 96)
-    # Clip to reasonable range
-    synthetic_sharpe = np.clip(synthetic_sharpe, -3.0, 3.0)
+    # Calmar-adjusted Sharpe (70% Sharpe + 30% Calmar blend)
+    proba_long = y_pred_proba[:, 1]
+    positions = np.where(proba_long > 0.5 + dead_zone, 1.0, np.where(proba_long < 0.5 - dead_zone, -1.0, 0.0))
+    active_mask = positions != 0.0
+    if active_mask.sum() > 1:
+        active_returns = positions[active_mask] * returns[active_mask] - fee_cost  # fee-adjusted
+        mean_r = active_returns.mean()
+        std_r = active_returns.std()
+        ann_factor = np.sqrt(252 * 96)
+        sharpe = float(mean_r / (std_r + 1e-9)) * ann_factor
+        # Calmar: annualized return / max drawdown
+        cum = np.cumprod(1 + np.clip(active_returns, -0.5, 0.5))
+        running_max = np.maximum.accumulate(cum)
+        drawdown = (running_max - cum) / (running_max + 1e-9)
+        max_dd = drawdown.max()
+        ann_ret = (cum[-1] ** (252 * 96 / max(len(active_returns), 1))) - 1
+        calmar = float(ann_ret / (max_dd + 1e-9))
+        calmar = np.clip(calmar, -3.0, 3.0)
+        calmar_adj_sharpe = 0.7 * np.clip(sharpe, -3.0, 3.0) + 0.3 * calmar
+        # CVaR 95%: mean of worst 5% returns
+        n_tail = max(1, int(0.05 * len(active_returns)))
+        cvar_95 = float(np.sort(active_returns)[:n_tail].mean())
+        cvar_penalty = np.clip(-cvar_95 * 10, 0.0, 1.0)  # positive when losses, 0 when gains
+        # Auto-reduce CVaR weight when tail sample count too small for reliable estimate
+        effective_cvar_weight = cvar_weight * min(1.0, n_tail / 50)
+    else:
+        calmar_adj_sharpe = 0.0
+        cvar_penalty = 1.0  # maximum penalty for no active positions
+        effective_cvar_weight = cvar_weight
 
-    score = da_weight * da + ic_weight * ic + sharpe_weight * (synthetic_sharpe / 3.0)
+    calmar_adj_sharpe = np.clip(calmar_adj_sharpe, -3.0, 3.0)
+    score = (da_weight * da
+             + ic_weight * ic
+             + sharpe_weight * (calmar_adj_sharpe / 3.0)
+             - effective_cvar_weight * cvar_penalty)
     return float(score)
 
 
@@ -101,12 +141,18 @@ def tune_hyperparams(
     weights: pd.Series,
     splitter: PurgedTimeSeriesSplit,
     cfg,
+    price_returns: np.ndarray | None = None,
+    warm_start_params: dict | None = None,
 ) -> dict:
     n_trials = int(cfg.model.optuna_n_trials)
     patience = int(cfg.model.optuna_patience)
     early_stop_rounds = int(cfg.model.xgb_early_stopping_rounds)
 
-    returns_proxy = y_train.map({0: -1.0, 1: 1.0}).fillna(0.0).values
+    # Use actual realized price returns if provided; otherwise fall back to binary proxy
+    if price_returns is not None and len(price_returns) == len(y_train):
+        returns_array = price_returns
+    else:
+        returns_array = y_train.map({0: -1.0, 1: 1.0}).fillna(0.0).values
 
     best_scores = []
 
@@ -121,7 +167,7 @@ def tune_hyperparams(
             w_tr = weights.iloc[train_idx].values if hasattr(weights, "iloc") else weights[train_idx]
             X_v = X_train.iloc[val_idx].values
             y_v = y_train.iloc[val_idx].values
-            ret_v = returns_proxy[val_idx]
+            ret_v = returns_array[val_idx]
 
             model = XGBClassifier(
                 **params,
@@ -137,7 +183,7 @@ def tune_hyperparams(
                     verbose=False,
                 )
                 proba = model.predict_proba(X_v)
-                score = compute_objective(y_v, proba, ret_v)
+                score = compute_objective(y_v, proba, ret_v, cfg=cfg)
                 fold_scores.append(score)
                 # Report intermediate value so HyperbandPruner can kill bad trials early
                 trial.report(score, step=len(fold_scores) - 1)
@@ -166,6 +212,11 @@ def tune_hyperparams(
         sampler=optuna.samplers.TPESampler(seed=1),
         pruner=optuna.pruners.HyperbandPruner(),
     )
+    if warm_start_params:
+        try:
+            study.enqueue_trial(warm_start_params)
+        except Exception as e:
+            logger.warning(f"warm-start enqueue failed: {e}")
     study.optimize(objective, n_trials=n_trials, callbacks=[_no_improvement_callback], show_progress_bar=False)
 
     best_params = study.best_params
@@ -210,14 +261,23 @@ def train_xgb(
         verbose=False,
     )
 
-    # Calibrate on val set using IsotonicRegression
+    # Calibrate on val set — method driven by cfg.model.calibration_method
     val_proba_raw = model.predict_proba(
         X_val.values if hasattr(X_val, "values") else X_val
     )[:, 1]
     y_val_arr = y_val.values if hasattr(y_val, "values") else y_val
 
-    calibrator = IsotonicRegression(out_of_bounds="clip")
-    calibrator.fit(val_proba_raw, y_val_arr)
+    cal_method = getattr(getattr(cfg, "model", cfg), "calibration_method", "sigmoid")
+    if cal_method == "isotonic":
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(val_proba_raw, y_val_arr)
+    else:
+        # Sigmoid / Platt scaling — more robust on small val sets
+        # Wrapped so .predict(raw_probs) returns calibrated probabilities (same interface as IsotonicRegression)
+        from sklearn.linear_model import LogisticRegression
+        _lr = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+        _lr.fit(val_proba_raw.reshape(-1, 1), y_val_arr)
+        calibrator = _SigmoidCalibrator(_lr)
 
     best_iter = model.best_iteration
     # evals_result_ is populated by XGBoost after fit when eval_set is provided

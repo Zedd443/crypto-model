@@ -164,6 +164,10 @@ def apply_cross_sectional_ranks(panel_df: pd.DataFrame, stats_path: Path, featur
         else:
             new_cols[f"{col}_rank"] = (panel_df[col].clip(s["q01"], s["q99"]) - s["min"]) / rng
     if new_cols:
+        # Drop any pre-existing _rank columns that will be regenerated to avoid duplicates on re-run
+        cols_to_drop = [rank_col for rank_col in new_cols if rank_col in panel_df.columns]
+        if cols_to_drop:
+            panel_df = panel_df.drop(columns=cols_to_drop)
         return pd.concat([panel_df, pd.DataFrame(new_cols, index=panel_df.index)], axis=1)
     return panel_df
 

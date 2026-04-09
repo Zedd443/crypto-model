@@ -97,6 +97,13 @@ def build_features_for_symbol(
     funding = build_funding_features(df_15m, btc_df, cfg)
     all_features = pd.concat([all_features, funding], axis=1)
 
+    # 4b. BTC lag spillover for altcoins (lags 1-4)
+    # Global shift(1) at step 9 makes these fully backward-looking at bar t
+    if btc_df is not None and symbol != "BTCUSDT":
+        btc_ret = np.log(btc_df["close"] / btc_df["close"].shift(1))
+        for lag in [1, 2, 3, 4]:
+            all_features[f"btc_lag_{lag}"] = btc_ret.reindex(df_15m.index).shift(lag)
+
     # 5. HMM regime features
     logger.info(f"{symbol}: computing regime features")
     hmm_input = _build_hmm_features_df(df_15m)

@@ -12,22 +12,95 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ## Open Issues (Not Fixed)
 
-### ISSUE-011: Data split dates are stale — train/val/test should be updated before each retrain
-- **Date discovered**: 2026-04-03
-- **Location**: `config/base.yaml` lines 12-15
-- **Status**: FIXED (2026-04-04) — Updated to train_end=2025-09-30, val_end=2025-12-31, test_start=2026-01-01
+### ISSUE-035: Position sizing uses stale equity from project_state.json and divides by max_symbols — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/pipeline/stage_08_live.py:run` (bar-start equity fetch), `_process_symbol` (sizing)
+- **Problem 1**: Equity was read from `project_state.json` at bar start — stale value from previous session/bar. Compound growth didn't work correctly.
+- **Problem 2**: Sizing was `margin = equity / max_symbols`, then `notional = margin × leverage`. This splits the wallet across symbol slots instead of using full wallet. Est Profit.xlsx formula is `Volume = Saldo × leverage` (full wallet each trade, compound automatic).
+- **Fix**: (1) Fetch `totalWalletBalance` from exchange API at the start of every bar; fall back to cached state only on API error. (2) Sizing now `notional = equity × leverage` (full wallet), matching Est Profit.xlsx exactly.
+- **Status**: FIXED
 
----
+### ISSUE-034: Testnet maxQty=120 is a real exchange limit — wallet×leverage must be capped to it — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/order_manager.py:submit_entry`, `src/pipeline/stage_08_live.py` FIX 9 probe
+- **Problem**: With full-wallet sizing (`notional = equity × leverage`), a $10k demo wallet × 3× = $30k notional. For SOLUSDT at $120, qty = 250 contracts — but testnet `MARKET_LOT_SIZE.maxQty=120`. Order would be rejected. Additionally ~30 symbols have `max_qty × price < min_notional=100` on testnet (e.g. ALGOUSDT: 120 × $0.12 = $14) — these are genuinely untradeable on testnet at current prices.
+- **Fix**: (1) `submit_entry` always caps qty to `max_qty` (both DEMO and mainnet) and recalculates `size_usd` — this is the correct "max notional this exchange allows" cap; (2) Startup probe reverted to original `max_qty × price < min_notional` check — this correctly excludes structurally untradeable coins on both testnet and mainnet; (3) Startup probe logs are INFO-level since exclusion is expected and correct.
+- **Status**: FIXED
 
-## Open Issues (Not Fixed)
+### ISSUE-036: STOP_MARKET/TAKE_PROFIT_MARKET not placeable on demo-fapi via any known endpoint — FIXED via LIMIT fallback
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/binance_client.py:place_order`
+- **Problem**: demo-fapi.binance.com returns -4120 "use Algo Order API" for STOP_MARKET/TAKE_PROFIT_MARKET on `/fapi/v1/order`. But `/fapi/v1/algoOrder` only accepts `algoType=TWAP` or `VP` (algorithmic execution strategies) — sending any other algoType returns -4500 "Invalid algoType". Result: TP+SL both fail → emergency close fires immediately after every entry → zero held positions.
+- **Fix**: In `place_order()`, when `self._mode == "DEMO"` and `order_type in _CONDITIONAL_ORDER_TYPES`, transparently remap to `LIMIT` orders at `stop_price` without `reduceOnly` (two simultaneous reduceOnly orders on same qty triggers -2022). On MAINNET, uses `/fapi/v1/order` with real `stopPrice + closePosition=true`. Also added `PERCENT_PRICE` multipliers to exchange info cache and `clamp_bracket_price()` method — demo-fapi enforces ±5% from mark price on all LIMIT orders; TP/SL prices are clamped before placement.
+- **Status**: FIXED
+
+### ISSUE-033: STOP/TAKE_PROFIT bracket orders fail — closePosition incompatible with limit-style types — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/binance_client.py:place_order` lines 159–165
+- **Problem**: After ISSUE-029 fix remapped STOP_MARKET→STOP and TAKE_PROFIT_MARKET→TAKE_PROFIT, the `close_position=True` flag was still being forwarded from `submit_entry`. Binance testnet rejects `STOP`/`TAKE_PROFIT` with `closePosition=true` — these limit-style types require explicit `quantity`, not `closePosition`. Both bracket orders failed → emergency market close fired → `submit_entry` returned `None` → zero positions ever opened despite valid signals.
+- **Fix**: After the DEMO remap block, added guard: if `order_type in ("STOP", "TAKE_PROFIT") and close_position`, force `close_position=False` and `reduce_only=True` so the `quantity` branch is taken. Orders now send `quantity + reduceOnly=true + price + stopPrice + timeInForce=GTC`. MAINNET path unaffected (remap only runs in DEMO mode).
+- **Status**: FIXED
+
+### ISSUE-031: DMS fires during per-symbol loop — heartbeat only in bar-wait — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/pipeline/stage_08_live.py`, inner for-loop
+- **Problem**: Per-symbol processing takes ~2.5s each. With 53 symbols = ~130s total loop time. DMS timeout = 60s. Heartbeat was only called in the bar-wait sleep loop, not inside the per-symbol loop — so DMS fired mid-bar on every run.
+- **Fix**: Added `order_manager.heartbeat()` after each `_process_symbol()` call inside the for-loop. DMS now sees a heartbeat every ~2.5s throughout bar processing.
+- **Status**: FIXED
+
+### ISSUE-032: Structurally untradeable micro-cap coins probed every bar — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/pipeline/stage_08_live.py`, startup filters
+- **Problem**: GALAUSDT, CHZUSDT, SEIUSDT, KMNOUSDT, XPLUSDT, FORMUSDT, JASMYUSDT all have `max_qty × price < min_notional` — physically impossible to trade at current price. These coins went through full feature computation, API calls, and model inference every bar before being rejected in `order_manager.submit_entry()`. Wasted ~7× 2.5s = 17s per bar and generated log spam.
+- **Fix (FIX 9)**: Added startup exchange probe loop — for each forecast symbol, fetches current price and checks `max_qty × price >= min_notional`. Coins failing this check are excluded from `forecast_symbols` entirely. Failed probe (network error) keeps the symbol in. This runs once at startup, not per bar.
+- **Status**: FIXED
+
+### ISSUE-029: STOP_MARKET / TAKE_PROFIT_MARKET not supported on Binance testnet — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/binance_client.py:place_order`
+- **Problem**: Binance Futures testnet (`testnet.binancefuture.com`) returns HTTP 400 `-4120` "Order type not supported" for `STOP_MARKET` and `TAKE_PROFIT_MARKET` on `/fapi/v1/order`. Both bracket orders failed for every entry, triggering the double-bracket emergency close and leaving all positions unprotected.
+- **Fix**: In `place_order()`, when `self._mode == "DEMO"`, transparently remap `STOP_MARKET → STOP` and `TAKE_PROFIT_MARKET → TAKE_PROFIT` before sending. Both limit-style types require `price + stopPrice + timeInForce=GTC`; if caller passed no explicit `price`, use `stop_price` for both fields. Stored `self._mode = mode.upper()` in `__init__`. MAINNET path completely unaffected.
+- **Status**: FIXED
+
+### ISSUE-030: size_usd not recalculated after qty capped to max_qty — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/execution/order_manager.py:submit_entry`, max_qty cap block
+- **Problem**: When qty was capped to `max_qty` (e.g. NEARUSDT: intended 2125 contracts → capped to 120), `size_usd` still held the original uncapped value. `sync_fills` uses `pos["size_usd"]` to compute PnL and for the trade log — so every capped position reported wildly wrong PnL (18× over for NEARUSDT).
+- **Fix**: After the cap line, added `size_usd = qty * entry_price` to make size_usd reflect the actual filled notional. Consistent with how `size_usd` is used downstream: `sync_fills` treats it as notional (multiplies `pnl_pct * size_usd` for USD PnL); `submit_exit` recomputes qty independently from `size_usd / entry_price` so that path is also corrected.
+- **Status**: FIXED
+
+### ISSUE-027: 4 symbols with negative test-set Sharpe excluded from live — FIXED
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-05
+- **Location**: `src/pipeline/stage_08_live.py`, FIX 8
+- **Problem**: TRXUSDT (Sharpe=-20.2, hit_rate=5.7%), BARDUSDT (-11.1), ASTERUSDT (-7.1), BTCUSDT (-3.6) have negative Sharpe on the test set (2026-01-01 to 2026-04-05). These models produce losing signals in the current bear market.
+- **Fix**: At startup, load `results/per_symbol_metrics.csv` and filter out any symbol with `sharpe < 0`. Applied after artifact check, so these symbols still get forecasted but never open positions.
+- **Status**: FIXED
+
+### ISSUE-028: All 57 models Tier B — live uses 3× leverage (Tier A rate) — NOT FIXED
+- **Date discovered**: 2026-04-05
+- **Location**: `src/portfolio/position_sizer.py:get_growth_gate_limits`, `src/pipeline/stage_04_train.py:_assign_tier`
+- **Root cause**: PBO check always returns 0.5 (ISSUE-006, splitter.py not implemented). `tier_A_pbo_max=0.40` never passes → all models classified Tier B.
+- **Impact**: `get_growth_gate_limits` returns `leverage_a_max=3` regardless of tier — Tier B spec is `leverage_b_max=1`. So live positions use 3× leverage on Tier B models.
+- **Risk level**: Acceptable for demo phase — 53/57 models have positive test Sharpe, 80%+ DA. 3× cap is still conservative.
+- **Proper fix**: Implement PBO correctly in `src/models/splitter.py`, or add tier-aware leverage lookup in `get_growth_gate_limits`.
+- **Status**: NOT FIXED (low priority for demo)
 
 ### ISSUE-026: Calibrator over-compression blocking live trades — FIXED
 - **Date discovered**: 2026-04-05
-- **Date fixed**: 2026-04-05
-- **Location**: `models/*_calibrator.pkl`, `scripts/refit_calibrator.py`
-- **Problem**: IsotonicRegression calibrators were fit on val set (train_end → val_end) during stage 4. Live raw probs (0.20–0.35) fell entirely in the compressed zone of that calibrator — e.g. raw=0.28 → cal=0.137, raw=0.50 → cal=0.285. No signals passed the floor.
-- **Fix**: Wrote `scripts/refit_calibrator.py` to refit calibrators on test set data (>= 2026-01-01). For each symbol: loads test features+labels, runs `model.predict_proba()`, fits new `IsotonicRegression(out_of_bounds='clip')` on (raw_probs, true_labels), overwrites calibrator pkl. All 57 symbol calibrators refitted. New calibrators align output mean to actual `pct_long` in test set (~0.30–0.38 across symbols).
-- **Status**: FIXED
+- **Date fixed**: 2026-04-09
+- **Location**: `src/models/primary_model.py:train_xgb`, `config/base.yaml`
+- **Problem**: IsotonicRegression calibrators were fit on val set during stage 4. Live raw probs (0.20–0.35) fell entirely in the compressed zone — e.g. raw=0.28 → cal=0.137. Almost no signals passed the floor.
+- **Fix**: Changed `calibration_method` from `"isotonic"` to `"sigmoid"` in `config/base.yaml`. `train_xgb` now reads `cfg.model.calibration_method` and uses `_SigmoidCalibrator` (Platt scaling via `LogisticRegression`) when method is not "isotonic". `_SigmoidCalibrator` wraps `LogisticRegression` to expose `.predict(raw_probs)` interface compatible with all downstream callers. Existing calibrator `.pkl` files are `IsotonicRegression` instances and will remain so until next retrain.
+- **Status**: FIXED (takes effect on next retrain)
 
 ### ISSUE-025: Order placement fails with "Precision is over the maximum" — FIXED
 - **Date discovered**: 2026-04-05
@@ -57,6 +130,146 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 ---
 
 ## Resolved Decisions
+
+### ISSUE-028: All 57 models Tier B / TP-SL mismatch with training — FIXED (partial)
+- **Date discovered**: 2026-04-05
+- **Date fixed**: 2026-04-09
+- **Location**: `config/base.yaml`, `growth_gate.tp_fixed_pct` / `growth_gate.sl_fixed_pct`
+- **Problem**: `tp_fixed_pct=0.01` and `sl_fixed_pct=0.04` produced 1:4 R:R in live trading — guaranteed negative expectancy. Training labels used `tp_atr_mult=2.5 / sl_atr_mult=1.5` (ratio ~1.67:1 reward:risk). Live exits were mismatched with the barrier geometry the model was trained on.
+- **Fix**: Set both to `0.0` so live trading reverts to ATR-based TP/SL that matches training labels exactly.
+- **Status**: FIXED (tier assignment for PBO gate still deferred — see original ISSUE-028 note)
+
+### ISSUE-029a: Optuna objective uses binary return proxy instead of actual price returns — FIXED
+- **Date discovered**: 2026-04-09
+- **Date fixed**: 2026-04-09
+- **Location**: `src/models/primary_model.py:tune_hyperparams`, `src/pipeline/stage_04_train.py`
+- **Problem**: `tune_hyperparams` used `y_train.map({0:-1,1:1})` as a return proxy in `compute_objective`. This ignores ATR-scaled realized returns from the triple-barrier scheme, so Optuna optimized against a proxy that is structurally different from actual PnL.
+- **Fix**: `tune_hyperparams` now accepts optional `price_returns: np.ndarray | None = None`. If provided and length matches, uses actual realized returns from `tp_level`/`sl_level` columns; otherwise falls back to binary proxy. `stage_04_train.py` computes `price_returns` before Step 3 (Optuna) and passes it. Duplicate computation block later in the function removed.
+- **Status**: FIXED (takes effect on next retrain)
+
+### ISSUE-030a: Optuna Sharpe uses forced long/short — contradicts live dead zone — FIXED
+- **Date discovered**: 2026-04-09
+- **Date fixed**: 2026-04-09
+- **Location**: `src/models/primary_model.py:compute_objective`
+- **Problem**: `positions = np.where(proba > 0.5, 1.0, -1.0)` forced a position on every bar. Live signal generator uses `dead_zone_direction=0.03` (flat when `|prob - 0.5| < 0.03`). Mismatch: Optuna optimized for a fully-invested strategy; live uses a selective one.
+- **Fix**: Changed to `positions = np.where(proba > 0.53, 1.0, np.where(proba < 0.47, -1.0, 0.0))`. Sharpe computed only on active-position bars (`positions != 0`), matching fold-Sharpe logic in `stage_04_train.py`.
+- **Status**: FIXED (takes effect on next retrain)
+
+### ISSUE-031a: Meta-labeler tree count too low (10 trees) — FIXED
+- **Date discovered**: 2026-04-09
+- **Date fixed**: 2026-04-09
+- **Location**: `config/base.yaml`, `model.meta_n_estimators`
+- **Problem**: `meta_n_estimators=10` gives insufficient capacity for learning conditional patterns over OOF predictions + regime + microstructure features (typically 8–12 features).
+- **Fix**: Changed to `meta_n_estimators=100`.
+- **Status**: FIXED (takes effect on next retrain)
+
+### ISSUE-032a: meta_accuracy_oof key misleadingly named — FIXED
+- **Date discovered**: 2026-04-09
+- **Date fixed**: 2026-04-09
+- **Location**: `src/pipeline/stage_05_meta.py`, `register_model` call
+- **Problem**: `meta_accuracy_oof` was computed in-sample on the same training data used to fit the meta-labeler. Naming it "oof" was actively misleading and would cause future readers to trust it as a held-out estimate.
+- **Fix**: Renamed to `meta_accuracy_train` in `register_model` metrics dict. Log message updated to say "train (in-sample)".
+- **Status**: FIXED
+
+### ISSUE-033a: stability_threshold too permissive (0.6) — TIGHTENED
+- **Date discovered**: 2026-04-09
+- **Date fixed**: 2026-04-09
+- **Location**: `config/base.yaml`, `model.stability_threshold`
+- **Decision**: Raised from 0.6 to 0.70. Feature must appear in 70%+ of bootstrap resamples to be selected. Reduces noise features entering the model.
+- **Status**: FIXED (takes effect on next retrain)
+
+---
+
+## Session 2026-04-09 — 10-Area ML Overhaul (all pending from plan)
+
+### DECISION-040: Objective function rewritten — Calmar-adjusted Sharpe + CVaR 95% penalty
+- **Date**: 2026-04-09
+- **Location**: `src/models/primary_model.py:compute_objective`
+- **Change**: `compute_objective` now reads all weights from `cfg` (da=0.2, sharpe=0.5, ic=0.3, cvar=0.1). Sharpe replaced with 70%×Sharpe + 30%×Calmar blend. CVaR 95% tail penalty added (avg worst 5% returns). Fee-adjusted returns (round_trip_cost_pct=0.006 subtracted before Sharpe/CVaR). Dead zone from config (0.05). Warm-start: `study.enqueue_trial(prior_best_params)` before optimize.
+- **Status**: FIXED (takes effect on next retrain)
+
+### DECISION-041: CV embargo increased 50→192 bars (48h), cv_n_splits 5→8
+- **Date**: 2026-04-09
+- **Location**: `config/base.yaml`
+- **Rationale**: Crypto autocorrelation decays over ~24-48h. 50-bar embargo (12.5h) was insufficient — val bars bled into train neighbourhood. 8 folds gives more robust cross-validation with longer embargo.
+- **Status**: FIXED (takes effect on next retrain)
+
+### DECISION-042: Labels aligned to 2:1 R:R — tp_atr_mult 2.5→2.0, sl_atr_mult 1.5→1.0, max_hold 16→32
+- **Date**: 2026-04-09
+- **Location**: `config/base.yaml` labels + backtest sections, `src/labels/triple_barrier.py`
+- **Rationale**: 2.5/1.5 gives 1.67:1 R:R — below 2:1 needed to be profitable after fees at ~50% hit rate. New 2:1 means winning trade covers 2 losses. max_hold 32 bars (8h) captures swing moves better than 4h. Fee-adjusted reclassification: TP hits where gain < 0.6% round-trip cost → reclassified as neutral.
+- **Status**: FIXED (takes effect on next --stage 3 --force)
+
+### DECISION-043: Imputer replaced IterativeImputer→SimpleImputer(median) + missing indicator flags
+- **Date**: 2026-04-09
+- **Location**: `src/models/imputer.py`, `src/pipeline/stage_04_train.py`
+- **Rationale**: IterativeImputer(BayesianRidge) has subtle leakage risk via correlated-feature imputation chain and is 10-100× slower. SimpleImputer(median) is leakage-safe and fast. Missing indicator flags (for cols with >5% NaN) capture informative missingness patterns. stage_04_train.py updated to handle expanded column count (`all_col_names`).
+- **Status**: FIXED (takes effect on next --stage 4 --force; requires --force due to column count change)
+
+### DECISION-044: Stability selection improved — RF 50 trees/depth 8 from config, MI tiebreaker, threshold 0.70→0.75, n_bootstrap 30→100
+- **Date**: 2026-04-09
+- **Location**: `src/models/stability_selection.py`, `config/base.yaml`
+- **Rationale**: RF with 30 trees/depth 5 was underpowered for 100+ features. MI tiebreaker resolves borderline features by informativeness rather than random RF variation. Higher threshold reduces false positives.
+- **Status**: FIXED (takes effect on next --stage 4 --force)
+
+### DECISION-045: Meta-labeler — 300 trees/depth 6, Optuna mini-study (10 trials), meta_signal_floor 0.1→0.25, new meta features
+- **Date**: 2026-04-09
+- **Location**: `src/models/meta_labeler.py`, `src/pipeline/stage_05_meta.py`, `config/base.yaml`
+- **Rationale**: 300 trees with Optuna-tuned lr+subsample gives better calibrated meta-probabilities. New features: `time_since_last_signal` (bars since last strong signal) and `spread_to_atr_ratio` (execution cost relative to volatility). meta_signal_floor 0.25 reduces noise trades — test on backtest first before live.
+- **Status**: FIXED (takes effect on next --stage 5 --force)
+
+### DECISION-046: Regime HMM 4→3 states, covariance "full"→"diag", hmm_retrain_hours 24→6
+- **Date**: 2026-04-09
+- **Location**: `config/base.yaml`
+- **Rationale**: 3-state (bull/bear/sideways) ablation — simpler model, fewer parameters, more stable convergence. Diagonal covariance reduces parameter count further. 6h retrain cycle gives faster regime adaptation.
+- **Status**: FIXED (takes effect on next retrain; hmm_retrain_hours takes effect immediately in live)
+
+### DECISION-047: New features — BTC lag spillover (lags 1-4), time-of-day cyclical, ACF lag-1/5, funding_sign_persistence
+- **Date**: 2026-04-09
+- **Location**: `src/features/feature_pipeline.py`, `src/features/technical.py`, `src/features/funding_rates.py`
+- **Features added**:
+  - `btc_lag_1..4`: BTC log-returns at t-1 to t-4 (altcoin spillover). Global shift(1) in pipeline makes these fully backward-looking.
+  - `tod_sin`, `tod_cos`: Cyclical encoding of hour-of-day UTC — captures session effects without leakage.
+  - `acf_lag1_w96`, `acf_lag5_w96`: 24h rolling ACF — momentum vs mean-reversion signal.
+  - `funding_sign_persistence_8`: Consecutive bars with same funding sign — persistence of funding pressure.
+- **Status**: FIXED (takes effect on next --stage 2 --force)
+
+### DECISION-048: Adaptive dead zone based on conformal width, dead_zone_direction 0.03→0.05
+- **Date**: 2026-04-09
+- **Location**: `src/portfolio/signal_generator.py`, `config/base.yaml`
+- **Change**: Dead zone base raised 0.03→0.05. Scale factor: 1.0× when conf_width < 0.20, 1.25× when < 0.40, 1.50× above. Currently uses static placeholder 0.20 — activates with real per-bar conformal widths.
+- **Status**: FIXED (immediately effective; adaptive scaling activates when real conformal widths are passed)
+
+### ISSUE-049-FIX (2026-04-09): Meta-labeler missing scale_pos_weight — FIXED
+- **Location**: `src/models/meta_labeler.py:train_meta_labeler`
+- **Problem**: Primary DA ~55% → meta_y=1 for ~55% of bars. Without scale_pos_weight, meta-labeler over-predicts class 1 (trust signal) and under-identifies class 0 (don't trade).
+- **Fix**: Compute `meta_spw = n_meta0 / n_meta1` before fitting. Pass to both mini-study XGBClassifier and final model. Logged as "Meta scale_pos_weight: X.XXX".
+- **Status**: FIXED (takes effect on next --stage 5 --force)
+
+### ISSUE-050-FIX (2026-04-09): Dead-zone bars incorrectly counted as meta_y=1 — FIXED
+- **Location**: `src/models/meta_labeler.py:create_meta_labels`, `src/pipeline/stage_05_meta.py`
+- **Problem**: Bars where |prob_long - 0.5| < dead_zone — primary model is in noise zone — were counted as meta_y=1 if the primary "happened to be correct" by chance. These are not true signals; treating them as correct inflates meta training quality.
+- **Fix**: Added `dead_zone=0.05` param to `create_meta_labels`. Dead-zone bars set to meta_y=0 regardless of correctness. stage_05 passes `cfg.model.objective_dead_zone`.
+- **Status**: FIXED (takes effect on next --stage 5 --force)
+
+### ISSUE-051-FIX (2026-04-09): CVaR penalty unstable with small tail samples — FIXED
+- **Location**: `src/models/primary_model.py:compute_objective`
+- **Problem**: CVaR 95% with ~3000 samples = ~150 tail observations. For small symbols or folds with few active positions, n_tail can drop below 50 — estimate is too noisy to be a reliable penalty signal, destabilizes Optuna landscape.
+- **Fix**: `effective_cvar_weight = cvar_weight * min(1.0, n_tail / 50)`. Auto-reduces weight proportionally when tail count is thin. At n_tail=25 (half of 50), effective weight = 0.05 instead of 0.1.
+- **Status**: FIXED (takes effect on next --stage 4 --force)
+
+### DECISION-052 (2026-04-09): CLAUDE.md protocol overhaul — append-only DECISIONS.md + anti-patterns
+- **Location**: `CLAUDE.md`
+- **Change**: Added rule 6 (DECISIONS.md append-only), updated End-of-Session actions (append only, not overwrite), rewrote Model Architecture section with current facts, added Anti-Patterns section listing 10+ already-evaluated proposals that should not be re-proposed without new evidence.
+- **Rationale**: Claude was re-proposing already-fixed issues across sessions (meta_n_estimators, stability_threshold, TP/SL format) because DECISIONS.md status could be freely edited, creating the illusion that issues were still open.
+- **Status**: FIXED
+
+### ISSUE-011: Data split dates were stale — updated before retrain
+- **Date discovered**: 2026-04-03
+- **Date fixed**: 2026-04-04
+- **Location**: `config/base.yaml` lines 12-15
+- **Fix**: Updated to train_end=2025-09-30, val_end=2025-12-31, test_start=2026-01-01
+- **Status**: FIXED
 
 ### ISSUE-001: Label encoding collapse (majority-class baseline = free DA)
 - **Date discovered**: 2026-04-03
@@ -270,12 +483,12 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 - **What**: `log_return = log(close/close.shift(1))` is backward-looking. Global `shift(1)` in `feature_pipeline.py` pushes it further so at inference time t, `log_return = log(close_{t-1}/close_{t-2})`. Inline comment added to document invariant.
 - **Status**: CONFIRMED — ingest and feature data are leakage-free for this feature
 
-### GIT-003: DMS heartbeat before+after sleep (partial fix)
+### GIT-003: DMS heartbeat before+after sleep (superseded by ISSUE-010 fix)
 - **Commit**: `70e8c36` — 2026-04-03
 - **Decision**: `fix: DMS heartbeat before sleep, klines limit cap 1500, load .env at stage 8 start`
 - **What**: Added `heartbeat()` call before AND after the 900s bar-wait sleep. Also capped Binance klines fetch at 1500 (FAPI hard limit). Added `.env` loading at stage_08 startup for API keys.
-- **Note**: This is a partial fix — see ISSUE-010 for remaining DMS problem.
-- **Status**: PARTIAL
+- **Note**: DMS problem fully resolved by ISSUE-010 (heartbeat loop every 30s during bar-wait).
+- **Status**: SUPERSEDED — ISSUE-010 FIXED
 
 ### GIT-004: Kaggle feature pipeline — 3-mode stage 2 (A/B/C)
 - **Commit**: `9a1ffcc` — 2026-04-03

@@ -165,12 +165,27 @@ def _compute_daily_pnl_pct(trade_log_path: Path, equity: float) -> float:
         return 0.0
 
 
-def run(cfg, **kwargs) -> None:
-    logger.info("=== Stage 8: Live Execution Loop ===")
+def _rotate_logs(logs_dir: Path, keep_days: int = 2) -> None:
+    # Delete log files older than keep_days. Keeps today and yesterday.
+    cutoff = datetime.now(timezone.utc).date()
+    for log_file in logs_dir.glob("*.log"):
+        try:
+            mtime = datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).date()
+            age = (cutoff - mtime).days
+            if age >= keep_days:
+                log_file.unlink()
+                logger.debug(f"Log rotated: {log_file.name} (age={age}d)")
+        except Exception:
+            pass
 
-    # --- FIX 2: MAINNET safety interlock ---
+
+def run(cfg, **kwargs) -> None:
+    logger.info("=== Stage 8: Live Execution ===")
+
+    # Auto-rotate logs — keep today + yesterday only
+    _rotate_logs(Path("logs"), keep_days=2)
+
     trading_mode = str(cfg.trading.mode).upper()
-    logger.info(f"=== Trading mode: {trading_mode} ===")
     if trading_mode == "MAINNET":
         _confirm = os.environ.get("CONFIRM_MAINNET_TRADING", "").lower()
         if _confirm != "yes":
@@ -197,35 +212,71 @@ def run(cfg, **kwargs) -> None:
     dashboard = LiveDashboard(cfg)
     lookback_needed = get_lookback_bars_needed(cfg)
     signal_floor = float(cfg.portfolio.signal_floor_prob)
-    max_margin_pct = float(cfg.portfolio.max_total_margin_pct)
     daily_profit_target = float(cfg.backtest.daily_profit_target_pct)
 
-    # Verify connectivity — will raise if credentials or endpoint are wrong
     try:
         server_ms = client.get_server_time()
-        logger.info(f"Connected to Binance — server time: {datetime.fromtimestamp(server_ms/1000, tz=timezone.utc)}")
+        logger.info(f"Connected [{trading_mode}] — {datetime.fromtimestamp(server_ms/1000, tz=timezone.utc).strftime('%H:%M:%S UTC')}  tf={primary_tf}  floor={signal_floor}")
     except Exception as exc:
         logger.error(f"Cannot connect to Binance: {exc}")
         raise
 
-    logger.info(f"Entering bar-wait loop — timeframe={primary_tf} signal_floor={signal_floor} lookback={lookback_needed} bars")
-
     state = load_state()
     forecast_symbols = _get_forecast_symbols(all_symbols, primary_tf)
 
-    # --- FIX 7: remove symbols missing imputer/scaler artifacts before first bar ---
-    _valid_symbols = []
-    for _sym in forecast_symbols:
-        _imp = Path(cfg.data.checkpoints_dir) / "imputers" / f"imputer_{_sym}_15m.pkl"
-        _scl = Path(cfg.data.checkpoints_dir) / "imputers" / f"scaler_{_sym}_15m.pkl"
-        if _imp.exists() and _scl.exists():
-            _valid_symbols.append(_sym)
-        else:
-            logger.warning(f"{_sym}: missing imputer or scaler — excluded from forecast")
-    forecast_symbols = _valid_symbols
-    logger.info(f"Forecast symbols after artifact check: {len(forecast_symbols)}")
+    # Filter 1: artifacts (imputer/scaler must exist)
+    _missing = [s for s in forecast_symbols
+                if not (Path(cfg.data.checkpoints_dir) / "imputers" / f"imputer_{s}_15m.pkl").exists()
+                or not (Path(cfg.data.checkpoints_dir) / "imputers" / f"scaler_{s}_15m.pkl").exists()]
+    forecast_symbols = [s for s in forecast_symbols if s not in _missing]
+    if _missing:
+        logger.debug(f"Excluded (missing artifacts): {_missing}")
 
-    # Pre-load models for all forecast symbols at startup
+    # Filter 2: negative backtest Sharpe
+    _metrics_path = Path(cfg.data.results_dir) / "per_symbol_metrics.csv"
+    _bad: set = set()
+    if _metrics_path.exists():
+        import pandas as _pd
+        _pm = _pd.read_csv(_metrics_path)
+        _bad = set(_pm.loc[_pm["sharpe"] < 0, "symbol"].tolist())
+        forecast_symbols = [s for s in forecast_symbols if s not in _bad]
+
+    # Filter 3: structurally untradeable — max tradeable notional too small.
+    # DEMO: maxQty=120 is real for MARKET orders. Filter coins where max notional
+    # is below a meaningful threshold (10% of target volume) to avoid lots of capped orders.
+    _untradeable = []
+    _probe_errors = []
+    # Fetch live equity for filter threshold (state equity may be stale at startup)
+    try:
+        _acct_f3 = client.get_account()
+        _equity_f3 = float(_acct_f3.get("totalWalletBalance", 0.0))
+    except Exception:
+        _equity_f3 = float(state.get("account", {}).get("current_equity", 1000))
+    _, _lev = get_growth_gate_limits(_equity_f3, cfg)
+    _target_volume = _equity_f3 * float(_lev)
+    _min_tradeable_notional = _target_volume * 0.10  # skip if max exchange volume < 10% of target
+    logger.info(f"Filter 3: equity={_equity_f3:.0f} target_vol={_target_volume:.0f} min_notional_threshold={_min_tradeable_notional:.0f}")
+
+    for _sym in forecast_symbols:
+        try:
+            _price = float(client.get_klines(_sym, primary_tf, limit=1)["close"].iloc[-1])
+            _max_qty = client.get_max_qty(_sym, _price)
+            _min_notional = client.get_min_notional(_sym)
+            _max_notional = _max_qty * _price
+            if _max_notional < _min_notional or _max_notional < _min_tradeable_notional:
+                logger.info(f"{_sym}: max notional {_max_notional:.0f} < threshold {_min_tradeable_notional:.0f} — excluded")
+                _untradeable.append(_sym)
+        except Exception as _e:
+            _probe_errors.append(_sym)
+    forecast_symbols = [s for s in forecast_symbols if s not in _untradeable]
+
+    logger.info(
+        f"Active symbols: {len(forecast_symbols)} "
+        f"(excluded: {len(_missing)} no artifacts, {len(_bad)} neg sharpe, "
+        f"{len(_untradeable)} untradeable, {len(_probe_errors)} probe errors kept)"
+    )
+
+    # Pre-load models
     for _sym in forecast_symbols:
         try:
             _model_cache[_sym] = {
@@ -233,108 +284,204 @@ def run(cfg, **kwargs) -> None:
                 "meta": _load_meta(_sym, cfg),
             }
         except Exception as _e:
-            logger.warning(f"Could not pre-load model for {_sym}: {_e}")
+            logger.debug(f"{_sym}: model preload failed — {_e}")
+
+    leverage = int(getattr(cfg.trading, "leverage", getattr(cfg.growth_gate, "fixed_leverage", 2)))
+    wallet_today: float = 0.0   # locked once per UTC day, used for ALL position sizing that day
+    wallet_today_date: str = ""  # UTC date string when wallet_today was locked
 
     try:
         while True:
             wait = _seconds_until_next_bar(bar_seconds) + _BAR_CLOSE_BUFFER
-            logger.info(f"Sleeping {wait:.1f}s until next bar + buffer...")
-            # Heartbeat every 30s throughout the bar-wait so DMS (60s timeout) never fires
+            next_bar_epoch = time.time() + wait
+
+            # Start countdown display — updates every second in background thread
+            dashboard.start_countdown(next_bar_epoch)
+
+            # Heartbeat every 30s during bar-wait so DMS (60s timeout) never fires
             _slept = 0.0
-            _hb_interval = 30.0
             while _slept < wait:
-                _step = min(_hb_interval, wait - _slept)
+                _step = min(30.0, wait - _slept)
                 time.sleep(_step)
                 _slept += _step
                 order_manager.heartbeat()
 
+            dashboard.stop_countdown()
             bar_start = datetime.now(timezone.utc)
+            today_utc = bar_start.strftime("%Y-%m-%d")
+
+            # Fetch live wallet balance from exchange
+            try:
+                acct = client.get_account()
+                equity = float(acct.get("totalWalletBalance", 0.0))
+                update_equity(equity)
+            except Exception as _eq_exc:
+                state = load_state()
+                equity = float(state.get("account", {}).get("current_equity", 0.0))
+                logger.warning(f"Equity fetch failed — using cached ${equity:.2f}: {_eq_exc}")
+
+            # Lock wallet_today once per UTC day — all positions today use this value for sizing.
+            # Compounding happens automatically: wallet_today resets to the new balance next day.
+            if today_utc != wallet_today_date:
+                wallet_today = equity
+                wallet_today_date = today_utc
+                logger.info(f"Wallet locked for {today_utc}: ${wallet_today:.2f} → size_usd per posisi = ${wallet_today * leverage:.2f} ({leverage}×)")
 
             state = load_state()
-            equity = float(state.get("account", {}).get("current_equity", 0.0))
             trade_limit = _get_trade_limit(cfg, state)
             open_count = len(order_manager.positions)
 
-            # FIX 3: check daily profit target before opening any new positions this bar
             daily_pnl_pct = _compute_daily_pnl_pct(_TRADE_LOG_PATH, equity)
             daily_target_hit = daily_pnl_pct >= daily_profit_target
-            if daily_target_hit:
-                logger.info(
-                    f"Daily profit target reached ({daily_pnl_pct:.2%} >= {daily_profit_target:.2%}) "
-                    "— no new position opens this bar (sync_fills and predictions still run)"
-                )
 
-            # Fetch BTC 15m klines once per bar — reused by all non-BTC symbols for
-            # funding cross-coin divergence feature. None if fetch fails.
             btc_klines_bar: pd.DataFrame | None = None
             try:
                 btc_klines_bar = client.get_klines("BTCUSDT", primary_tf, limit=lookback_needed)
             except Exception as _btc_exc:
-                logger.warning(f"Could not pre-fetch BTC klines: {_btc_exc}")
+                logger.debug(f"BTC klines prefetch failed: {_btc_exc}")
 
-            bar_signals = []  # collect per-symbol signal data for dashboard
-            for symbol in tqdm(forecast_symbols, desc="stage_08", unit="sym", position=0, leave=False):
-                open_count = len(order_manager.positions)  # refresh after each symbol
+            # Phase 1: score ALL symbols — fetch klines, compute features, predict, sync fills.
+            # Entry decisions are NOT made here — we collect all signals first so we can
+            # sort by signal_strength and open the highest-conviction positions first.
+            bar_signals = []
+            scored: list[dict] = []  # candidates eligible for entry (above floor, slot available)
+
+            for symbol in tqdm(forecast_symbols, desc="scoring", unit="sym", position=0, leave=False):
                 try:
-                    sig_info = _process_symbol(
+                    sig_info = _score_symbol(
                         symbol=symbol,
                         client=client,
                         order_manager=order_manager,
                         cfg=cfg,
                         lookback_needed=lookback_needed,
                         signal_floor=signal_floor,
-                        max_margin_pct=max_margin_pct,
                         equity=equity,
+                        wallet_today=wallet_today,
+                        leverage=leverage,
                         state=state,
-                        trade_limit=trade_limit,
-                        open_count=open_count,
                         skip_new_entries=daily_target_hit,
                         btc_klines_15m=btc_klines_bar,
                     )
                     if sig_info is not None:
                         bar_signals.append(sig_info)
+                        if sig_info.get("action") == "CANDIDATE":
+                            scored.append(sig_info)
                 except Exception as exc:
-                    logger.error(f"{symbol}: bar processing error: {exc}")
+                    logger.error(f"{symbol}: {exc}")
                     import traceback
                     logger.debug(traceback.format_exc())
+                order_manager.heartbeat()
 
-            # Update equity from exchange after processing all symbols
+            # Phase 2: sort candidates by signal_strength desc, open top-N positions
+            scored.sort(key=lambda x: x["signal_strength"], reverse=True)
+            open_count = len(order_manager.positions)
+            slots_left = trade_limit - open_count
+
+            for cand in scored:
+                if slots_left <= 0:
+                    cand["action"] = "SKIP_LIMIT"
+                    continue
+                symbol = cand["symbol"]
+                # Re-check: another symbol in this loop may have just opened a position
+                if symbol in order_manager.positions:
+                    cand["action"] = "HOLD"
+                    continue
+                try:
+                    order_id = _enter_position(
+                        sig_info=cand,
+                        client=client,
+                        order_manager=order_manager,
+                        cfg=cfg,
+                        equity=equity,
+                    )
+                    if order_id:
+                        cand["action"] = "ENTERED"
+                        slots_left -= 1
+                        # Use actual filled size from position dict (may be capped by maxQty)
+                        actual_size = order_manager.positions.get(symbol, {}).get("size_usd", cand["volume_usdt"])
+                        logger.info(
+                            f"{symbol}: ENTERED {cand['direction_str'].upper()} — "
+                            f"wallet={equity:.2f} USDT volume={actual_size:.2f} USDT ({cand['leverage']}×) "
+                            f"tp={cand['tp_pct']:.2%} sl={cand['sl_pct']:.2%} signal={cand['signal_strength']:.3f} orderId={order_id}"
+                        )
+                    else:
+                        cand["action"] = "FAILED"
+                except Exception as exc:
+                    logger.error(f"{symbol}: entry error: {exc}")
+                    cand["action"] = "FAILED"
+                order_manager.heartbeat()
+
+            # Bar summary — show entered/failed/skipped at a glance
+            _entered = [s["symbol"] for s in bar_signals if s.get("action") == "ENTERED"]
+            _failed  = [s["symbol"] for s in bar_signals if s.get("action") == "FAILED"]
+            _skipped = [s["symbol"] for s in bar_signals if s.get("action", "").startswith("SKIP")]
+            logger.info(
+                f"Bar summary — ENTERED: {_entered} | FAILED: {_failed} | SKIPPED: {len(_skipped)}"
+            )
+
+            # Post-bar equity refresh for dashboard
             try:
                 acct = client.get_account()
                 live_equity = float(acct.get("totalWalletBalance", equity))
                 update_equity(live_equity)
-                logger.info(f"Equity updated: {live_equity:.2f} USDT")
-            except Exception as exc:
+            except Exception:
                 live_equity = equity
-                logger.warning(f"Could not refresh equity from exchange: {exc}")
 
-            # Render dashboard after each bar
+            _state_now = load_state()
+            _demo_done = int(_state_now.get("account", {}).get("demo_trades_completed", 0))
+            _demo_req = int(cfg.growth_gate.demo_trades_required)
+            _daily_pnl = _compute_daily_pnl_pct(_TRADE_LOG_PATH, live_equity)
+
+            dashboard.update({
+                "mode": trading_mode,
+                "equity": live_equity,
+                "daily_pnl_pct": _daily_pnl,
+                "open_positions": dict(order_manager.positions),
+                "signals": bar_signals,
+                "demo_trades_completed": _demo_done,
+                "demo_trades_required": _demo_req,
+                "daily_target_pct": daily_profit_target,
+            })
             try:
-                _state_now = load_state()
-                _demo_done = int(_state_now.get("account", {}).get("demo_trades_completed", 0))
-                _demo_req = int(cfg.growth_gate.demo_trades_required)
-                _daily_pnl = _compute_daily_pnl_pct(_TRADE_LOG_PATH, live_equity)
-                dashboard.update({
-                    "mode": trading_mode,
-                    "equity": live_equity,
-                    "daily_pnl_pct": _daily_pnl,
-                    "open_positions": dict(order_manager.positions),
-                    "signals": bar_signals,
-                    "demo_trades_completed": _demo_done,
-                    "demo_trades_required": _demo_req,
-                    "daily_target_pct": daily_profit_target,
-                })
                 dashboard.render()
             except Exception as _dash_exc:
-                logger.debug(f"Dashboard render error (non-fatal): {_dash_exc}")
-
-            bar_elapsed = (datetime.now(timezone.utc) - bar_start).total_seconds()
-            # FIX 1: was referencing undefined `active_symbols` — use forecast_symbols
-            logger.info(f"Bar loop complete in {bar_elapsed:.1f}s — {len(forecast_symbols)} symbols processed")
+                logger.debug(f"Dashboard render error: {_dash_exc}")
 
     except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt received — cancelling all open positions before exit")
-        order_manager.cancel_all_open()
+        open_positions = dict(order_manager.positions)
+        if open_positions:
+            logger.warning(f"KeyboardInterrupt — {len(open_positions)} open position(s):")
+            for _sym, _pos in open_positions.items():
+                _has_bracket = bool(_pos.get("tp_order_id") or _pos.get("sl_order_id"))
+                logger.warning(
+                    f"  {_sym}: {_pos.get('direction','?').upper()} "
+                    f"entry={_pos.get('entry_price',0):.4f} "
+                    f"size={_pos.get('size_usd',0):.2f} USDT "
+                    f"bracket={'YES' if _has_bracket else 'NO (DMS will close if bracket missing)'}"
+                )
+        else:
+            logger.warning("KeyboardInterrupt — no open positions at shutdown")
+
+        if trading_mode == "DEMO":
+            # DEMO: positions stay open — TP/SL monitored by sync_fills next run.
+            # Do NOT issue market close (causes unnecessary fee losses).
+            logger.warning("DEMO mode: positions left open on exchange. Close manually in Binance app if needed.")
+            order_manager.positions.clear()
+        else:
+            # MAINNET: only close positions that have NO bracket orders (dangerous state).
+            # Positions with bracket orders are safe — TP/SL will handle them.
+            _no_bracket = [s for s, p in open_positions.items()
+                           if not p.get("tp_order_id") and not p.get("sl_order_id")]
+            _with_bracket = [s for s in open_positions if s not in _no_bracket]
+            if _with_bracket:
+                logger.info(f"MAINNET: positions with brackets left open (safe): {_with_bracket}")
+                for s in _with_bracket:
+                    order_manager.positions.pop(s, None)
+            if _no_bracket:
+                logger.warning(f"MAINNET: closing positions WITHOUT brackets (unsafe to leave): {_no_bracket}")
+                for s in list(_no_bracket):
+                    if s in order_manager.positions:
+                        order_manager.submit_exit(s)
         logger.info("Shutdown complete")
 
 
@@ -353,32 +500,30 @@ def _compute_atr(klines_df: pd.DataFrame, period: int = 14) -> float:
     return float(atr_series.iloc[-1]) if not atr_series.empty else float(close.iloc[-1] * 0.01)
 
 
-def _process_symbol(
+def _score_symbol(
     symbol: str,
     client: BinanceClient,
     order_manager: OrderManager,
     cfg,
     lookback_needed: int,
     signal_floor: float,
-    max_margin_pct: float,
     equity: float,
+    wallet_today: float,
+    leverage: int,
     state: dict,
-    trade_limit: int = 1,
-    open_count: int = 0,
     skip_new_entries: bool = False,
     btc_klines_15m: pd.DataFrame | None = None,
 ) -> dict | None:
-    # Returns a signal-info dict for the dashboard, or None on hard failure
+    # Phase 1: fetch data, compute features, predict, sync fills.
+    # Does NOT open positions — returns a scored signal dict.
+    # action="CANDIDATE" means eligible for entry in Phase 2.
     primary_tf = str(cfg.data.primary_timeframe)
 
-    # Fetch live OHLCV bars — 15m (primary timeframe)
     klines_df = client.get_klines(symbol, primary_tf, limit=lookback_needed)
     if len(klines_df) < lookback_needed // 2:
         logger.warning(f"{symbol}: insufficient kline data ({len(klines_df)} bars) — skipping")
         return None
 
-    # Fetch HTF klines for multi-timeframe features (1h, 4h, 1d)
-    # Each HTF uses the same lookback cap; 1500 bars of 1h = ~62 days, enough for all indicators.
     klines_1h, klines_4h, klines_1d = None, None, None
     for tf, limit in [("1h", 500), ("4h", 200), ("1d", 100)]:
         try:
@@ -392,12 +537,9 @@ def _process_symbol(
         except Exception as _htf_exc:
             logger.warning(f"{symbol}: could not fetch {tf} klines — HTF features will be missing: {_htf_exc}")
 
-    # Compute live features — full feature pipeline matching training
     feature_series = compute_live_features(
         symbol, cfg, klines_df,
-        klines_1h=klines_1h,
-        klines_4h=klines_4h,
-        klines_1d=klines_1d,
+        klines_1h=klines_1h, klines_4h=klines_4h, klines_1d=klines_1d,
         btc_klines_15m=btc_klines_15m,
     )
 
@@ -410,108 +552,89 @@ def _process_symbol(
 
     primary_prob, signal_strength = _predict(primary_model, calibrator, meta_model, feature_series)
 
-    # Sync fills — detect if a prior position was closed by TP/SL
+    # Sync fills — detect TP/SL hits and DEMO simulated exits
     fill = order_manager.sync_fills(symbol)
     if fill is not None:
-        logger.info(f"{symbol}: fill detected — pnl_pct={fill['pnl_pct']:.4%}")
+        pnl_usd = fill['pnl_pct'] * fill['size_usd']
+        pnl_style = "+" if fill['pnl_pct'] >= 0 else ""
+        logger.info(f"{symbol}: CLOSED — P&L {pnl_style}{pnl_usd:.2f} USDT ({pnl_style}{fill['pnl_pct']:.2%})")
 
-    # Determine current HMM regime from state (stored by stage 2/4); default to "unknown"
     regime = state.get("model_tiers", {}).get(symbol, {}).get("last_regime", "unknown")
 
-    logger.info(
-        f"{symbol}: primary_prob={primary_prob:.3f} "
-        f"signal={signal_strength:.3f} regime={regime} "
-        f"open_position={symbol in order_manager.positions}"
-    )
-
-    # Encode direction for dashboard: 1=long, -1=short, 0=flat (near 0.5)
-    if abs(primary_prob - 0.5) < float(cfg.portfolio.dead_zone_direction):
-        direction_int = 0
-    else:
+    direction_int = 0
+    if abs(primary_prob - 0.5) >= float(cfg.portfolio.dead_zone_direction):
         direction_int = 1 if primary_prob >= 0.5 else -1
 
-    # Build base signal info dict — enriched with action below
+    direction_str = "long" if primary_prob >= 0.5 else "short"
+
+    # Sizing: wallet_today × leverage — locked once per UTC day, same for every position.
+    # wallet_today does NOT decrease as positions open (full wallet per posisi, sesuai aturan sizing).
+    volume_usdt = wallet_today * float(leverage)
+    max_volume_usdt = float(getattr(cfg.portfolio, "max_volume_usdt", 0))
+    if max_volume_usdt > 0 and volume_usdt > max_volume_usdt:
+        volume_usdt = max_volume_usdt
+    logger.debug(f"{symbol}: wallet_today={wallet_today:.2f} × {leverage}× = volume {volume_usdt:.2f} USDT")
+
+    entry_price = float(klines_df["close"].iloc[-1])
+
+    tp_fixed = float(getattr(cfg.growth_gate, "tp_fixed_pct", 0))
+    sl_fixed = float(getattr(cfg.growth_gate, "sl_fixed_pct", 0))
+    if tp_fixed > 0 and sl_fixed > 0:
+        tp_pct, sl_pct = tp_fixed, sl_fixed
+    else:
+        atr = _compute_atr(klines_df)
+        atr_pct = atr / max(entry_price, 1e-12)
+        tp_pct = min(max(float(cfg.labels.tp_min_pct), atr_pct * float(cfg.labels.tp_atr_mult)), float(cfg.labels.tp_max_pct))
+        sl_pct = min(max(float(cfg.labels.sl_min_pct), atr_pct * float(cfg.labels.sl_atr_mult)), float(cfg.labels.sl_max_pct))
+
     sig_info = {
         "symbol": symbol,
         "primary_prob": round(primary_prob, 4),
         "signal_strength": round(signal_strength, 4),
         "direction": direction_int,
+        "direction_str": direction_str,
+        "regime": regime,
+        "entry_price": entry_price,
+        "volume_usdt": volume_usdt,
+        "leverage": leverage,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
         "action": "NO_SIGNAL",
     }
 
-    # Skip if already in a position for this symbol
     if symbol in order_manager.positions:
         sig_info["action"] = "HOLD"
         return sig_info
 
-    # FIX 3: daily profit target gate — predictions still run, but no new entries
     if skip_new_entries:
         sig_info["action"] = "SKIP_DAILY"
         return sig_info
 
-    # Skip if signal is below floor
     if signal_strength < signal_floor:
         sig_info["action"] = "SKIP_FLOOR"
         return sig_info
 
-    # Growth gate: skip opening new position if at max open positions
-    if open_count >= trade_limit:
-        logger.debug(f"{symbol}: signal={signal_strength:.3f} but trade_limit={trade_limit} reached ({open_count} open) — no new entry")
-        sig_info["action"] = "SKIP_LIMIT"
-        return sig_info
-
-    # Size the position — wallet-based sizing (mirrors Est Profit.xlsx logic)
-    # margin = equity / max_symbols_allowed  (equity split evenly across open slots)
-    # notional = margin × leverage (volume from tier)
-    # This matches the Excel model: Volume = Saldo × leverage, trade full wallet each bar.
-    _, leverage = get_growth_gate_limits(equity, cfg)
-    max_symbols, _ = get_growth_gate_limits(equity, cfg)
-    margin = equity / max(max_symbols, 1)
-    notional = margin * float(leverage)
-    pos_info = {
-        "margin": float(margin),
-        "notional": float(notional),
-        "leverage_used": float(leverage),
-        "size_usd": float(margin),
-    }
-    logger.debug(f"{symbol}: wallet sizing — equity={equity:.2f} max_symbols={max_symbols} leverage={leverage}× margin={margin:.2f} notional={notional:.2f}")
-
-    # Use last close as entry price proxy (market order will fill near this)
-    entry_price = float(klines_df["close"].iloc[-1])
-
-    # FIX 2: compute ATR-based TP/SL that matches engine.py logic
-    atr = _compute_atr(klines_df)
-    tp_atr_mult = float(cfg.labels.tp_atr_mult)
-    sl_atr_mult = float(cfg.labels.sl_atr_mult)
-    tp_min_pct = float(cfg.labels.tp_min_pct)
-    sl_min_pct = float(cfg.labels.sl_min_pct)
-    atr_pct = atr / max(entry_price, 1e-12)
-    # ATR-based percentage, floored by the configured minimum
-    tp_pct = max(tp_min_pct, atr_pct * tp_atr_mult)
-    sl_pct = max(sl_min_pct, atr_pct * sl_atr_mult)
-
-    # Direction: model predicts probability of upward move (label=1 → long)
-    direction = "long" if primary_prob >= 0.5 else "short"
-    # Direction-aware TP/SL is handled inside order_manager.submit_entry already
-    # (long: tp = entry*(1+tp_pct), sl = entry*(1-sl_pct); short: inverted)
-
-    order_id = order_manager.submit_entry(
-        symbol=symbol,
-        direction=direction,
-        size_usd=pos_info["notional"],
-        entry_price=entry_price,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        regime=regime,
-        signal_strength=signal_strength,
-    )
-
-    if order_id:
-        sig_info["action"] = "ENTERED"
-        logger.info(
-            f"{symbol}: entry submitted — dir={direction} notional={pos_info['notional']:.2f} margin={pos_info['margin']:.2f} "
-            f"atr={atr:.6f} tp_pct={tp_pct:.4%} sl_pct={sl_pct:.4%} "
-            f"signal={signal_strength:.3f} orderId={order_id}"
-        )
-
+    # Eligible for entry — Phase 2 will decide based on rank
+    sig_info["action"] = "CANDIDATE"
     return sig_info
+
+
+def _enter_position(
+    sig_info: dict,
+    client: BinanceClient,
+    order_manager: OrderManager,
+    cfg,
+    equity: float,
+) -> str | None:
+    # Phase 2: submit entry for a pre-scored candidate. Returns order_id or None.
+    symbol = sig_info["symbol"]
+    return order_manager.submit_entry(
+        symbol=symbol,
+        direction=sig_info["direction_str"],
+        size_usd=sig_info["volume_usdt"],
+        entry_price=sig_info["entry_price"],
+        tp_pct=sig_info["tp_pct"],
+        sl_pct=sig_info["sl_pct"],
+        regime=sig_info["regime"],
+        signal_strength=sig_info["signal_strength"],
+    )

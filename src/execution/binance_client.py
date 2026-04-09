@@ -39,11 +39,14 @@ class BinanceClient:
         self._session.headers.update({
             "X-MBX-APIKEY": self._api_key,
         })
+        self._mode = mode.upper()
         # Cache for symbol exchange info (step size, max qty, min notional, tick size)
         self._qty_step_cache: dict[str, float] = {}
         self._qty_max_cache: dict[str, float] = {}      # max order qty from MARKET_LOT_SIZE / LOT_SIZE
         self._min_notional_cache: dict[str, float] = {}  # min notional from MIN_NOTIONAL filter
         self._tick_size_cache: dict[str, float] = {}     # price tick size from PRICE_FILTER
+        self._price_mult_up_cache: dict[str, float] = {}    # PERCENT_PRICE multiplierUp (e.g. 1.05)
+        self._price_mult_down_cache: dict[str, float] = {}  # PERCENT_PRICE multiplierDown (e.g. 0.95)
         logger.info(f"BinanceClient initialised — mode={mode} endpoint={self._base_url}")
 
     def _sign(self, params: dict) -> dict:
@@ -126,11 +129,15 @@ class BinanceClient:
                         "positionAmt": float(p.get("positionAmt", 0)),
                         "entryPrice": float(p.get("entryPrice", 0)),
                         "unrealizedProfit": float(p.get("unRealizedProfit", 0)),
+                        "markPrice": float(p.get("markPrice", 0)),
                     }
-        return {"positionAmt": 0.0, "entryPrice": 0.0, "unrealizedProfit": 0.0}
+        return {"positionAmt": 0.0, "entryPrice": 0.0, "unrealizedProfit": 0.0, "markPrice": 0.0}
 
     def get_open_orders(self, symbol: str) -> list:
         return self._request("GET", "/fapi/v1/openOrders", params={"symbol": symbol}, signed=True)
+
+    # Conditional trigger order types
+    _CONDITIONAL_ORDER_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"}
 
     def place_order(
         self,
@@ -142,13 +149,58 @@ class BinanceClient:
         stop_price: float | None = None,
         reduce_only: bool = False,
         close_position: bool = False,
+        working_type: str | None = None,
     ) -> dict:
-        params: dict = {
+        # DEMO mode: demo-fapi.binance.com does NOT support STOP_MARKET / TAKE_PROFIT_MARKET
+        # on either /fapi/v1/order (-4120) or /fapi/v1/algoOrder (only TWAP/VP algoTypes valid).
+        # Fall back to LIMIT orders at the stop_price level (fills at that price or better).
+        # Do NOT use reduceOnly — two simultaneous bracket LIMIT orders would both be reduceOnly
+        # on the same qty, which triggers -2022 ReduceOnly rejected on the second order.
+        # Without reduceOnly they coexist; whichever fills first closes the position, the
+        # other becomes a small directional order that sync_fills + cancel_all_orders cleans up.
+        if self._mode == "DEMO" and order_type in self._CONDITIONAL_ORDER_TYPES:
+            limit_price = price if price is not None else stop_price
+            if limit_price is None:
+                raise ValueError(f"place_order DEMO fallback: stop_price required for {order_type}")
+            params: dict = {
+                "symbol": symbol,
+                "side": side,
+                "type": "LIMIT",
+                "price": limit_price,
+                "quantity": qty,
+                "timeInForce": "GTC",
+            }
+            logger.debug(f"place_order DEMO {symbol} {side} {order_type}→LIMIT price={limit_price} qty={qty}")
+            return self._request("POST", "/fapi/v1/order", params=params, signed=True)
+
+        # MAINNET: conditional orders use /fapi/v1/order with stopPrice + closePosition=true.
+        if order_type in self._CONDITIONAL_ORDER_TYPES:
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": order_type,
+            }
+            if stop_price is not None:
+                params["stopPrice"] = stop_price
+            if price is not None:
+                params["price"] = price
+            if working_type is not None:
+                params["workingType"] = working_type
+            if close_position:
+                params["closePosition"] = "true"
+            else:
+                params["quantity"] = qty
+                if reduce_only:
+                    params["reduceOnly"] = "true"
+            logger.debug(f"place_order {symbol} {side} {order_type} stopPrice={stop_price}")
+            return self._request("POST", "/fapi/v1/order", params=params, signed=True)
+
+        # Regular order (LIMIT / MARKET)
+        params = {
             "symbol": symbol,
             "side": side,
             "type": order_type,
         }
-        # STOP_MARKET / TAKE_PROFIT_MARKET with closePosition=true must NOT include quantity
         if close_position:
             params["closePosition"] = "true"
         else:
@@ -158,21 +210,39 @@ class BinanceClient:
         if price is not None:
             params["price"] = price
             params["timeInForce"] = "GTC"
-        if stop_price is not None:
-            params["stopPrice"] = stop_price
-        logger.info(f"place_order {symbol} {side} {order_type} qty={qty} price={price} stopPrice={stop_price}")
+        logger.debug(f"place_order {symbol} {side} {order_type} qty={qty} price={price}")
         return self._request("POST", "/fapi/v1/order", params=params, signed=True)
 
-    def cancel_order(self, symbol: str, order_id: int) -> dict:
-        logger.info(f"cancel_order {symbol} orderId={order_id}")
+    def cancel_order(self, symbol: str, order_id: int, is_algo: bool = False) -> dict:
+        if is_algo:
+            return self._request("DELETE", "/fapi/v1/algoOrder", params={
+                "symbol": symbol,
+                "algoId": order_id,
+            }, signed=True)
         return self._request("DELETE", "/fapi/v1/order", params={
             "symbol": symbol,
             "orderId": order_id,
         }, signed=True)
 
-    def cancel_all_orders(self, symbol: str) -> list:
-        logger.info(f"cancel_all_orders {symbol}")
-        return self._request("DELETE", "/fapi/v1/allOpenOrders", params={"symbol": symbol}, signed=True)
+    def cancel_all_orders(self, symbol: str) -> None:
+        # Cancel regular open orders
+        try:
+            self._request("DELETE", "/fapi/v1/allOpenOrders", params={"symbol": symbol}, signed=True)
+        except Exception as exc:
+            logger.debug(f"{symbol}: cancel regular orders — {exc}")
+        # Cancel open algo orders
+        try:
+            algo_orders = self._request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": symbol}, signed=True)
+            if isinstance(algo_orders, dict):
+                algo_orders = algo_orders.get("orders", [])
+            for o in algo_orders or []:
+                algo_id = o.get("algoId")
+                if algo_id:
+                    self._request("DELETE", "/fapi/v1/algoOrder", params={
+                        "symbol": symbol, "algoId": algo_id,
+                    }, signed=True)
+        except Exception as exc:
+            logger.debug(f"{symbol}: cancel algo orders — {exc}")
 
     def get_recent_trades(self, symbol: str, limit: int = 10) -> list:
         # GET /fapi/v1/userTrades — signed, returns recent fills for this account/symbol
@@ -197,9 +267,11 @@ class BinanceClient:
                     if max_qty > 0:
                         self._qty_max_cache[symbol] = max_qty
                 elif ft == "MARKET_LOT_SIZE":
+                    # DEMO (testnet): MARKET_LOT_SIZE.maxQty=120 is a real limit for market orders.
+                    # MAINNET: this filter does not reflect actual position capacity (leverage bracket
+                    # notional limits apply instead). Only use for DEMO.
                     max_qty = float(filt.get("maxQty", 0))
-                    if max_qty > 0:
-                        # MARKET_LOT_SIZE overrides LOT_SIZE max for market orders
+                    if max_qty > 0 and self._mode == "DEMO":
                         self._qty_max_cache[symbol] = max_qty
                 elif ft == "MIN_NOTIONAL":
                     min_notional = float(filt.get("notional", filt.get("minNotional", 5.0)))
@@ -208,42 +280,85 @@ class BinanceClient:
                     tick = float(filt.get("tickSize", 0.01))
                     if tick > 0:
                         self._tick_size_cache[symbol] = tick
+                elif ft == "PERCENT_PRICE":
+                    mult_up = float(filt.get("multiplierUp", 1.05))
+                    mult_down = float(filt.get("multiplierDown", 0.95))
+                    self._price_mult_up_cache[symbol] = mult_up
+                    self._price_mult_down_cache[symbol] = mult_down
             logger.debug(
                 f"{symbol}: step={self._qty_step_cache.get(symbol)} "
                 f"max_qty={self._qty_max_cache.get(symbol)} "
                 f"min_notional={self._min_notional_cache.get(symbol)} "
-                f"tick={self._tick_size_cache.get(symbol)}"
+                f"tick={self._tick_size_cache.get(symbol)} "
+                f"pct_price=[{self._price_mult_down_cache.get(symbol)},{self._price_mult_up_cache.get(symbol)}]"
             )
         except Exception as e:
             logger.warning(f"{symbol}: could not fetch exchange info — {e}")
             # Fallbacks
             self._qty_step_cache.setdefault(symbol, 1.0)
 
-    def get_qty_step(self, symbol: str) -> float:
-        """Minimum quantity step size for a symbol (lot size precision)."""
+    def _ensure_symbol_info(self, symbol: str) -> None:
+        """Fetch and cache exchange info for symbol if not already cached."""
         if symbol not in self._qty_step_cache:
             self._fetch_symbol_info(symbol)
+
+    def get_qty_step(self, symbol: str) -> float:
+        """Minimum quantity step size for a symbol (lot size precision)."""
+        self._ensure_symbol_info(symbol)
         return self._qty_step_cache.get(symbol, 1.0)
 
     def get_max_qty(self, symbol: str, price: float) -> float:
         """Maximum order quantity for a symbol. Returns inf if no limit found."""
-        if symbol not in self._qty_step_cache:
-            self._fetch_symbol_info(symbol)
+        self._ensure_symbol_info(symbol)
         return self._qty_max_cache.get(symbol, float("inf"))
+
+    def get_notional_limit(self, symbol: str, leverage: int) -> float:
+        """Max position notional (USD) for a symbol at the given leverage, from leverageBracket.
+        Returns a large value (1e9) if the endpoint fails — caller should not block on this."""
+        try:
+            data = self._request("GET", "/fapi/v1/leverageBracket", params={"symbol": symbol}, signed=True)
+            # Response: [{"symbol": ..., "brackets": [{"bracket":1, "initialLeverage":125, "notionalCap":10000, ...}]}]
+            brackets = []
+            if isinstance(data, list) and len(data) > 0:
+                brackets = data[0].get("brackets", [])
+            elif isinstance(data, dict):
+                brackets = data.get("brackets", [])
+            # Find the bracket where initialLeverage >= requested leverage — smallest notionalCap that applies
+            applicable = [b for b in brackets if int(b.get("initialLeverage", 0)) >= leverage]
+            if applicable:
+                # Sort by initialLeverage ascending — pick the tightest bracket that allows our leverage
+                applicable.sort(key=lambda b: int(b.get("initialLeverage", 0)))
+                cap = float(applicable[0].get("notionalCap", 1e9))
+                logger.debug(f"{symbol}: notional cap at leverage={leverage}x → {cap:,.0f} USDT")
+                return cap
+        except Exception as exc:
+            logger.debug(f"{symbol}: could not fetch leverageBracket — {exc}")
+        return 1e9  # no cap found — don't restrict
 
     def get_min_notional(self, symbol: str) -> float:
         """Minimum order notional (USD value) for a symbol. Default 5.0."""
-        if symbol not in self._qty_step_cache:
-            self._fetch_symbol_info(symbol)
+        self._ensure_symbol_info(symbol)
         return self._min_notional_cache.get(symbol, 5.0)
 
     def get_tick_size(self, symbol: str) -> float:
         """Price tick size for a symbol. Default 0.01."""
-        if symbol not in self._qty_step_cache:
-            self._fetch_symbol_info(symbol)
+        self._ensure_symbol_info(symbol)
         return self._tick_size_cache.get(symbol, 0.01)
 
     def round_price(self, symbol: str, price: float) -> float:
-        """Round price to the symbol's tick size."""
+        """Round price to nearest tick size for the symbol."""
         tick = self.get_tick_size(symbol)
         return round(round(price / tick) * tick, 10)
+
+    def clamp_bracket_price(self, symbol: str, price: float, ref_price: float) -> float:
+        """Clamp a bracket order price to within the PERCENT_PRICE band around ref_price.
+        demo-fapi enforces this strictly; clamped prices keep orders from being rejected.
+        """
+        self._ensure_symbol_info(symbol)
+        mult_up = self._price_mult_up_cache.get(symbol, 1.05)
+        mult_down = self._price_mult_down_cache.get(symbol, 0.95)
+        max_price = ref_price * mult_up
+        min_price = ref_price * mult_down
+        tick = self.get_tick_size(symbol)
+        clamped = max(min_price, min(max_price, price))
+        return round(round(clamped / tick) * tick, 10)

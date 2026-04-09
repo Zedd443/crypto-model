@@ -4,19 +4,26 @@ import pandas as pd
 import pickle
 from pathlib import Path
 from xgboost import XGBClassifier
+import optuna
 from src.utils.logger import get_logger
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 logger = get_logger("meta_labeler")
 
 
-def create_meta_labels(y_true: np.ndarray, oof_proba: np.ndarray) -> np.ndarray:
+def create_meta_labels(y_true: np.ndarray, oof_proba: np.ndarray, dead_zone: float = 0.05) -> np.ndarray:
     # meta_y = 1 if primary prediction was correct, 0 otherwise
-    # For binary: correct = (prob_class_1 > 0.5) matches y_true
+    # Dead-zone bars (|prob-0.5| < dead_zone): primary is near-random → exclude as "don't trust"
     if oof_proba.ndim == 2:
-        pred_class = (oof_proba[:, 1] > 0.5).astype(int)
+        prob_long = oof_proba[:, 1]
+        pred_class = (prob_long > 0.5).astype(int)
     else:
-        pred_class = (oof_proba > 0.5).astype(int)
+        prob_long = oof_proba
+        pred_class = (prob_long > 0.5).astype(int)
     meta_y = (pred_class == y_true.astype(int)).astype(int)
+    in_dead_zone = np.abs(prob_long - 0.5) < dead_zone
+    meta_y[in_dead_zone] = 0
     return meta_y
 
 
@@ -26,6 +33,8 @@ def build_meta_features(
     realized_vol: pd.Series,
     volume_zscore: pd.Series,
     ofi: pd.Series,
+    spread_series: pd.Series = None,
+    atr_series: pd.Series = None,
 ) -> pd.DataFrame:
     # ONLY these features to prevent meta overfitting
     if oof_proba.ndim == 2:
@@ -54,6 +63,24 @@ def build_meta_features(
     meta_df["volume_zscore"] = volume_zscore.values if hasattr(volume_zscore, "values") else volume_zscore
     meta_df["ofi"] = ofi.values if hasattr(ofi, "values") else ofi
 
+    # Time since last signal: bars since |prob_long - 0.5| > 0.1
+    signal_active = (np.abs(prob_long - 0.5) > 0.1).astype(float)
+    bars_since = np.zeros(len(signal_active))
+    counter = len(signal_active)  # large sentinel for "never"
+    for i in range(len(signal_active)):
+        if signal_active[i] > 0:
+            counter = 0
+        else:
+            counter += 1
+        bars_since[i] = counter
+    meta_df["time_since_last_signal"] = bars_since
+
+    # Spread-to-ATR ratio (informative about execution cost relative to volatility)
+    if spread_series is not None and atr_series is not None:
+        spread_vals = spread_series.values if hasattr(spread_series, "values") else np.array(spread_series)
+        atr_vals = atr_series.values if hasattr(atr_series, "values") else np.array(atr_series)
+        meta_df["spread_to_atr_ratio"] = spread_vals / (atr_vals + 1e-9)
+
     return meta_df
 
 
@@ -65,32 +92,77 @@ def train_meta_labeler(
 ) -> XGBClassifier:
     n_estimators = int(cfg.model.meta_n_estimators)
     max_depth = int(cfg.model.meta_max_depth)
-
     device = os.environ.get("XGB_DEVICE", "cpu")
+
+    w = weights.values if hasattr(weights, "values") else weights
+    X = meta_X_train.values if hasattr(meta_X_train, "values") else meta_X_train
+    X = np.nan_to_num(X, nan=0.0)
+
+    # Class imbalance compensation: primary DA ~55% → meta_y=1 for ~55% of bars
+    n_meta0 = int((meta_y_train == 0).sum())
+    n_meta1 = int((meta_y_train == 1).sum())
+    meta_spw = n_meta0 / max(n_meta1, 1)
+    logger.info(f"Meta scale_pos_weight: {meta_spw:.3f} (n0={n_meta0}, n1={n_meta1})")
+
+    # 10-trial Optuna mini-study to tune lr and subsample — temporal 80/20 split
+    split_idx = int(0.8 * len(X))
+    X_ms, X_mv = X[:split_idx], X[split_idx:]
+    y_ms, y_mv = meta_y_train[:split_idx], meta_y_train[split_idx:]
+    w_ms = w[:split_idx]
+
+    def _meta_objective(trial):
+        lr = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
+        sub = trial.suggest_float("subsample", 0.6, 1.0)
+        m = XGBClassifier(
+            n_estimators=min(n_estimators, 100),  # faster mini-study
+            max_depth=max_depth,
+            learning_rate=lr,
+            subsample=sub,
+            colsample_bytree=0.8,
+            scale_pos_weight=meta_spw,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            device=device,
+            n_jobs=-1 if device == "cpu" else 1,
+            random_state=42,
+            verbosity=0,
+        )
+        m.fit(X_ms, y_ms, sample_weight=w_ms)
+        proba = m.predict_proba(X_mv)[:, 1]
+        # Use log-loss negated as maximize objective
+        eps = 1e-9
+        logloss = -np.mean(y_mv * np.log(proba + eps) + (1 - y_mv) * np.log(1 - proba + eps))
+        return -logloss
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    try:
+        study.optimize(_meta_objective, n_trials=10, show_progress_bar=False)
+        best_lr = study.best_params["learning_rate"]
+        best_sub = study.best_params["subsample"]
+        logger.info(f"Meta Optuna best: lr={best_lr:.4f}, subsample={best_sub:.3f}")
+    except Exception as e:
+        logger.warning(f"Meta Optuna failed: {e} — using defaults")
+        best_lr = 0.05
+        best_sub = 0.8
+
     model = XGBClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
-        learning_rate=0.05,
-        subsample=0.8,
+        learning_rate=best_lr,
+        subsample=best_sub,
         colsample_bytree=0.8,
+        scale_pos_weight=meta_spw,
         objective="binary:logistic",
         eval_metric="logloss",
-        use_label_encoder=False,
         tree_method="hist",
         device=device,
         n_jobs=-1 if device == "cpu" else 1,
         random_state=42,
         verbosity=0,
     )
-
-    w = weights.values if hasattr(weights, "values") else weights
-    X = meta_X_train.values if hasattr(meta_X_train, "values") else meta_X_train
-
-    # Fill NaN in meta features
-    X = np.nan_to_num(X, nan=0.0)
-
     model.fit(X, meta_y_train, sample_weight=w)
-    logger.info(f"Meta-labeler trained: {n_estimators} estimators, {max_depth} depth")
+    logger.info(f"Meta-labeler trained: {n_estimators} estimators, depth={max_depth}, spw={meta_spw:.3f}")
     return model
 
 

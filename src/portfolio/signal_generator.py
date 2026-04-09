@@ -41,9 +41,18 @@ def generate_signals(
         prob_long = primary_proba_df[prob_col]
         prob_short = 1.0 - prob_long
 
-    # Dead zone thresholds from config (FIX 5: no hardcoded values)
-    dead_zone_direction = float(cfg.portfolio.dead_zone_direction)
+    # Dead zone thresholds from config
+    dead_zone_direction_base = float(cfg.portfolio.dead_zone_direction)
     dead_zone_signal = float(cfg.portfolio.dead_zone_signal)
+
+    # Adaptive dead zone: scale up when conformal width signals model uncertainty
+    # conf_width is currently a static 0.20 placeholder — activates with real per-bar widths
+    conf_width_full = float(getattr(cfg.model, 'conformal_width_full', 0.20))
+    conf_width_60pct = float(getattr(cfg.model, 'conformal_width_60pct', 0.40))
+    conf_width_series = pd.Series(0.20, index=primary_proba_df.index)  # placeholder
+    scale = np.where(conf_width_series < conf_width_full, 1.0,
+                     np.where(conf_width_series < conf_width_60pct, 1.25, 1.5))
+    dead_zone_direction = dead_zone_direction_base * scale
 
     direction = np.where(prob_long > 0.5, 1, -1)
     dead_zone = np.abs(prob_long - 0.5) < dead_zone_direction

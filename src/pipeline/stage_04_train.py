@@ -16,7 +16,7 @@ from src.models.primary_model import (
     compute_oof_predictions, compute_shap_importance,
     compute_conformal_q90, save_model,
 )
-from src.models.model_versioning import generate_version_string, register_model
+from src.models.model_versioning import generate_version_string, register_model, get_latest_model
 
 logger = get_logger("stage_04_train")
 
@@ -70,6 +70,11 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         features_df = read_features(symbol, _TF, features_dir)
     except FileNotFoundError as e:
         return symbol, None, str(e)
+
+    # Defensive dedup — parquet written by older stage_02 runs may have duplicate _rank cols
+    if features_df.columns.duplicated().any():
+        features_df = features_df.loc[:, ~features_df.columns.duplicated()]
+        logger.warning(f"{symbol}: removed duplicate feature columns from parquet")
 
     # Load labels and weights
     try:
@@ -174,14 +179,43 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         X_train_scaled = X_train_imp
         X_val_scaled = X_val_imp
 
-    # Build DataFrames back from scaled arrays for splitter (needs index)
-    X_train_final = pd.DataFrame(X_train_scaled, index=X_train_sel.index, columns=selected_features)
-    X_val_final = pd.DataFrame(X_val_scaled, index=X_val_sel.index, columns=selected_features)
+    # Build column names — imputer may append missing-indicator flags
+    n_indicator = X_train_imp.shape[1] - len(selected_features)
+    if n_indicator > 0:
+        all_col_names = selected_features + [f"missing_flag_{i}" for i in range(n_indicator)]
+    else:
+        all_col_names = selected_features
 
-    # Step 3: Hyperparameter tuning with Optuna
+    # Build DataFrames back from scaled arrays for splitter (needs index)
+    X_train_final = pd.DataFrame(X_train_scaled, index=X_train_sel.index, columns=all_col_names)
+    X_val_final = pd.DataFrame(X_val_scaled, index=X_val_sel.index, columns=all_col_names)
+
+    # Build price_returns here so it can be passed to tune_hyperparams AND reused for fold Sharpes
+    # label=+1 → tp_level (long TP hit), label=-1 → -sl_level (short SL hit), 0 → time barrier
+    _labels_for_ret = labels_aligned.loc[train_mask].reindex(X_train_final.index)
+    _raw_lbl = _labels_for_ret["label"].values
+    _tp = _labels_for_ret["tp_level"].fillna(0.0).values if "tp_level" in _labels_for_ret.columns else np.zeros(len(X_train_final))
+    _sl = _labels_for_ret["sl_level"].fillna(0.0).values if "sl_level" in _labels_for_ret.columns else np.zeros(len(X_train_final))
+    price_returns = np.where(_raw_lbl == 1, _tp, np.where(_raw_lbl == -1, -_sl, 0.0))
+
+    # Step 3: Hyperparameter tuning with Optuna (warm-start from prior best params if available)
+    prior_params = {}
+    try:
+        prior_entry = get_latest_model(symbol, _TF, model_type="primary")
+        if prior_entry and prior_entry.get("hyperparams"):
+            prior_params = {k: v for k, v in prior_entry["hyperparams"].items()
+                            if k not in ("scale_pos_weight",)}
+            logger.info(f"  {symbol}: warm-starting Optuna from prior params")
+    except Exception as e:
+        logger.warning(f"  {symbol}: warm-start lookup failed: {e}")
+
     logger.info(f"  {symbol}: tuning hyperparameters ({cfg.model.optuna_n_trials} trials)")
     try:
-        best_params = tune_hyperparams(X_train_final, y_train_binary, w_train, splitter, cfg)
+        best_params = tune_hyperparams(
+            X_train_final, y_train_binary, w_train, splitter, cfg,
+            price_returns=price_returns,
+            warm_start_params=prior_params if prior_params else None,
+        )
     except Exception as e:
         logger.warning(f"  {symbol}: Optuna failed ({e}), using defaults")
         best_params = {}
@@ -237,19 +271,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         f"val_pos={pct_positive_val:.3f}"
     )
 
-    # Build a price-return series for train samples indexed identically to X_train_final
-    # label=+1 → tp_level (long trade hits TP), label=-1 → -sl_level (hits SL), label=0 → 0
-    # This gives the actual realized return per bar under the triple-barrier scheme
-    train_labels_for_sharpe = labels_aligned.loc[train_mask]
-    # Reindex to X_train_final.index — this drops warmup rows automatically since they were
-    # already filtered out of X_train before building X_train_final
-    train_labels_for_sharpe = train_labels_for_sharpe.reindex(X_train_final.index)
-    raw_label_col = train_labels_for_sharpe["label"].values
-    tp_col = train_labels_for_sharpe["tp_level"].fillna(0.0).values if "tp_level" in train_labels_for_sharpe.columns else np.zeros(len(X_train_final))
-    sl_col = train_labels_for_sharpe["sl_level"].fillna(0.0).values if "sl_level" in train_labels_for_sharpe.columns else np.zeros(len(X_train_final))
-    # Realized pct return: +tp_level for TP hit, -sl_level for SL hit, 0 for time barrier
-    price_returns = np.where(raw_label_col == 1, tp_col,
-                    np.where(raw_label_col == -1, -sl_col, 0.0))
+    # price_returns was already computed before Step 3 (Optuna) and passed to tune_hyperparams
 
     # Compute fold Sharpes using actual price returns (not binary label proxies)
     fold_sharpes = []
@@ -295,7 +317,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         "conformal_q90": q90,
         "n_train_samples": len(X_train_final),
         "n_val_samples": len(X_val_final),
-        "n_features": len(selected_features),
+        "n_features": len(all_col_names),
         "dsr": max(synthetic_sharpe - pbo, 0.0),  # simplified DSR proxy
         "pct_positive_train": pct_positive_train,
         "pct_positive_val": pct_positive_val,
@@ -350,7 +372,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     # Step 9: Save model and register
     train_start_str = str(X_train_final.index.min().date())
     train_end_str = str(X_train_final.index.max().date())
-    version = generate_version_string(symbol, _TF, selected_features, best_params, train_start_str, train_end_str)
+    version = generate_version_string(symbol, _TF, all_col_names, best_params, train_start_str, train_end_str)
 
     save_model(model, calibrator, symbol, _TF, version, models_dir)
 
@@ -371,7 +393,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         tf=_TF,
         version=version,
         metrics={**metrics, "tier": tier},
-        feature_names=selected_features,
+        feature_names=all_col_names,
         hyperparams=best_params,
         train_period=(train_start_str, train_end_str),
         model_path=str(models_dir / f"{version}_model.json"),
@@ -391,7 +413,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     features_sel_path = checkpoints_dir / "feature_selection" / f"{symbol}_{_TF}_selected.json"
     features_sel_path.parent.mkdir(parents=True, exist_ok=True)
     with open(features_sel_path, "w") as f:
-        json.dump(selected_features, f)
+        json.dump(all_col_names, f)
 
     # Generate diagnostic plots (non-fatal — skip on error)
     try:

@@ -30,12 +30,24 @@ def get_growth_gate_limits(equity: float, cfg) -> tuple:
         if equity <= max_eq:
             max_symbols = int(tier.get("max_symbols", 1))
             max_leverage = int(tier.get("leverage_a_max", 1))
-            return max_symbols, max_leverage
+            break
+    else:
+        # Above all tiers — use last tier values
+        last_tier = tiers[-1]
+        max_symbols = int(last_tier.get("max_symbols", 1))
+        max_leverage = int(last_tier.get("leverage_a_max", 1))
 
-    # Above all tiers — use last tier values
-    last_tier = tiers[-1]
-    max_symbols = int(last_tier.get("max_symbols", 1))
-    max_leverage = int(last_tier.get("leverage_a_max", 1))
+    # Hard override: max_open_positions (0 = use tier value)
+    pos_override = int(getattr(cfg.growth_gate, "max_open_positions", 0))
+    if pos_override > 0:
+        max_symbols = min(max_symbols, pos_override)
+
+    # Hard override: cfg.trading.leverage takes priority, then growth_gate.fixed_leverage (0 = use tier)
+    lev_override = int(getattr(getattr(cfg, "trading", cfg), "leverage", 0)) or \
+                   int(getattr(cfg.growth_gate, "fixed_leverage", 0))
+    if lev_override > 0:
+        max_leverage = lev_override
+
     return max_symbols, max_leverage
 
 

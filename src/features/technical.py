@@ -226,4 +226,28 @@ def build_technical_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     parts.append(compute_realized_skewness(log_ret, daily_bars).to_frame())
     parts.append(compute_realized_kurtosis(log_ret, daily_bars).to_frame())
 
+    # Time-of-day cyclical features — no leakage (uses bar timestamp only)
+    parts.append(compute_time_of_day_cyclical(close.index))
+
+    # Rolling ACF lag-1 and lag-5 — momentum vs mean-reversion signal
+    acf_window = int(getattr(cfg.features, 'acf_window', 96))
+    parts.append(compute_rolling_acf(log_ret, lag=1, window=acf_window).to_frame())
+    parts.append(compute_rolling_acf(log_ret, lag=5, window=acf_window).to_frame())
+
     return pd.concat(parts, axis=1)
+
+
+def compute_time_of_day_cyclical(index: pd.DatetimeIndex) -> pd.DataFrame:
+    # Cyclical encoding of hour-of-day using sin/cos — preserves circular structure
+    # All UTC — no leakage (uses bar open timestamp)
+    hour = index.hour + index.minute / 60.0
+    tod_sin = np.sin(2 * np.pi * hour / 24.0)
+    tod_cos = np.cos(2 * np.pi * hour / 24.0)
+    return pd.DataFrame({"tod_sin": tod_sin, "tod_cos": tod_cos}, index=index)
+
+
+def compute_rolling_acf(series: pd.Series, lag: int, window: int) -> pd.Series:
+    # Rolling autocorrelation at given lag — positive = momentum, negative = mean-reversion
+    return series.rolling(window, min_periods=window // 2).corr(
+        series.shift(lag)
+    ).rename(f"acf_lag{lag}_w{window}")

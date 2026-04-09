@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import mutual_info_classif
 from src.utils.logger import get_logger
 
 logger = get_logger("stability_selection")
@@ -42,8 +43,8 @@ def run_stability_selection(
         w_b = w_arr[idx]
 
         rf = RandomForestClassifier(
-            n_estimators=30,
-            max_depth=5,
+            n_estimators=int(getattr(cfg.model, 'stability_rf_n_estimators', 50)),
+            max_depth=int(getattr(cfg.model, 'stability_rf_max_depth', 8)),
             max_features="sqrt",
             n_jobs=-1,
             random_state=b,
@@ -61,6 +62,25 @@ def run_stability_selection(
             continue
 
     selection_freq /= n_bootstrap
+
+    # MI tiebreaker: for borderline features (within 0.5/n_bootstrap of threshold), rank by mutual info
+    borderline_margin = 0.5 / n_bootstrap
+    borderline_mask = np.abs(selection_freq - threshold) <= borderline_margin
+    if borderline_mask.sum() > 0:
+        try:
+            mi_scores = mutual_info_classif(X_arr, y_arr, random_state=42)
+            # Among borderline features, bump MI-superior ones above threshold, drop MI-inferior
+            borderline_idx = np.where(borderline_mask)[0]
+            mi_border = mi_scores[borderline_idx]
+            mi_median = np.median(mi_border)
+            for i in borderline_idx:
+                if selection_freq[i] < threshold and mi_scores[i] >= mi_median:
+                    selection_freq[i] = threshold  # promote
+                elif selection_freq[i] >= threshold and mi_scores[i] < mi_median:
+                    selection_freq[i] = threshold - borderline_margin * 0.5  # demote
+        except Exception as e:
+            logger.warning(f"MI tiebreaker failed: {e}")
+
     selected_features = [
         feature_names[i] for i in range(n_features)
         if selection_freq[i] >= threshold
