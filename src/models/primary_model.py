@@ -97,16 +97,19 @@ def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.
     except Exception:
         ic = 0.0
 
-    # Calmar-adjusted Sharpe (70% Sharpe + 30% Calmar blend)
+    # Calmar-adjusted Sortino (70% Sortino + 30% Calmar blend)
+    # Sortino uses downside deviation instead of std — appropriate for skewed crypto returns
     proba_long = y_pred_proba[:, 1]
     positions = np.where(proba_long > 0.5 + dead_zone, 1.0, np.where(proba_long < 0.5 - dead_zone, -1.0, 0.0))
     active_mask = positions != 0.0
     if active_mask.sum() > 1:
         active_returns = positions[active_mask] * returns[active_mask] - fee_cost  # fee-adjusted
         mean_r = active_returns.mean()
-        std_r = active_returns.std()
         ann_factor = np.sqrt(252 * 96)
-        sharpe = float(mean_r / (std_r + 1e-9)) * ann_factor
+        # Downside deviation: std of returns below 0 (target return = 0)
+        downside = active_returns[active_returns < 0]
+        downside_dev = float(np.sqrt(np.mean(downside ** 2))) if len(downside) > 0 else 1e-9
+        sortino = float(mean_r / (downside_dev + 1e-9)) * ann_factor
         # Calmar: annualized return / max drawdown
         cum = np.cumprod(1 + np.clip(active_returns, -0.5, 0.5))
         running_max = np.maximum.accumulate(cum)
@@ -115,7 +118,7 @@ def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.
         ann_ret = (cum[-1] ** (252 * 96 / max(len(active_returns), 1))) - 1
         calmar = float(ann_ret / (max_dd + 1e-9))
         calmar = np.clip(calmar, -3.0, 3.0)
-        calmar_adj_sharpe = 0.7 * np.clip(sharpe, -3.0, 3.0) + 0.3 * calmar
+        calmar_adj_sharpe = 0.7 * np.clip(sortino, -3.0, 3.0) + 0.3 * calmar
         # CVaR 95%: mean of worst 5% returns
         n_tail = max(1, int(0.05 * len(active_returns)))
         cvar_95 = float(np.sort(active_returns)[:n_tail].mean())

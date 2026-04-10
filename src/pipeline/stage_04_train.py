@@ -398,6 +398,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         train_period=(train_start_str, train_end_str),
         model_path=str(models_dir / f"{version}_model.json"),
         model_type="primary",
+        cfg=cfg,
     )
 
     # Save OOF predictions for meta-labeler (stage 05)

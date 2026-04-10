@@ -82,7 +82,7 @@ def _get_trade_limit(cfg, state: dict) -> int:
 
 def _load_primary_model(symbol: str, cfg):
     primary_tf = str(cfg.data.primary_timeframe)
-    entry = get_latest_model(symbol, primary_tf, model_type="primary")
+    entry = get_latest_model(symbol, primary_tf, model_type="primary", cfg=cfg)
     if entry is None:
         return None, None
     try:
@@ -95,7 +95,7 @@ def _load_primary_model(symbol: str, cfg):
 
 def _load_meta(symbol: str, cfg):
     primary_tf = str(cfg.data.primary_timeframe)
-    entry = get_latest_model(symbol, primary_tf, model_type="meta")
+    entry = get_latest_model(symbol, primary_tf, model_type="meta", cfg=cfg)
     if entry is None:
         return None
     try:

@@ -580,3 +580,33 @@ ISSUE-001 through ISSUE-021 are all FIXED. Remaining open:
 - Fit any scaler/imputer on train only, save to `data/checkpoints/`, load for val/test
 - Verify `shift(1)` is applied globally before feature is written to parquet
 - Fracdiff d: estimate ADF on train series only
+
+### ISSUE-052-FIX (2026-04-10): Orphan position reconciliation — stage_08
+- **Fix**: `_reconcile_positions_from_api` now injects positions found on exchange (via `/fapi/v2/positionRisk`) into `order_manager.positions`. Previously, orphan positions from a prior session caused margin-insufficient errors because the system tried to open new positions while margin was already consumed.
+- **Files changed**: `src/pipeline/stage_08_live.py`
+- **Status**: FIXED
+
+### ISSUE-053-FIX (2026-04-10): Filter 3 (tradeability) using equity threshold — stage_08
+- **Fix**: Filter 3 changed from `max_notional < equity_threshold` to `max_notional < min_notional`. Equity-based threshold was excluding 50/57 symbols at demo account balance. Correct criterion: structurally untradeable = `max_qty × price < min_notional`.
+- **Files changed**: `src/pipeline/stage_08_live.py`
+- **Status**: FIXED
+
+### ISSUE-054-FIX (2026-04-10): submit_entry sizing refactor — OrderManager
+- **Fix**: Full rewrite of sizing logic with: (1) effective max_qty via min(exchange_max, bracket/price), (2) smart bump to min_notional × 1.05 when size_usd < min_notional, (3) structural skip when max_qty × price < min_notional, (4) DEMO integer pre-guard for qty_step ≤ 0.001, (5) -1111 exception retry with floor(qty).
+- **Files changed**: `src/execution/order_manager.py`, `tests/test_submit_entry_sizing.py` (8 new tests, all pass)
+- **Status**: FIXED
+
+### ISSUE-055-FIX (2026-04-10): Meta-labeler missing early stopping
+- **Fix**: Added `early_stopping_rounds` from `cfg.model.meta_early_stopping_rounds` (default 10) and `eval_set` on temporal 80/20 split. Meta model now stops at optimal n_trees instead of always using full `meta_n_estimators=300`.
+- **Files changed**: `src/models/meta_labeler.py`, `config/base.yaml`
+- **Status**: FIXED
+
+### ISSUE-056-FIX (2026-04-10): Optuna objective used Sharpe — replaced with Calmar-adjusted Sortino
+- **Fix**: `compute_objective` in `primary_model.py` replaced symmetric Sharpe with `0.7 × Sortino + 0.3 × Calmar`. Sortino uses downside deviation only — better for skewed crypto return distributions. Calmar term penalizes deep drawdowns directly.
+- **Files changed**: `src/models/primary_model.py`
+- **Status**: FIXED
+
+### ISSUE-057-FIX (2026-04-10): No config hash versioning — stale models undetectable
+- **Fix**: Added `compute_config_hash(cfg)` to `model_versioning.py` — SHA256 of 15 model-relevant config keys (objective weights, label geometry, HMM states, train dates, etc.). `register_model` stores `config_hash` per entry. `get_latest_model` warns when stored hash ≠ current hash. stage_04 and stage_05 pass `cfg` to `register_model`. stage_08 passes `cfg` to `get_latest_model` for live stale-model detection.
+- **Files changed**: `src/models/model_versioning.py`, `src/pipeline/stage_04_train.py`, `src/pipeline/stage_05_meta.py`, `src/pipeline/stage_08_live.py`
+- **Status**: FIXED

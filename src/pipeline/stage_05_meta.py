@@ -186,6 +186,7 @@ def _train_meta_symbol(
         train_period=(str(train_labels_aligned.index.min().date()), str(train_labels_aligned.index.max().date())),
         model_path=str(models_dir / f"{version}_meta.pkl"),
         model_type="meta",
+        cfg=cfg,
     )
 
     # Write meta diagnostics to unified CSV

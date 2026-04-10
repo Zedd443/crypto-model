@@ -31,6 +31,49 @@ def _release_lock() -> None:
         logger.warning(f"Failed to release registry lock: {e}")
 
 
+_CONFIG_HASH_KEYS = [
+    # Model hyperparams / objective — changes invalidate trained models
+    "model.objective_cvar_weight",
+    "model.objective_dead_zone",
+    "model.embargo_bars",
+    "model.cv_n_splits",
+    "model.meta_n_estimators",
+    "model.meta_max_depth",
+    "model.meta_early_stopping_rounds",
+    # Label geometry — changes invalidate labels AND models
+    "labels.tp_atr_mult",
+    "labels.sl_atr_mult",
+    "labels.max_hold_bars",
+    "labels.min_return_pct",
+    # HMM regime — changes invalidate HMM and downstream models
+    "hmm.n_states",
+    # Training dates — changes invalidate models trained on old splits
+    "data.train_end",
+    "data.val_end",
+]
+
+
+def _get_nested(cfg, dotted_key: str):
+    """Resolve 'a.b.c' → cfg.a.b.c, returning None if any level is missing."""
+    parts = dotted_key.split(".")
+    obj = cfg
+    for p in parts:
+        obj = getattr(obj, p, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def compute_config_hash(cfg) -> str:
+    """SHA256 of the model-relevant config keys. Use to detect stale models."""
+    snapshot = {}
+    for key in _CONFIG_HASH_KEYS:
+        val = _get_nested(cfg, key)
+        snapshot[key] = str(val) if val is not None else "__missing__"
+    payload = json.dumps(snapshot, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 def generate_version_string(
     symbol: str,
     tf: str,
@@ -61,13 +104,16 @@ def register_model(
     train_period: tuple,
     model_path: str,
     model_type: str = "primary",
+    cfg=None,
 ) -> None:
+    config_hash = compute_config_hash(cfg) if cfg is not None else "__no_cfg__"
     entry = {
         "version": version,
         "symbol": symbol,
         "tf": tf,
         "model_type": model_type,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "config_hash": config_hash,
         "metrics": metrics,
         "feature_count": len(feature_names),
         "feature_names": list(feature_names),
@@ -122,7 +168,7 @@ def _read_registry() -> dict:
     return {"models": []}
 
 
-def get_latest_model(symbol: str, tf: str, model_type: str = "primary") -> dict | None:
+def get_latest_model(symbol: str, tf: str, model_type: str = "primary", cfg=None) -> dict | None:
     if not _REGISTRY_PATH.exists():
         return None
 
@@ -137,7 +183,20 @@ def get_latest_model(symbol: str, tf: str, model_type: str = "primary") -> dict 
 
     # Sort by created_at descending
     matching.sort(key=lambda x: x["created_at"], reverse=True)
-    return matching[0]
+    best = matching[0]
+
+    # Warn if model was trained with a different config
+    if cfg is not None:
+        current_hash = compute_config_hash(cfg)
+        stored_hash = best.get("config_hash", "__missing__")
+        if stored_hash not in ("__missing__", "__no_cfg__") and stored_hash != current_hash:
+            logger.warning(
+                f"STALE MODEL: {symbol} {tf} {model_type} — config has changed since training. "
+                f"stored_hash={stored_hash} current_hash={current_hash}. "
+                f"Retrain recommended (--stage 4 --force)."
+            )
+
+    return best
 
 
 def get_active_models() -> dict:

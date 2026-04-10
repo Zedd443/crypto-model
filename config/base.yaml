@@ -106,8 +106,9 @@ model:
   conformal_q_level: 0.85                      # conformal prediction quantile level (was 0.90)
   conformal_width_full: 0.20                   # prediction interval width below this → full position size
   conformal_width_60pct: 0.40                  # width between 0.20–0.40 → 60% position size (above → 30%)
-  meta_n_estimators: 300                      # meta-labeler tree count (was 100)
+  meta_n_estimators: 300                      # meta-labeler max tree count (early stopping may use fewer)
   meta_max_depth: 6                            # meta-labeler max depth (was 4)
+  meta_early_stopping_rounds: 10              # patience for meta-labeler early stopping (8-12 features → overfit risk)
   meta_signal_floor: 0.25                     # minimum meta-prob to pass a signal (was 0.1)
   tier_A_da_min: 0.53                          # tier A: minimum directional accuracy on validation
   tier_A_da_min_folds: 6                       # tier A: DA threshold must hold in at least N folds

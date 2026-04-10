@@ -146,6 +146,9 @@ def train_meta_labeler(
         best_lr = 0.05
         best_sub = 0.8
 
+    # Early stopping on temporal 80/20 split — patience from config (default 10)
+    # Prevents overfitting on small feature set (8-12 features), finds true optimal n_trees
+    es_patience = int(getattr(cfg.model, "meta_early_stopping_rounds", 10))
     model = XGBClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
@@ -155,20 +158,27 @@ def train_meta_labeler(
         scale_pos_weight=meta_spw,
         objective="binary:logistic",
         eval_metric="logloss",
+        early_stopping_rounds=es_patience,
         tree_method="hist",
         device=device,
         n_jobs=-1 if device == "cpu" else 1,
         random_state=42,
         verbosity=0,
     )
-    model.fit(X, meta_y_train, sample_weight=w)
-    logger.info(f"Meta-labeler trained: {n_estimators} estimators, depth={max_depth}, spw={meta_spw:.3f}")
+    model.fit(
+        X, meta_y_train, sample_weight=w,
+        eval_set=[(X_mv, y_mv)],  # reuse the same temporal val split from Optuna
+        verbose=False,
+    )
+    best_n_trees = model.best_iteration + 1 if hasattr(model, "best_iteration") and model.best_iteration else n_estimators
+    logger.info(f"Meta-labeler trained: best_trees={best_n_trees}/{n_estimators} depth={max_depth} spw={meta_spw:.3f} es_patience={es_patience}")
     meta_stats = {
         "meta_spw": round(meta_spw, 4),
         "meta_best_lr": round(best_lr, 6),
         "meta_best_subsample": round(best_sub, 4),
         "meta_n0": n_meta0,
         "meta_n1": n_meta1,
+        "meta_best_n_trees": best_n_trees,
     }
     return model, meta_stats
 
