@@ -187,22 +187,46 @@ def _compute_rolling_sharpe(trade_log_path: Path, days: int = 7) -> float:
 
 
 def _reconcile_positions_from_api(client, order_manager, trading_mode: str) -> None:
-    # Query Binance for all open positions and warn about positions the local dict doesn't know about.
-    # This is informational only — does not auto-close anything. Prevents silent orphan positions.
+    # Sync local positions dict with exchange reality every bar.
+    # Orphans (on exchange but not in local dict) are injected so the system treats them as open.
+    # Ghosts (in local dict but exchange shows zero) are removed.
     try:
         api_positions = client.get_all_open_positions()
         api_syms = {p["symbol"] for p in api_positions}
         local_syms = set(order_manager.positions.keys())
 
-        # Positions on exchange but not in local dict — orphans (e.g. from prior session)
+        # Orphan positions: on exchange but not tracked locally (e.g. prior session, manual trade)
+        # Inject them so system won't try to open a second position on top
         orphans = api_syms - local_syms
         if orphans:
             logger.warning(f"RECONCILE: {len(orphans)} orphan position(s) on exchange not in local state: {orphans}")
             for sym in orphans:
                 p = next(x for x in api_positions if x["symbol"] == sym)
-                logger.warning(f"  {sym}: amt={p['positionAmt']:.4f} entry={p['entryPrice']:.4f} upnl={p['unrealizedProfit']:.2f}")
+                amt = float(p["positionAmt"])
+                entry = float(p["entryPrice"])
+                upnl = float(p["unrealizedProfit"])
+                direction = "long" if amt > 0 else "short"
+                size_usd = abs(amt) * entry
+                logger.warning(
+                    f"  {sym}: amt={amt:.4f} entry={entry:.4f} upnl={upnl:.2f} "
+                    f"— injecting as {direction} into local state"
+                )
+                # Inject minimal position record so system knows this slot is occupied
+                order_manager.positions[sym] = {
+                    "order_id": "RECONCILED",
+                    "direction": direction,
+                    "entry_price": entry,
+                    "size_usd": size_usd,
+                    "tp_price": None,
+                    "sl_price": None,
+                    "tp_order_id": None,
+                    "sl_order_id": None,
+                    "entry_time": datetime.now(timezone.utc).isoformat(),
+                    "regime": "unknown",
+                    "signal_strength": 0.0,
+                }
 
-        # Positions in local dict but exchange shows zero — already closed (missed sync_fills)
+        # Ghost positions: in local dict but exchange shows zero — already closed externally
         ghosts = local_syms - api_syms
         if ghosts:
             logger.warning(f"RECONCILE: {len(ghosts)} ghost position(s) in local state but closed on exchange: {ghosts}")

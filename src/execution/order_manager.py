@@ -153,8 +153,25 @@ class OrderManager:
         try:
             entry_resp = self._client.place_order(symbol, entry_side, qty, order_type="MARKET")
         except Exception as exc:
-            logger.error(f"{symbol}: entry order failed: {exc}")
-            return None
+            exc_str = str(exc)
+            # -1111: Precision over maximum — demo-fapi LOT_SIZE.stepSize is wrong (reports 0.0001
+            # for integer-only symbols like SOLUSDT). Retry with integer qty as fallback.
+            if "-1111" in exc_str and qty != math.floor(qty):
+                qty_int = math.floor(qty)
+                if qty_int < 1:
+                    logger.error(f"{symbol}: entry order failed and integer fallback qty<1 — skip: {exc}")
+                    return None
+                logger.warning(f"{symbol}: precision error -1111, retrying with integer qty={qty_int}")
+                qty = float(qty_int)
+                size_usd = qty * entry_price
+                try:
+                    entry_resp = self._client.place_order(symbol, entry_side, qty, order_type="MARKET")
+                except Exception as exc2:
+                    logger.error(f"{symbol}: entry order failed after integer retry: {exc2}")
+                    return None
+            else:
+                logger.error(f"{symbol}: entry order failed: {exc}")
+                return None
 
         order_id = str(entry_resp.get("orderId", ""))
         # Use actual fill price from avgPrice if available (more accurate than kline close)
