@@ -127,7 +127,8 @@ model:
 
 portfolio:
   signal_floor_prob: 0.2                      # minimum signal_strength to enter a trade
-  max_volume_usdt: 0                           # hard cap on volume per trade in USDT (0 = no cap, use full wallet × leverage)
+  volume_multiplier: 2.0                       # total volume = wallet × volume_multiplier, split across max_symbols positions
+  max_volume_usdt: 0                           # hard cap on total volume in USDT (0 = no cap)
   max_position_size: 0.10                      # maximum single position as fraction of equity
   max_total_margin_pct: 0.80                   # maximum total margin deployed (80% of equity)
   kelly_fraction: 0.5                          # half-Kelly sizing fraction

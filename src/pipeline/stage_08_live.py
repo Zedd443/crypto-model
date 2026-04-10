@@ -399,7 +399,9 @@ def run(cfg, **kwargs) -> None:
             if today_utc != wallet_today_date:
                 wallet_today = equity
                 wallet_today_date = today_utc
-                logger.info(f"Wallet locked for {today_utc}: ${wallet_today:.2f} → size_usd per posisi = ${wallet_today * leverage:.2f} ({leverage}×)")
+                vol_mult = float(getattr(cfg.portfolio, "volume_multiplier", 2.0))
+                _total_vol = wallet_today * vol_mult
+                logger.info(f"Wallet locked for {today_utc}: ${wallet_today:.2f} × {vol_mult}× = total_volume ${_total_vol:.2f} (leverage={leverage}× for margin only)")
 
             state = load_state()
             trade_limit = _get_trade_limit(cfg, state)
@@ -445,6 +447,7 @@ def run(cfg, **kwargs) -> None:
                         wallet_today=wallet_today * _sharpe_size_factor,
                         leverage=leverage,
                         state=state,
+                        trade_limit=trade_limit,
                         skip_new_entries=daily_target_hit,
                         btc_klines_15m=btc_klines_bar,
                     )
@@ -608,6 +611,7 @@ def _score_symbol(
     wallet_today: float,
     leverage: int,
     state: dict,
+    trade_limit: int = 1,
     skip_new_entries: bool = False,
     btc_klines_15m: pd.DataFrame | None = None,
 ) -> dict | None:
@@ -665,13 +669,19 @@ def _score_symbol(
 
     direction_str = "long" if primary_prob >= 0.5 else "short"
 
-    # Sizing: wallet_today × leverage — locked once per UTC day, same for every position.
-    # wallet_today does NOT decrease as positions open (full wallet per posisi, sesuai aturan sizing).
-    volume_usdt = wallet_today * float(leverage)
+    # Sizing: volume per posisi = (wallet × volume_multiplier) / max_symbols
+    # volume_multiplier dari config (default 2.0) menentukan total notional target.
+    # Leverage hanya mempengaruhi margin requirement di exchange, bukan ukuran posisi.
+    # Contoh: wallet=$100, mult=2×, max_symbols=2, leverage=8×
+    #   → volume_per_posisi = $100 × 2 / 2 = $100
+    #   → margin_per_posisi = $100 / 8 = $12.5 (exchange-side, bukan urusan kita)
+    # Naikkan leverage → margin lebih kecil, volume tetap sama. Sesuai Est Profit.xlsx.
+    vol_mult = float(getattr(cfg.portfolio, "volume_multiplier", 2.0))
+    volume_usdt = (wallet_today * vol_mult) / max(trade_limit, 1)
     max_volume_usdt = float(getattr(cfg.portfolio, "max_volume_usdt", 0))
     if max_volume_usdt > 0 and volume_usdt > max_volume_usdt:
         volume_usdt = max_volume_usdt
-    logger.debug(f"{symbol}: wallet_today={wallet_today:.2f} × {leverage}× = volume {volume_usdt:.2f} USDT")
+    logger.debug(f"{symbol}: wallet={wallet_today:.2f} × {vol_mult}× / {trade_limit} slots = volume {volume_usdt:.2f} USDT (leverage={leverage}× for margin)")
 
     entry_price = float(klines_df["close"].iloc[-1])
 
