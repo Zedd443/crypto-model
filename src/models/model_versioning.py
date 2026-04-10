@@ -33,6 +33,7 @@ def _release_lock() -> None:
 
 _CONFIG_HASH_KEYS = [
     # Model hyperparams / objective — changes invalidate trained models
+    "model.objective_sortino_weight",
     "model.objective_cvar_weight",
     "model.objective_dead_zone",
     "model.embargo_bars",

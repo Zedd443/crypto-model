@@ -89,7 +89,7 @@ model:
   optuna_patience: 5                          # early-stop Optuna if no improvement after N trials
   objective_da_weight: 0.2                     # weight of directional accuracy in Optuna objective (was 0.4)
   objective_ic_weight: 0.3                     # weight of information coefficient in objective
-  objective_sharpe_weight: 0.5                 # weight of Calmar-adjusted Sharpe in objective (was 0.3)
+  objective_sortino_weight: 0.5                 # weight of Calmar-adjusted Sortino in objective (renamed from objective_sharpe_weight)
   objective_cvar_weight: 0.1                   # weight of CVaR 95% tail penalty in objective (NEW)
   objective_dead_zone: 0.05                    # prob distance from 0.5 treated as no-signal in objective (NEW, was hardcoded 0.03)
   stability_threshold: 0.75                    # minimum selection frequency for stability selection (was 0.70)

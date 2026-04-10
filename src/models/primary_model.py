@@ -79,7 +79,8 @@ def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.
     # Weights from config with fallbacks
     da_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_da_weight', 0.2)) if cfg is not None else 0.2
     ic_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_ic_weight', 0.3)) if cfg is not None else 0.3
-    sharpe_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_sharpe_weight', 0.5)) if cfg is not None else 0.5
+    sharpe_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_sortino_weight',
+                          getattr(getattr(cfg, 'model', cfg), 'objective_sharpe_weight', 0.5))) if cfg is not None else 0.5
     cvar_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_cvar_weight', 0.1)) if cfg is not None else 0.1
     dead_zone = float(getattr(getattr(cfg, 'model', cfg), 'objective_dead_zone', 0.05)) if cfg is not None else 0.05
     fee_cost = float(getattr(getattr(cfg, 'labels', cfg), 'round_trip_cost_pct', 0.006)) if cfg is not None else 0.006
@@ -106,10 +107,15 @@ def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.
         active_returns = positions[active_mask] * returns[active_mask] - fee_cost  # fee-adjusted
         mean_r = active_returns.mean()
         ann_factor = np.sqrt(252 * 96)
-        # Downside deviation: std of returns below 0 (target return = 0)
+        # Downside deviation: RMS of returns below 0 (target = 0)
+        # Fallback when tail < 50 bars: use 0.5 × full std — avoids infinite Sortino in lucky folds
         downside = active_returns[active_returns < 0]
-        downside_dev = float(np.sqrt(np.mean(downside ** 2))) if len(downside) > 0 else 1e-9
-        sortino = float(mean_r / (downside_dev + 1e-9)) * ann_factor
+        if len(downside) >= 50:
+            downside_dev = float(np.sqrt(np.mean(downside ** 2)))
+        else:
+            downside_dev = float(np.std(active_returns)) * 0.5
+        downside_dev = max(downside_dev, 1e-9)
+        sortino = float(mean_r / downside_dev) * ann_factor
         # Calmar: annualized return / max drawdown
         cum = np.cumprod(1 + np.clip(active_returns, -0.5, 0.5))
         running_max = np.maximum.accumulate(cum)
