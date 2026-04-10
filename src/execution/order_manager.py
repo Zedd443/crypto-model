@@ -105,69 +105,87 @@ class OrderManager:
             logger.warning(f"{symbol}: submit_entry called but position already tracked — skipping")
             return None
 
-        # MAINNET: cap size_usd to the notional limit for the active leverage tier.
-        # This reflects the real Binance position size limit (e.g. $250k at 2-3x).
-        # DEMO: leverageBracket not reliable on testnet — skip this cap.
-        leverage = getattr(self._cfg.trading, "leverage", getattr(getattr(self._cfg, "growth_gate", self._cfg), "fixed_leverage", 2))
-        if self._mode != "DEMO":
-            notional_cap = self._client.get_notional_limit(symbol, int(leverage))
-            if size_usd > notional_cap:
-                logger.info(f"{symbol}: size_usd {size_usd:.2f} > notional cap {notional_cap:.0f} at {leverage}x — clamped")
-                size_usd = notional_cap
-
-        # Convert USD size to contract quantity using current price, rounded to symbol's step size
-        qty_raw = size_usd / entry_price
+        leverage = int(getattr(self._cfg.trading, "leverage",
+                               getattr(getattr(self._cfg, "growth_gate", self._cfg), "fixed_leverage", 2)))
         qty_step = self._client.get_qty_step(symbol)
-        qty = _round_qty(qty_raw, qty_step)
-
-        # Cap qty to exchange max lot size.
-        # DEMO (demo-fapi): MARKET_LOT_SIZE.maxQty=120 is a real market order limit.
-        # MAINNET: LOT_SIZE.maxQty applies (notional_cap above is the primary constraint).
         min_notional = self._client.get_min_notional(symbol)
-        max_qty = self._client.get_max_qty(symbol, entry_price)
-        if qty > max_qty:
-            qty = _round_qty(max_qty, qty_step)
-            size_usd = qty * entry_price
-            logger.info(f"{symbol}: volume dipotong ke max exchange {size_usd:.2f} USDT")
 
-        # Structural check: if even the max possible order is below min notional, skip
-        max_volume_exchange = max_qty * entry_price
-        if max_volume_exchange < min_notional:
-            logger.warning(f"{symbol}: max volume {max_volume_exchange:.2f} < min order {min_notional:.2f} — skip")
-            return None
+        # --- Step 1: determine effective max qty ---
+        # Start with exchange lot size limit (both DEMO and MAINNET)
+        exchange_max_qty = self._client.get_max_qty(symbol, entry_price)
 
-        # Pastikan volume >= minimum order exchange (berlaku di semua mode)
-        effective_notional = qty * entry_price
-        if effective_notional < min_notional:
-            qty_bumped = _round_qty((min_notional * 1.1) / entry_price, qty_step)
-            qty_bumped = min(qty_bumped, max_qty)
-            effective_notional = qty_bumped * entry_price
-            if effective_notional < min_notional:
-                logger.warning(f"{symbol}: bumped notional {effective_notional:.2f} still < min {min_notional:.2f} — skip")
+        # MAINNET: also cap by leverage-bracket notional limit
+        if self._mode != "DEMO":
+            notional_cap = self._client.get_notional_limit(symbol, leverage)
+            bracket_max_qty = notional_cap / entry_price
+            max_qty_eff = min(exchange_max_qty, bracket_max_qty)
+            if bracket_max_qty < exchange_max_qty:
+                logger.debug(f"{symbol}: bracket notional cap {notional_cap:.0f} → max_qty {bracket_max_qty:.4f}")
+        else:
+            max_qty_eff = exchange_max_qty
+
+        # --- Step 2: raw qty from size_usd ---
+        qty_raw = size_usd / entry_price
+        logger.debug(f"{symbol}: raw qty={qty_raw:.6f} (size_usd={size_usd:.2f} / price={entry_price:.6f}) max_qty_eff={max_qty_eff:.4f}")
+
+        # --- Step 3: clamp to [min_qty, max_qty_eff] with smart bump ---
+        # 3a. Cap to exchange/bracket max
+        qty = _round_qty(min(qty_raw, max_qty_eff), qty_step)
+        size_usd = qty * entry_price
+        if qty < qty_raw:
+            logger.info(f"{symbol}: qty capped {qty_raw:.4f}→{qty:.4f} (notional={size_usd:.2f} USDT)")
+
+        # 3b. Bump up if below min_notional — price may have moved since filter
+        if size_usd < min_notional:
+            qty_bumped = _round_qty((min_notional * 1.05) / entry_price, qty_step)
+            # Re-apply max cap after bump
+            qty_bumped = _round_qty(min(qty_bumped, max_qty_eff), qty_step)
+            bumped_notional = qty_bumped * entry_price
+            if bumped_notional < min_notional:
+                # Even at max allowed qty we can't reach min_notional — skip this bar,
+                # but do NOT permanently exclude: price may rise on the next bar.
+                logger.warning(
+                    f"{symbol}: max tradeable notional {bumped_notional:.2f} < min_notional {min_notional:.2f} "
+                    f"(max_qty_eff={max_qty_eff:.4f} × price={entry_price:.6f}) — skipping this bar"
+                )
                 return None
-            logger.info(f"{symbol}: volume dinaikkan ke min order {effective_notional:.2f} USDT")
+            logger.info(f"{symbol}: qty bumped {qty:.4f}→{qty_bumped:.4f} to meet min_notional (notional={bumped_notional:.2f})")
             qty = qty_bumped
+            size_usd = bumped_notional
 
-        # Market entry
+        # 3c. DEMO precision guard: if step from exchange is wrong (e.g. 0.0001 for integer-only
+        # symbols) and the qty has sub-integer decimals, try integer qty first to avoid -1111.
+        # This is checked here, before placing the order, so we don't need an exception retry path.
+        if self._mode == "DEMO" and qty_step <= 0.001 and qty > 1.0 and qty != math.floor(qty):
+            qty_int = math.floor(qty)
+            notional_int = qty_int * entry_price
+            if notional_int >= min_notional:
+                logger.debug(f"{symbol}: DEMO pre-rounding {qty:.4f}→{qty_int} (integer guard for -1111)")
+                qty = float(qty_int)
+                size_usd = notional_int
+
+        logger.info(f"{symbol}: final qty={qty} notional={qty * entry_price:.2f} USDT min_notional={min_notional:.2f}")
+
+        # --- Step 4: place market entry order ---
         entry_side = "BUY" if direction == "long" else "SELL"
         try:
             entry_resp = self._client.place_order(symbol, entry_side, qty, order_type="MARKET")
         except Exception as exc:
             exc_str = str(exc)
-            # -1111: Precision over maximum — demo-fapi LOT_SIZE.stepSize is wrong (reports 0.0001
-            # for integer-only symbols like SOLUSDT). Retry with integer qty as fallback.
+            # -1111 fallback: exchange rejected our precision — reduce to integer qty and retry once
             if "-1111" in exc_str and qty != math.floor(qty):
                 qty_int = math.floor(qty)
-                if qty_int < 1:
-                    logger.error(f"{symbol}: entry order failed and integer fallback qty<1 — skip: {exc}")
-                    return None
-                logger.warning(f"{symbol}: precision error -1111, retrying with integer qty={qty_int}")
-                qty = float(qty_int)
-                size_usd = qty * entry_price
-                try:
-                    entry_resp = self._client.place_order(symbol, entry_side, qty, order_type="MARKET")
-                except Exception as exc2:
-                    logger.error(f"{symbol}: entry order failed after integer retry: {exc2}")
+                if qty_int >= 1 and qty_int * entry_price >= min_notional:
+                    logger.warning(f"{symbol}: -1111 precision error, integer retry qty={qty_int}")
+                    qty = float(qty_int)
+                    size_usd = qty * entry_price
+                    try:
+                        entry_resp = self._client.place_order(symbol, entry_side, qty, order_type="MARKET")
+                    except Exception as exc2:
+                        logger.error(f"{symbol}: entry failed after integer retry: {exc2}")
+                        return None
+                else:
+                    logger.error(f"{symbol}: -1111 and integer qty {math.floor(qty)} below min_notional — skip: {exc}")
                     return None
             else:
                 logger.error(f"{symbol}: entry order failed: {exc}")
