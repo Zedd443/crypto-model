@@ -8,7 +8,7 @@ from tqdm import tqdm
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state, update_completed_symbol
 from src.utils.logger import get_logger
-from src.utils.io_utils import read_features
+from src.utils.io_utils import read_features, write_pipeline_diagnostics
 from src.models.meta_labeler import (
     create_meta_labels, build_meta_features, train_meta_labeler,
     save_meta_model,
@@ -154,7 +154,7 @@ def _train_meta_symbol(
 
     # Train meta-labeler
     try:
-        meta_model = train_meta_labeler(meta_X, meta_y, w_meta, cfg)
+        meta_model, meta_stats = train_meta_labeler(meta_X, meta_y, w_meta, cfg)
     except Exception as e:
         return symbol, None, f"Meta training failed: {e}"
 
@@ -187,6 +187,18 @@ def _train_meta_symbol(
         model_path=str(models_dir / f"{version}_meta.pkl"),
         model_type="meta",
     )
+
+    # Write meta diagnostics to unified CSV
+    try:
+        results_dir = Path(cfg.data.results_dir) if hasattr(cfg.data, "results_dir") else Path("results")
+        write_pipeline_diagnostics([{
+            "symbol": symbol,
+            "stage": "meta",
+            "meta_accuracy_train": round(meta_acc, 4),
+            **meta_stats,
+        }], results_dir)
+    except Exception as _diag_exc:
+        logger.warning(f"  {symbol}: meta diagnostics write failed (non-fatal): {_diag_exc}")
 
     return symbol, {"version": version, "meta_accuracy": meta_acc}, None
 

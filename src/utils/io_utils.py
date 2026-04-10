@@ -1,8 +1,42 @@
+import threading
 from pathlib import Path
 import pandas as pd
 from src.utils.logger import get_logger
 
 logger = get_logger("io_utils")
+
+_DIAG_LOCK = threading.Lock()
+_DIAG_CSV = Path("results/pipeline_diagnostics.csv")
+
+
+def write_pipeline_diagnostics(rows: list[dict], results_dir: str | Path | None = None) -> None:
+    """Append one or more diagnostic rows to the unified pipeline diagnostics CSV.
+
+    Thread-safe. Called from stage 3, 4, and 5. Each row must have a 'symbol'
+    and 'stage' key. Columns are merged across stages (NaN for absent columns).
+    """
+    if not rows:
+        return
+    csv_path = Path(results_dir) / "pipeline_diagnostics.csv" if results_dir else _DIAG_CSV
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    new_df = pd.DataFrame(rows)
+    with _DIAG_LOCK:
+        if csv_path.exists():
+            try:
+                existing = pd.read_csv(csv_path)
+                # Remove rows that will be replaced (same symbol + stage)
+                mask = ~(
+                    existing["symbol"].isin(new_df["symbol"]) &
+                    existing["stage"].isin(new_df["stage"])
+                )
+                existing = existing[mask]
+                combined = pd.concat([existing, new_df], ignore_index=True, sort=False)
+            except Exception:
+                combined = new_df
+        else:
+            combined = new_df
+        combined.to_csv(csv_path, index=False)
+    logger.debug(f"pipeline_diagnostics.csv updated — {len(new_df)} row(s) written")
 
 REQUIRED_OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 

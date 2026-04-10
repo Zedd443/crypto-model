@@ -7,7 +7,7 @@ from tqdm import tqdm
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state
 from src.utils.logger import get_logger
-from src.utils.io_utils import checkpoint_exists, read_checkpoint
+from src.utils.io_utils import checkpoint_exists, read_checkpoint, write_pipeline_diagnostics
 from src.labels.triple_barrier import label_all_bars
 from src.labels.sample_weights import compute_return_weights, compute_label_uniqueness, combine_weights
 
@@ -40,20 +40,35 @@ def _label_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path) -> 
 
         _save_labels(labels_df, weights, symbol, labels_dir)
 
-        n_long = (labels_df["label"] == 1).sum()
-        n_short = (labels_df["label"] == -1).sum()
-        n_neutral = (labels_df["label"] == 0).sum()
-        logger.info(f"{symbol}: {len(labels_df)} labels — long={n_long}, short={n_short}, neutral={n_neutral}")
-        return symbol, None
+        n_long = int((labels_df["label"] == 1).sum())
+        n_short = int((labels_df["label"] == -1).sum())
+        n_neutral = int((labels_df["label"] == 0).sum())
+        n_total = len(labels_df)
+        pct_neutral = round(n_neutral / max(n_total, 1), 4)
+
+        # Count fee-reclassified bars (tp_level < round_trip_cost_pct → reclassified to neutral)
+        fee_reclassified = 0
+        if "tp_level" in labels_df.columns:
+            cost = 0.006  # default; exact value comes from config but unavailable in worker
+            fee_reclassified = int((
+                (labels_df["label"] == 0) &
+                (labels_df.get("original_label", labels_df["label"]) == 1) |
+                ((labels_df["tp_level"] < cost) & (labels_df["label"] == 0))
+            ).sum())
+
+        logger.info(f"{symbol}: {n_total} labels — long={n_long}, short={n_short}, neutral={n_neutral}")
+        return symbol, {
+            "n_long": n_long, "n_short": n_short, "n_neutral": n_neutral,
+            "pct_neutral": pct_neutral, "fee_reclassified": fee_reclassified,
+        }
 
     except Exception as e:
         import traceback
-        return symbol, f"{e}\n{traceback.format_exc()}"
+        return symbol, None, f"{e}\n{traceback.format_exc()}"
 
 
 def _label_symbol_worker(symbol: str, cfg_dict: dict, checkpoints_dir_str: str, labels_dir_str: str) -> tuple:
     # Worker entry point for ProcessPoolExecutor — all args must be picklable.
-    # Reconstruct OmegaConf and Path objects inside the subprocess.
     cfg = OmegaConf.create(cfg_dict)
     return _label_symbol(symbol, cfg, Path(checkpoints_dir_str), Path(labels_dir_str))
 
@@ -79,6 +94,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     issues = []
     success_count = 0
+    diag_rows = []
 
     logger.info(f"Stage 3: labeling {len(symbol_names)} symbols with max_workers={max_workers}")
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -87,12 +103,19 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
             for sym in symbol_names
         }
         for future in tqdm(as_completed(futures), total=len(futures), desc="stage_03", unit="sym"):
-            sym, err = future.result()
+            sym, stats, err = future.result()
             if err:
                 logger.error(f"{sym}: labeling failed — {err}")
                 issues.append(f"{sym}: {str(err)[:200]}")
             else:
                 success_count += 1
+                if stats:
+                    diag_rows.append({"symbol": sym, "stage": "labels", **stats})
+
+    # Write label stats to unified diagnostics CSV
+    if diag_rows:
+        results_dir = Path(cfg.data.results_dir) if hasattr(cfg.data, "results_dir") else Path("results")
+        write_pipeline_diagnostics(diag_rows, results_dir)
 
     # Validate label distribution across all symbols
     _validate_label_distributions(symbol_names, labels_dir, issues)

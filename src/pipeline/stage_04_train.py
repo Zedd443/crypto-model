@@ -7,7 +7,7 @@ from tqdm import tqdm
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state, update_completed_symbol
 from src.utils.logger import get_logger
-from src.utils.io_utils import read_features
+from src.utils.io_utils import read_features, write_pipeline_diagnostics
 from src.models.splitter import PurgedTimeSeriesSplit, compute_pbo
 from src.models.imputer import fit_imputer, transform_with_imputer, fit_robust_scaler, transform_with_scaler
 from src.models.stability_selection import select_features_pipeline
@@ -433,6 +433,40 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
         )
     except Exception as e:
         logger.warning(f"  {symbol}: diagnostic plots failed (non-fatal): {e}")
+
+    # Step 10: Write to unified pipeline diagnostics CSV
+    try:
+        fold_sharpe_std = float(np.std(fold_sharpes)) if fold_sharpes else float("nan")
+        fold_sharpe_min = float(np.min(fold_sharpes)) if fold_sharpes else float("nan")
+        # Top-5 SHAP features (from saved JSON if available)
+        shap_path = models_dir / f"{symbol}_{_TF}_shap_importance.json"
+        top_features_str = ""
+        if shap_path.exists():
+            try:
+                shap_series = pd.read_json(shap_path, typ="series")
+                top_features_str = ",".join(shap_series.nlargest(5).index.tolist())
+            except Exception:
+                pass
+        diag_row = {
+            "symbol": symbol,
+            "stage": "train",
+            "tier": tier,
+            "da_val": round(da, 4),
+            "synthetic_sharpe_mean": round(synthetic_sharpe, 4),
+            "fold_sharpe_std": round(fold_sharpe_std, 4) if not np.isnan(fold_sharpe_std) else None,
+            "fold_sharpe_min": round(fold_sharpe_min, 4) if not np.isnan(fold_sharpe_min) else None,
+            "pbo": round(pbo, 4),
+            "overfit_ratio": round(overfit_ratio, 4) if not np.isnan(overfit_ratio) else None,
+            "fold_da_std": round(fold_da_std, 4) if not np.isnan(fold_da_std) else None,
+            "n_features": len(all_col_names),
+            "n_train": len(X_train_final),
+            "pct_positive_train": round(pct_positive_train, 4),
+            "top5_shap_features": top_features_str,
+        }
+        results_dir = Path(cfg.data.results_dir) if hasattr(cfg.data, "results_dir") else Path("results")
+        write_pipeline_diagnostics([diag_row], results_dir)
+    except Exception as _diag_exc:
+        logger.warning(f"  {symbol}: diagnostics write failed (non-fatal): {_diag_exc}")
 
     return symbol, {"version": version, "tier": tier, "metrics": metrics}, None
 

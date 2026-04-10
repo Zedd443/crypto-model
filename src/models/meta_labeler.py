@@ -163,7 +163,14 @@ def train_meta_labeler(
     )
     model.fit(X, meta_y_train, sample_weight=w)
     logger.info(f"Meta-labeler trained: {n_estimators} estimators, depth={max_depth}, spw={meta_spw:.3f}")
-    return model
+    meta_stats = {
+        "meta_spw": round(meta_spw, 4),
+        "meta_best_lr": round(best_lr, 6),
+        "meta_best_subsample": round(best_sub, 4),
+        "meta_n0": n_meta0,
+        "meta_n1": n_meta1,
+    }
+    return model, meta_stats
 
 
 def compute_signal_strength(

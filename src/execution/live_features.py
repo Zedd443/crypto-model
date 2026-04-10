@@ -91,6 +91,7 @@ def compute_live_features(
     klines_4h: pd.DataFrame | None = None,
     klines_1d: pd.DataFrame | None = None,
     btc_klines_15m: pd.DataFrame | None = None,
+    client=None,  # BinanceClient — if provided, real funding rates injected
 ) -> pd.Series:
     """
     Build the full inference-time feature vector for a symbol.
@@ -130,7 +131,19 @@ def compute_live_features(
     # 4. Funding rate features
     try:
         btc_df_for_funding = btc_klines_15m if (symbol != "BTCUSDT" and btc_klines_15m is not None) else None
-        funding = build_funding_features(klines_15m, btc_df_for_funding, cfg)
+        # Inject real funding rate from Binance API if client available — overrides proxy
+        klines_for_funding = klines_15m.copy()
+        if client is not None:
+            try:
+                fr_history = client.get_funding_rate_history(symbol, limit=500)
+                if not fr_history.empty:
+                    # Funding is settled every 8h — forward-fill to 15m bars
+                    fr_aligned = fr_history["fundingRate"].reindex(klines_for_funding.index, method="ffill")
+                    klines_for_funding["real_funding_rate"] = fr_aligned
+                    logger.debug(f"{symbol}: injected real funding rates ({len(fr_history)} records)")
+            except Exception as _fr_exc:
+                logger.debug(f"{symbol}: real funding rate fetch failed — using proxy: {_fr_exc}")
+        funding = build_funding_features(klines_for_funding, btc_df_for_funding, cfg)
         all_features = pd.concat([all_features, funding], axis=1)
     except Exception as exc:
         logger.warning(f"{symbol}: funding features failed — {exc}")

@@ -165,6 +165,54 @@ def _compute_daily_pnl_pct(trade_log_path: Path, equity: float) -> float:
         return 0.0
 
 
+def _compute_rolling_sharpe(trade_log_path: Path, days: int = 7) -> float:
+    # Compute Sharpe of per-trade pnl_pct over last N days — returns nan if insufficient trades
+    if not trade_log_path.exists():
+        return float("nan")
+    try:
+        df = pd.read_csv(trade_log_path)
+        if df.empty or "timestamp_exit" not in df.columns or "pnl_pct" not in df.columns:
+            return float("nan")
+        cutoff = datetime.now(timezone.utc) - pd.Timedelta(days=days)
+        df["ts"] = pd.to_datetime(df["timestamp_exit"], utc=True, errors="coerce")
+        recent = df[df["ts"] >= cutoff]["pnl_pct"].dropna()
+        if len(recent) < 5:  # need at least 5 trades for meaningful Sharpe
+            return float("nan")
+        mean_r = recent.mean()
+        std_r = recent.std()
+        return float(mean_r / (std_r + 1e-9)) * (len(recent) ** 0.5)  # information ratio style
+    except Exception as exc:
+        logger.debug(f"Rolling Sharpe compute failed: {exc}")
+        return float("nan")
+
+
+def _reconcile_positions_from_api(client, order_manager, trading_mode: str) -> None:
+    # Query Binance for all open positions and warn about positions the local dict doesn't know about.
+    # This is informational only — does not auto-close anything. Prevents silent orphan positions.
+    try:
+        api_positions = client.get_all_open_positions()
+        api_syms = {p["symbol"] for p in api_positions}
+        local_syms = set(order_manager.positions.keys())
+
+        # Positions on exchange but not in local dict — orphans (e.g. from prior session)
+        orphans = api_syms - local_syms
+        if orphans:
+            logger.warning(f"RECONCILE: {len(orphans)} orphan position(s) on exchange not in local state: {orphans}")
+            for sym in orphans:
+                p = next(x for x in api_positions if x["symbol"] == sym)
+                logger.warning(f"  {sym}: amt={p['positionAmt']:.4f} entry={p['entryPrice']:.4f} upnl={p['unrealizedProfit']:.2f}")
+
+        # Positions in local dict but exchange shows zero — already closed (missed sync_fills)
+        ghosts = local_syms - api_syms
+        if ghosts:
+            logger.warning(f"RECONCILE: {len(ghosts)} ghost position(s) in local state but closed on exchange: {ghosts}")
+            for sym in ghosts:
+                logger.warning(f"  {sym}: removing from local positions dict")
+                order_manager.positions.pop(sym, None)
+    except Exception as exc:
+        logger.debug(f"Position reconciliation failed: {exc}")
+
+
 def _rotate_logs(logs_dir: Path, keep_days: int = 2) -> None:
     # Delete log files older than keep_days. Keeps today and yesterday.
     cutoff = datetime.now(timezone.utc).date()
@@ -290,6 +338,14 @@ def run(cfg, **kwargs) -> None:
     wallet_today: float = 0.0   # locked once per UTC day, used for ALL position sizing that day
     wallet_today_date: str = ""  # UTC date string when wallet_today was locked
 
+    # Circuit breaker: consecutive error counter per symbol
+    # Symbol removed from forecast_symbols after 5 consecutive scoring failures
+    _sym_error_count: dict[str, int] = {}
+    _CIRCUIT_BREAKER_LIMIT = 5
+
+    # Rolling Sharpe guardrail: if last 7-day Sharpe from trade log < 0, log warning + halve sizing
+    _sharpe_size_factor: float = 1.0  # 1.0 = full size, 0.5 = halved
+
     try:
         while True:
             wait = _seconds_until_next_bar(bar_seconds) + _BAR_CLOSE_BUFFER
@@ -331,8 +387,20 @@ def run(cfg, **kwargs) -> None:
             trade_limit = _get_trade_limit(cfg, state)
             open_count = len(order_manager.positions)
 
+            # Position reconciliation: every bar, check API vs local dict for orphan/ghost positions
+            _reconcile_positions_from_api(client, order_manager, trading_mode)
+
             daily_pnl_pct = _compute_daily_pnl_pct(_TRADE_LOG_PATH, equity)
             daily_target_hit = daily_pnl_pct >= daily_profit_target
+
+            # Rolling Sharpe guardrail: halve sizing if 7-day Sharpe is negative
+            _rolling_sharpe = _compute_rolling_sharpe(_TRADE_LOG_PATH, days=7)
+            if not (isinstance(_rolling_sharpe, float) and _rolling_sharpe != _rolling_sharpe):  # not nan
+                if _rolling_sharpe < 0:
+                    _sharpe_size_factor = 0.5
+                    logger.warning(f"Rolling 7d Sharpe={_rolling_sharpe:.3f} < 0 — sizing halved to 50%")
+                else:
+                    _sharpe_size_factor = 1.0
 
             btc_klines_bar: pd.DataFrame | None = None
             try:
@@ -356,7 +424,7 @@ def run(cfg, **kwargs) -> None:
                         lookback_needed=lookback_needed,
                         signal_floor=signal_floor,
                         equity=equity,
-                        wallet_today=wallet_today,
+                        wallet_today=wallet_today * _sharpe_size_factor,
                         leverage=leverage,
                         state=state,
                         skip_new_entries=daily_target_hit,
@@ -366,10 +434,21 @@ def run(cfg, **kwargs) -> None:
                         bar_signals.append(sig_info)
                         if sig_info.get("action") == "CANDIDATE":
                             scored.append(sig_info)
+                    # Circuit breaker: reset error count on success
+                    _sym_error_count.pop(symbol, None)
                 except Exception as exc:
                     logger.error(f"{symbol}: {exc}")
                     import traceback
                     logger.debug(traceback.format_exc())
+                    # Circuit breaker: increment error count
+                    _sym_error_count[symbol] = _sym_error_count.get(symbol, 0) + 1
+                    if _sym_error_count[symbol] >= _CIRCUIT_BREAKER_LIMIT:
+                        logger.warning(
+                            f"Circuit breaker: {symbol} failed {_sym_error_count[symbol]} consecutive bars "
+                            f"— removing from forecast_symbols"
+                        )
+                        forecast_symbols = [s for s in forecast_symbols if s != symbol]
+                        _sym_error_count.pop(symbol, None)
                 order_manager.heartbeat()
 
             # Phase 2: sort candidates by signal_strength desc, open top-N positions
@@ -541,6 +620,7 @@ def _score_symbol(
         symbol, cfg, klines_df,
         klines_1h=klines_1h, klines_4h=klines_4h, klines_1d=klines_1d,
         btc_klines_15m=btc_klines_15m,
+        client=client,
     )
 
     cached = _model_cache.get(symbol, {})

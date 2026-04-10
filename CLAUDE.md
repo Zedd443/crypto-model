@@ -6,6 +6,9 @@
 3. Read `SESSION_PROTOCOL.md` if starting a new investigation or retrain.
 4. Do NOT read other files unless explicitly listed in `token_hints.read_if_relevant`.
 5. Check `project_state.json` stages before re-running any stage — pipeline is resumable.
+   - `results/pipeline_diagnostics.csv` — per-symbol label stats (stage=labels), fold Sharpe
+     variance + top SHAP features (stage=train), meta SPW + accuracy (stage=meta). Read this
+     when diagnosing model quality or proposing improvements.
 6. **DECISIONS.md is APPEND-ONLY.** Never edit existing entry text or status in-place.
    To mark fixed: add new entry `### ISSUE-XXX-FIX (date)` below the original with what changed.
    To reopen: add `### ISSUE-XXX-REOPEN (date)`. Never delete or overwrite old entries.

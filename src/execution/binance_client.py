@@ -133,6 +133,64 @@ class BinanceClient:
                     }
         return {"positionAmt": 0.0, "entryPrice": 0.0, "unrealizedProfit": 0.0, "markPrice": 0.0}
 
+    def get_funding_rate(self, symbol: str) -> float:
+        # Returns latest real funding rate from Binance — used in live features to replace proxy
+        try:
+            data = self._request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
+            if isinstance(data, dict):
+                return float(data.get("lastFundingRate", 0.0))
+            if isinstance(data, list) and len(data) > 0:
+                return float(data[0].get("lastFundingRate", 0.0))
+        except Exception as exc:
+            logger.debug(f"{symbol}: get_funding_rate failed: {exc}")
+        return 0.0
+
+    def get_funding_rate_history(self, symbol: str, limit: int = 500) -> pd.DataFrame:
+        # Returns historical funding rates as DataFrame with columns [timestamp, fundingRate]
+        try:
+            data = self._request("GET", "/fapi/v1/fundingRate", params={"symbol": symbol, "limit": limit})
+            if isinstance(data, list) and len(data) > 0:
+                df = pd.DataFrame(data)
+                df["timestamp"] = pd.to_datetime(df["fundingTime"].astype(int), unit="ms", utc=True)
+                df["fundingRate"] = df["fundingRate"].astype(float)
+                return df[["timestamp", "fundingRate"]].set_index("timestamp").sort_index()
+        except Exception as exc:
+            logger.debug(f"{symbol}: get_funding_rate_history failed: {exc}")
+        return pd.DataFrame(columns=["fundingRate"])
+
+    def get_commission_rate(self, symbol: str) -> dict:
+        # Returns taker/maker commission rates for symbol — used to deduct actual fee from pnl
+        try:
+            data = self._request("GET", "/fapi/v1/commissionRate", params={"symbol": symbol}, signed=True)
+            if isinstance(data, dict):
+                return {
+                    "taker": float(data.get("takerCommissionRate", 0.0004)),
+                    "maker": float(data.get("makerCommissionRate", 0.0002)),
+                }
+        except Exception as exc:
+            logger.debug(f"{symbol}: get_commission_rate failed: {exc}")
+        return {"taker": 0.0004, "maker": 0.0002}  # Binance FAPI default fallback
+
+    def get_all_open_positions(self) -> list[dict]:
+        # Returns all positions with non-zero positionAmt from exchange — ground truth for reconciliation
+        try:
+            data = self._request("GET", "/fapi/v2/positionRisk", signed=True)
+            if isinstance(data, list):
+                return [
+                    {
+                        "symbol": p["symbol"],
+                        "positionAmt": float(p.get("positionAmt", 0)),
+                        "entryPrice": float(p.get("entryPrice", 0)),
+                        "unrealizedProfit": float(p.get("unRealizedProfit", 0)),
+                        "markPrice": float(p.get("markPrice", 0)),
+                    }
+                    for p in data
+                    if abs(float(p.get("positionAmt", 0))) > 0
+                ]
+        except Exception as exc:
+            logger.debug(f"get_all_open_positions failed: {exc}")
+        return []
+
     def get_open_orders(self, symbol: str) -> list:
         return self._request("GET", "/fapi/v1/openOrders", params={"symbol": symbol}, signed=True)
 

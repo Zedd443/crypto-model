@@ -29,6 +29,8 @@ _TRADE_LOG_COLS = [
     "exit_price",
     "size_usd",
     "pnl_pct",
+    "pnl_pct_net",       # pnl after round-trip fee deduction
+    "fee_pct",           # round-trip fee actually charged (taker × 2)
     "regime",
     "signal_strength",
 ]
@@ -47,6 +49,11 @@ class OrderManager:
         #           tp_order_id, sl_order_id, regime, signal_strength}}
         self.positions: dict = {}
 
+        # Per-symbol commission rate cache — fetched from API on first trade, fallback to config
+        self._commission_cache: dict[str, float] = {}
+        # Default taker fee from config (used as fallback before API fetch)
+        self._default_taker_fee = float(getattr(getattr(cfg, "backtest", cfg), "commission_pct", 0.001))
+
         self._heartbeat_lock = threading.Lock()
         self._last_heartbeat = time.monotonic()
 
@@ -60,6 +67,20 @@ class OrderManager:
         self._dms_thread = threading.Thread(target=self._dead_man_switch_loop, daemon=True)
         self._dms_thread.start()
         logger.info(f"OrderManager started — DMS={self._dms_seconds}s trade_log={self._log_path}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_taker_fee(self, symbol: str) -> float:
+        # Returns taker fee rate for symbol — fetched from API once, cached per symbol
+        if symbol not in self._commission_cache:
+            try:
+                rates = self._client.get_commission_rate(symbol)
+                self._commission_cache[symbol] = rates["taker"]
+            except Exception:
+                self._commission_cache[symbol] = self._default_taker_fee
+        return self._commission_cache[symbol]
 
     # ------------------------------------------------------------------
     # Public API
@@ -353,6 +374,7 @@ class OrderManager:
                             pnl_pct = (exit_price - entry_price) / (entry_price + 1e-12)
                         else:
                             pnl_pct = (entry_price - exit_price) / (entry_price + 1e-12)
+                        fee_pct = self._get_taker_fee(symbol) * 2  # round-trip: entry + exit
                         fill = {
                             "timestamp_entry": pos["entry_time"],
                             "timestamp_exit": datetime.now(timezone.utc).isoformat(),
@@ -362,12 +384,14 @@ class OrderManager:
                             "exit_price": exit_price,
                             "size_usd": pos["size_usd"],
                             "pnl_pct": round(pnl_pct, 6),
+                            "pnl_pct_net": round(pnl_pct - fee_pct, 6),
+                            "fee_pct": round(fee_pct, 6),
                             "regime": pos.get("regime", ""),
                             "signal_strength": pos.get("signal_strength", 0.0),
                         }
                         self._write_trade_log(fill)
                         del self.positions[symbol]
-                        logger.info(f"{symbol}: DEMO {hit} fill recorded — pnl_pct={pnl_pct:.4%}")
+                        logger.info(f"{symbol}: DEMO {hit} fill recorded — pnl_pct={pnl_pct:.4%} net={pnl_pct - fee_pct:.4%}")
                         return fill
 
             return None  # still open
@@ -387,6 +411,7 @@ class OrderManager:
         else:
             pnl_pct = (entry_price - exit_price) / (entry_price + 1e-12)
 
+        fee_pct = self._get_taker_fee(symbol) * 2  # round-trip: entry + exit
         fill = {
             "timestamp_entry": pos["entry_time"],
             "timestamp_exit": datetime.now(timezone.utc).isoformat(),
@@ -396,13 +421,15 @@ class OrderManager:
             "exit_price": exit_price,
             "size_usd": pos["size_usd"],
             "pnl_pct": round(pnl_pct, 6),
+            "pnl_pct_net": round(pnl_pct - fee_pct, 6),
+            "fee_pct": round(fee_pct, 6),
             "regime": pos.get("regime", ""),
             "signal_strength": pos.get("signal_strength", 0.0),
         }
 
         self._write_trade_log(fill)
         del self.positions[symbol]
-        logger.info(f"{symbol}: fill recorded — pnl_pct={pnl_pct:.4%}")
+        logger.info(f"{symbol}: fill recorded — pnl_pct={pnl_pct:.4%} net={pnl_pct - fee_pct:.4%}")
         return fill
 
     def cancel_all_open(self, force_close: bool = False) -> None:
