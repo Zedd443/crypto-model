@@ -313,21 +313,13 @@ def run(cfg, **kwargs) -> None:
         _bad = set(_pm.loc[_pm["sharpe"] < 0, "symbol"].tolist())
         forecast_symbols = [s for s in forecast_symbols if s not in _bad]
 
-    # Filter 3: structurally untradeable — max tradeable notional too small.
-    # DEMO: maxQty=120 is real for MARKET orders. Filter coins where max notional
-    # is below a meaningful threshold (10% of target volume) to avoid lots of capped orders.
+    # Filter 3: structurally untradeable — exclude only if max_qty × price < min_notional.
+    # This means the exchange literally cannot fill even the minimum order for this symbol.
+    # Symbols where max_qty × price < our target size are NOT excluded — order_manager
+    # will cap qty to max_qty automatically (size gets bumped/capped, not skipped).
     _untradeable = []
     _probe_errors = []
-    # Fetch live equity for filter threshold (state equity may be stale at startup)
-    try:
-        _acct_f3 = client.get_account()
-        _equity_f3 = float(_acct_f3.get("totalWalletBalance", 0.0))
-    except Exception:
-        _equity_f3 = float(state.get("account", {}).get("current_equity", 1000))
-    _, _lev = get_growth_gate_limits(_equity_f3, cfg)
-    _target_volume = _equity_f3 * float(_lev)
-    _min_tradeable_notional = _target_volume * 0.10  # skip if max exchange volume < 10% of target
-    logger.info(f"Filter 3: equity={_equity_f3:.0f} target_vol={_target_volume:.0f} min_notional_threshold={_min_tradeable_notional:.0f}")
+    logger.info("Filter 3: checking structural tradeability (max_qty × price >= min_notional)")
 
     for _sym in forecast_symbols:
         try:
@@ -335,9 +327,11 @@ def run(cfg, **kwargs) -> None:
             _max_qty = client.get_max_qty(_sym, _price)
             _min_notional = client.get_min_notional(_sym)
             _max_notional = _max_qty * _price
-            if _max_notional < _min_notional or _max_notional < _min_tradeable_notional:
-                logger.info(f"{_sym}: max notional {_max_notional:.0f} < threshold {_min_tradeable_notional:.0f} — excluded")
+            if _max_notional < _min_notional:
+                logger.info(f"{_sym}: max notional {_max_notional:.2f} < min_notional {_min_notional:.2f} — structurally untradeable, excluded")
                 _untradeable.append(_sym)
+            else:
+                logger.debug(f"{_sym}: ok — max_notional={_max_notional:.2f} min_notional={_min_notional:.2f}")
         except Exception as _e:
             _probe_errors.append(_sym)
     forecast_symbols = [s for s in forecast_symbols if s not in _untradeable]
