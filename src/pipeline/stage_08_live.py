@@ -97,15 +97,16 @@ def _load_meta(symbol: str, cfg):
     primary_tf = str(cfg.data.primary_timeframe)
     entry = get_latest_model(symbol, primary_tf, model_type="meta", cfg=cfg)
     if entry is None:
-        return None
+        return None, None
     try:
-        return load_meta_model(symbol, primary_tf, entry["version"], cfg.data.models_dir)
+        model = load_meta_model(symbol, primary_tf, entry["version"], cfg.data.models_dir)
+        return model, entry
     except Exception as exc:
         logger.debug(f"{symbol}: no meta model loaded: {exc}")
-        return None
+        return None, None
 
 
-def _predict(model, calibrator, meta_model, feature_series: pd.Series) -> tuple[float, float]:
+def _predict(model, calibrator, meta_model, feature_series: pd.Series, meta_entry=None) -> tuple[float, float]:
     X_arr = feature_series.values.reshape(1, -1)
 
     raw_prob = float(model.predict_proba(X_arr)[0][1])
@@ -124,10 +125,24 @@ def _predict(model, calibrator, meta_model, feature_series: pd.Series) -> tuple[
         _vol_col = next((c for c in _idx if c.startswith("realized_vol")), None)
         _zscore_col = next((c for c in _idx if c.startswith("volume_zscore")), None)
         _ofi_col = next((c for c in _idx if c.startswith("ofi")), None)
+        _spread_col = next((c for c in _idx if c.startswith("spread_proxy")), None)
+        _atr_col = next((c for c in _idx if c == "atr_14"), None)
         realized_vol = pd.Series([feature_series[_vol_col] if _vol_col else np.nan])
         volume_zscore = pd.Series([feature_series[_zscore_col] if _zscore_col else np.nan])
         ofi = pd.Series([feature_series[_ofi_col] if _ofi_col else np.nan])
-        meta_X = build_meta_features(oof_proba_1bar, None, realized_vol, volume_zscore, ofi)
+        spread_series = pd.Series([feature_series[_spread_col] if _spread_col else np.nan])
+        atr_series = pd.Series([feature_series[_atr_col] if _atr_col else np.nan])
+        meta_X = build_meta_features(
+            oof_proba_1bar, None, realized_vol, volume_zscore, ofi,
+            spread_series=spread_series, atr_series=atr_series,
+        )
+        # Align to training feature schema to prevent shape mismatch
+        if meta_entry is not None and meta_entry.get("feature_names"):
+            expected_cols = meta_entry["feature_names"]
+            for col in expected_cols:
+                if col not in meta_X.columns:
+                    meta_X[col] = 0.0
+            meta_X = meta_X[expected_cols]
         meta_X_arr = np.nan_to_num(meta_X.values, nan=0.0)
         try:
             meta_prob = float(meta_model.predict_proba(meta_X_arr)[0][1])
@@ -304,13 +319,19 @@ def run(cfg, **kwargs) -> None:
     if _missing:
         logger.debug(f"Excluded (missing artifacts): {_missing}")
 
-    # Filter 2: negative backtest Sharpe
+    # Filter 2: negative backtest Sharpe OR critically low hit_rate (inverted signal)
+    # hit_rate < 0.40 on 2:1 R:R labels means model has inverted signal, not just bad luck
     _metrics_path = Path(cfg.data.results_dir) / "per_symbol_metrics.csv"
     _bad: set = set()
     if _metrics_path.exists():
         import pandas as _pd
         _pm = _pd.read_csv(_metrics_path)
-        _bad = set(_pm.loc[_pm["sharpe"] < 0, "symbol"].tolist())
+        _bad_sharpe = set(_pm.loc[_pm["sharpe"] < 0, "symbol"].tolist())
+        _hit_rate_col = "hit_rate" if "hit_rate" in _pm.columns else None
+        _bad_hr = set(_pm.loc[_pm[_hit_rate_col] < 0.40, "symbol"].tolist()) if _hit_rate_col else set()
+        _bad = _bad_sharpe | _bad_hr
+        if _bad_hr - _bad_sharpe:
+            logger.warning(f"Excluded by hit_rate < 0.40 (inverted signal): {_bad_hr - _bad_sharpe}")
         forecast_symbols = [s for s in forecast_symbols if s not in _bad]
 
     # Filter 3: structurally untradeable — exclude only if max_qty × price < min_notional.
@@ -322,16 +343,24 @@ def run(cfg, **kwargs) -> None:
     logger.info("Filter 3: checking structural tradeability (max_qty × price >= min_notional)")
 
     for _sym in forecast_symbols:
+        order_manager.heartbeat()  # DMS keepalive — Filter 3 probes ~57 symbols × 1s > 60s timeout
         try:
             _price = float(client.get_klines(_sym, primary_tf, limit=1)["close"].iloc[-1])
-            _max_qty = client.get_max_qty(_sym, _price)
+            _step = client.get_qty_step(_sym)
             _min_notional = client.get_min_notional(_sym)
-            _max_notional = _max_qty * _price
-            if _max_notional < _min_notional:
-                logger.info(f"{_sym}: max notional {_max_notional:.2f} < min_notional {_min_notional:.2f} — structurally untradeable, excluded")
+            # Minimum qty needed to satisfy min_notional, rounded up to nearest step
+            import math
+            _min_qty_needed = math.ceil((_min_notional / _price) / _step) * _step if _price > 0 else float("inf")
+            _max_qty = client.get_max_qty(_sym, _price)
+            # Untradeable only if even 1 lot × price < min_notional AND max_qty can't cover it
+            if _min_qty_needed > _max_qty:
+                logger.info(
+                    f"{_sym}: structurally untradeable — need qty≥{_min_qty_needed:.4f} to meet "
+                    f"min_notional={_min_notional:.2f} but max_qty={_max_qty:.4f}, excluded"
+                )
                 _untradeable.append(_sym)
             else:
-                logger.debug(f"{_sym}: ok — max_notional={_max_notional:.2f} min_notional={_min_notional:.2f}")
+                logger.debug(f"{_sym}: ok — min_qty_needed={_min_qty_needed:.4f} max_qty={_max_qty:.4f} price={_price:.6f}")
         except Exception as _e:
             _probe_errors.append(_sym)
     forecast_symbols = [s for s in forecast_symbols if s not in _untradeable]
@@ -344,6 +373,7 @@ def run(cfg, **kwargs) -> None:
 
     # Pre-load models
     for _sym in forecast_symbols:
+        order_manager.heartbeat()  # DMS keepalive during model preload
         try:
             _model_cache[_sym] = {
                 "primary": _load_primary_model(_sym, cfg),
@@ -647,12 +677,12 @@ def _score_symbol(
 
     cached = _model_cache.get(symbol, {})
     primary_model, calibrator = cached.get("primary", (None, None))
-    meta_model = cached.get("meta", None)
+    meta_model, meta_entry = cached.get("meta", (None, None))
     if primary_model is None:
         logger.warning(f"{symbol}: no cached model, skipping bar")
         return None
 
-    primary_prob, signal_strength = _predict(primary_model, calibrator, meta_model, feature_series)
+    primary_prob, signal_strength = _predict(primary_model, calibrator, meta_model, feature_series, meta_entry=meta_entry)
 
     # Sync fills — detect TP/SL hits and DEMO simulated exits
     fill = order_manager.sync_fills(symbol)

@@ -31,9 +31,6 @@ _FRACDIFF_COLS = [
 # HTF interval → Binance kline interval string
 _HTF_INTERVALS = {"1h": "1h", "4h": "4h", "1d": "1d"}
 
-# ffill limits per HTF (bars in 15m units)
-_HTF_FFILL = {"1h": 4, "4h": 16, "1d": 96}
-
 
 def get_lookback_bars_needed(cfg) -> int:
     # Cap at 1500 — Binance FAPI hard limit for klines endpoint
@@ -56,8 +53,12 @@ def _build_hmm_input(klines_15m: pd.DataFrame) -> pd.DataFrame:
     return hmm_df.dropna()
 
 
-def _merge_htf(base_15m: pd.DataFrame, htf_df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    ffill_limit = _HTF_FFILL.get(tf, 4)
+def _merge_htf(base_15m: pd.DataFrame, htf_df: pd.DataFrame, tf: str, cfg=None) -> pd.DataFrame:
+    # ffill limits from config, with defaults matching feature_pipeline
+    if cfg is not None:
+        ffill_limit = int(cfg.features.htf_ffill_limits.get(tf, 4))
+    else:
+        ffill_limit = {"1h": 4, "4h": 16, "1d": 96}.get(tf, 4)
     htf_reindexed = htf_df.reindex(base_15m.index, method="ffill", limit=ffill_limit)
     htf_reindexed.columns = [f"{c}_{tf}" for c in htf_reindexed.columns]
     return pd.concat([base_15m, htf_reindexed], axis=1)
@@ -117,9 +118,25 @@ def compute_live_features(
         if df_htf is not None and len(df_htf) > 0:
             try:
                 tech_htf = build_technical_features(df_htf, cfg)
-                all_features = _merge_htf(all_features, tech_htf, tf)
+                all_features = _merge_htf(all_features, tech_htf, tf, cfg)
             except Exception as exc:
                 logger.warning(f"{symbol}: HTF {tf} feature build failed — {exc}")
+
+    # 2b. HTF model predictions (4h, 1d) — inject calibrated long-prob as features
+    # Mirrors feature_pipeline step 2b. Models trained in stage_04b.
+    models_dir = Path(cfg.data.models_dir)
+    for _tf, _df_htf in [("4h", klines_4h), ("1d", klines_1d)]:
+        _htf_model_path = models_dir / f"{symbol}_{_tf}_htf_model.json"
+        if _df_htf is not None and len(_df_htf) > 0 and _htf_model_path.exists():
+            try:
+                from src.models.htf_model import load_htf_model, predict_htf_proba
+                _htf_model, _htf_cal, _htf_feat_names = load_htf_model(symbol, _tf, models_dir)
+                _htf_pred = predict_htf_proba(_htf_model, _htf_cal, _htf_feat_names, _df_htf, _tf)
+                _ffill_limit = _HTF_FFILL.get(_tf, 16)
+                _htf_pred_aligned = _htf_pred.reindex(all_features.index, method="ffill", limit=_ffill_limit)
+                all_features = pd.concat([all_features, _htf_pred_aligned], axis=1)
+            except Exception as _e:
+                logger.warning(f"{symbol}: live htf_pred_{_tf} failed — {_e}")
 
     # 3. Microstructure features
     try:
@@ -147,6 +164,16 @@ def compute_live_features(
         all_features = pd.concat([all_features, funding], axis=1)
     except Exception as exc:
         logger.warning(f"{symbol}: funding features failed — {exc}")
+
+    # 4b. BTC lag spillover for altcoins — mirrors feature_pipeline step 4b
+    if btc_klines_15m is not None and symbol != "BTCUSDT":
+        try:
+            btc_ret = np.log(btc_klines_15m["close"] / btc_klines_15m["close"].shift(1))
+            btc_ret_aligned = btc_ret.reindex(all_features.index)
+            btc_lag_cols = {f"btc_lag_{lag}": btc_ret_aligned.shift(lag) for lag in [1, 2, 3, 4]}
+            all_features = pd.concat([all_features, pd.DataFrame(btc_lag_cols, index=all_features.index)], axis=1)
+        except Exception as exc:
+            logger.warning(f"{symbol}: btc_lag features failed — {exc}")
 
     # 5. HMM regime probabilities — load saved model, predict on full lookback window
     hmm_dir = checkpoints_dir / "hmm" / symbol
@@ -230,17 +257,14 @@ def compute_live_features(
     last_row = all_features.iloc[[-1]]
 
     # 12. Load imputer and scaler (fit on train split only — no leakage)
-    imputer_path = checkpoints_dir / "imputers" / f"imputer_{symbol}_15m.pkl"
+    from src.models.imputer import transform_with_imputer, transform_with_scaler
+    imp_dir = checkpoints_dir / "imputers"
+    imputer_path = imp_dir / f"imputer_{symbol}_15m.pkl"
     if not imputer_path.exists():
         raise FileNotFoundError(f"Imputer not found: {imputer_path}")
-    with open(imputer_path, "rb") as f:
-        imputer = pickle.load(f)
-
-    scaler_path = checkpoints_dir / "imputers" / f"scaler_{symbol}_15m.pkl"
+    scaler_path = imp_dir / f"scaler_{symbol}_15m.pkl"
     if not scaler_path.exists():
         raise FileNotFoundError(f"Scaler not found: {scaler_path}")
-    with open(scaler_path, "rb") as f:
-        scaler = pickle.load(f)
 
     # 13. Subset to the exact feature names the model was trained on
     registry_entry = get_latest_model(symbol, "15m", model_type="primary")
@@ -260,9 +284,10 @@ def compute_live_features(
 
     last_row = last_row[selected_features]
 
-    # 14. Transform with imputer then scaler (transform-only, never fit)
-    transformed = imputer.transform(last_row.values)
-    transformed = scaler.transform(transformed)
+    # 14. Transform with imputer then scaler — uses transform_with_imputer which handles
+    # the dict artifact format (imputer + indicator_cols) correctly
+    transformed = transform_with_imputer(last_row.values, symbol, "15m", imp_dir)
+    transformed = transform_with_scaler(transformed, symbol, "15m", imp_dir)
 
     result = pd.Series(transformed[0], index=selected_features, name=last_row.index[0])
     logger.debug(f"{symbol}: live features computed — {len(result)} features, {len(missing_cols)} filled NaN")

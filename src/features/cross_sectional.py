@@ -63,42 +63,66 @@ def fit_cross_sectional_stats_from_files(
     except ImportError:
         _iter = parquet_paths
 
+    import pyarrow as pa
+
+    def _is_numeric_type(pa_type):
+        # Use public pyarrow API — avoids internal pa.lib.Type_* constants
+        return (
+            pa.types.is_integer(pa_type)
+            or pa.types.is_floating(pa_type)
+            or pa.types.is_decimal(pa_type)
+        )
+
     for path in _iter:
         try:
             pf = pq.ParquetFile(path)
-            # Read index column to get train mask — index is stored as '__index_level_0__' or similar
-            idx_col = pf.schema_arrow.pandas_metadata["index_columns"] if hasattr(pf.schema_arrow, "pandas_metadata") else None
-            # Simpler: read only index + one col at a time using row groups
-            # Read full index first (cheap — one int64 column)
-            idx_table = pf.read(columns=[])  # no data columns, just index
+            schema = pf.schema_arrow
+
+            # Build set of numeric-only columns available in this file (public API type check)
+            numeric_available = set()
+            for i in range(len(schema)):
+                field = schema.field(i)
+                if _is_numeric_type(field.type) and field.name in accum:
+                    numeric_available.add(field.name)
+
+            if not numeric_available:
+                continue
+
+            # Read full index first (cheap — no data columns, just index)
+            idx_table = pf.read(columns=[])
             idx_vals = idx_table.to_pandas().index
-            # Normalise to UTC-aware DatetimeIndex for comparison
             if not isinstance(idx_vals, pd.DatetimeIndex):
                 idx_vals = pd.to_datetime(idx_vals, utc=True)
             elif idx_vals.tz is None:
                 idx_vals = idx_vals.tz_localize("UTC")
             else:
                 idx_vals = idx_vals.tz_convert("UTC")
-            train_mask = idx_vals <= train_end_ts
+            # Use np.asarray() — safe for both DatetimeIndex and numpy array results
+            train_mask = np.asarray(idx_vals <= train_end_ts, dtype=bool)
             n_train = train_mask.sum()
             if n_train == 0:
                 continue
 
-            # Read each feature column individually
-            available_cols = set(pf.schema_arrow.names)
-            for col in feature_cols:
-                if col not in available_cols:
-                    continue
-                col_table = pf.read(columns=[col])
-                vals_all = col_table.column(col).to_pylist()
+            # Subsample train rows if very large — reduces peak RAM, keeps quantile estimates valid
+            # Sample every Nth row when train rows > 50k (50k rows × 8 bytes = 400KB per col, safe)
+            _MAX_TRAIN_ROWS = 50_000
+            if n_train > _MAX_TRAIN_ROWS:
+                _step = int(np.ceil(n_train / _MAX_TRAIN_ROWS))
+                _subsample_idx = np.where(train_mask)[0][::_step]
+                train_mask_eff = np.zeros(len(train_mask), dtype=bool)
+                train_mask_eff[_subsample_idx] = True
+            else:
+                train_mask_eff = train_mask
+
+            # Read each numeric feature column individually
+            for col in numeric_available:
+                col_arr = pf.read(columns=[col]).column(col)
+                # Cast ChunkedArray to float64 then convert to list — to_pylist() is correct for ChunkedArray
                 try:
-                    vals = np.array(
-                        [v for v, m in zip(vals_all, train_mask) if m and v is not None],
-                        dtype=np.float64,
-                    )
-                except (TypeError, ValueError):
-                    # Column contains non-numeric types (e.g. Timestamp) — skip silently
-                    del col_table
+                    vals_all = col_arr.cast(pa.float64(), safe=False).to_pylist()
+                    vals = np.array(vals_all, dtype=np.float64)[train_mask_eff]
+                except Exception as col_err:
+                    logger.debug(f"{path.name}: skipping col {col}: {col_err}")
                     continue
                 vals = vals[np.isfinite(vals)]
                 if len(vals) == 0:
@@ -109,11 +133,12 @@ def fit_cross_sectional_stats_from_files(
                 a["sum"] += float(vals.sum())
                 a["sum_sq"] += float((vals ** 2).sum())
                 a["count"] += len(vals)
-                # Reservoir: keep up to 10k per file per col for quantile estimation
+                # Reservoir: uniform random sample up to 10k total per col for quantile estimation
                 if len(a["samples"]) < 10_000:
                     take = min(10_000 - len(a["samples"]), len(vals))
-                    a["samples"].append(vals[:take])
-                del vals, col_table
+                    idx_sample = np.random.choice(len(vals), take, replace=False) if len(vals) > take else np.arange(len(vals))
+                    a["samples"].append(vals[idx_sample])
+                del vals, col_arr
         except Exception as e:
             logger.warning(f"Skipping {path.name} in cross-sectional fit: {e}")
             continue

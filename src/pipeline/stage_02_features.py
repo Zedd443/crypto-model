@@ -32,7 +32,7 @@ def _write_saved_hash(features_dir: Path, h: str) -> None:
 
 
 def _process_symbol(args: tuple) -> tuple:
-    symbol, cfg_dict, train_end, force = args
+    symbol, cfg_dict, train_end, force, models_dir = args
     from omegaconf import OmegaConf
     cfg = OmegaConf.create(cfg_dict)
 
@@ -84,7 +84,8 @@ def _process_symbol(args: tuple) -> tuple:
 
         features_df = build_features_for_symbol(
             symbol, df_15m, df_1h, df_4h, df_1d,
-            macro_panel, onchain_panel, btc_df, cfg, train_end
+            macro_panel, onchain_panel, btc_df, cfg, train_end,
+            models_dir=models_dir,
         )
 
         write_features(features_df, symbol, "15m", features_dir)
@@ -118,7 +119,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     all_symbols = get_symbols(cfg)
     if symbol_filter:
-        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) == symbol_filter]
+        _sf = set(symbol_filter) if isinstance(symbol_filter, list) else {symbol_filter}
+        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) in _sf]
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
     train_end = str(cfg.data.train_end)
@@ -127,7 +129,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     # Phase 1: per-symbol features — parallel with ProcessPoolExecutor
     # Use max_workers=4 to avoid OOM on large feature sets
-    args_list = [(sym, cfg_dict, train_end, force) for sym in symbol_names]
+    models_dir = str(cfg.data.models_dir)
+    args_list = [(sym, cfg_dict, train_end, force, models_dir) for sym in symbol_names]
 
     with ProcessPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_process_symbol, args): args[0] for args in args_list}
@@ -192,7 +195,11 @@ def _apply_cross_sectional_features(symbol_names: list, cfg, train_end: str, iss
     if len(available_symbols) < 2:
         return
 
-    common_cols = list(set.intersection(*col_sets))
+    # Exclude BTCUSDT from intersection — BTC lacks btc_lag_* cols (it IS the anchor).
+    # Using BTC in the intersection would silently drop btc_lag_* rank features from all altcoins.
+    non_btc_col_sets = [cols for sym, cols in zip(available_symbols, col_sets) if sym != "BTCUSDT"]
+    intersection_sets = non_btc_col_sets if non_btc_col_sets else col_sets
+    common_cols = list(set.intersection(*intersection_sets))
     feature_cols = [c for c in common_cols if c not in ("is_warmup", "__index_level_0__")]
     logger.info(f"Cross-sectional: {len(feature_cols)} common features across {len(available_symbols)} symbols")
 

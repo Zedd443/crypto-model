@@ -198,6 +198,12 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     _sl = _labels_for_ret["sl_level"].fillna(0.0).values if "sl_level" in _labels_for_ret.columns else np.zeros(len(X_train_final))
     price_returns = np.where(_raw_lbl == 1, _tp, np.where(_raw_lbl == -1, -_sl, 0.0))
 
+    # t1 barrier end times for purged CV — passed as groups to enable true purging
+    # Without this, the splitter's embargo runs but barrier overlap in train folds is not removed
+    t1_series = None
+    if "t1" in _labels_for_ret.columns:
+        t1_series = _labels_for_ret["t1"].values  # numpy array of barrier end timestamps
+
     # Step 3: Hyperparameter tuning with Optuna (warm-start from prior best params if available)
     prior_params = {}
     try:
@@ -215,6 +221,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
             X_train_final, y_train_binary, w_train, splitter, cfg,
             price_returns=price_returns,
             warm_start_params=prior_params if prior_params else None,
+            t1=t1_series,
         )
     except Exception as e:
         logger.warning(f"  {symbol}: Optuna failed ({e}), using defaults")
@@ -228,7 +235,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     fold_best_iterations = []
     try:
         oof_proba, fold_val_losses, fold_best_iterations = compute_oof_predictions(
-            X_train_final, y_train_binary, w_train, splitter, best_params, cfg
+            X_train_final, y_train_binary, w_train, splitter, best_params, cfg, t1=t1_series
         )
     except Exception as e:
         logger.warning(f"  {symbol}: OOF failed ({e})")
@@ -276,7 +283,7 @@ def _train_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path, fea
     # Compute fold Sharpes using actual price returns (not binary label proxies)
     fold_sharpes = []
     fold_da_list = []
-    for _, val_idx in splitter.split(X_train_final, y_train_binary):
+    for _, val_idx in splitter.split(X_train_final, y_train_binary, groups=t1_series):
         fold_proba = oof_proba[val_idx, 1]
         fold_y = y_train_binary.iloc[val_idx].values
         fold_price_ret = price_returns[val_idx]
@@ -479,7 +486,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     all_symbols = get_symbols(cfg)
     if symbol_filter:
-        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) == symbol_filter]
+        _sf = set(symbol_filter) if isinstance(symbol_filter, list) else {symbol_filter}
+        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) in _sf]
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
     # Skip symbols already trained in a prior run (pipeline is resumable)

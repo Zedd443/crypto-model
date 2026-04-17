@@ -83,7 +83,7 @@ def compute_objective(y_true: np.ndarray, y_pred_proba: np.ndarray, returns: np.
                           getattr(getattr(cfg, 'model', cfg), 'objective_sharpe_weight', 0.5))) if cfg is not None else 0.5
     cvar_weight = float(getattr(getattr(cfg, 'model', cfg), 'objective_cvar_weight', 0.1)) if cfg is not None else 0.1
     dead_zone = float(getattr(getattr(cfg, 'model', cfg), 'objective_dead_zone', 0.05)) if cfg is not None else 0.05
-    fee_cost = float(getattr(getattr(cfg, 'labels', cfg), 'round_trip_cost_pct', 0.006)) if cfg is not None else 0.006
+    fee_cost = float(getattr(getattr(cfg, 'labels', cfg), 'round_trip_cost_pct', 0.003)) if cfg is not None else 0.003
 
     # Directional accuracy
     pred_dir = (y_pred_proba[:, 1] > 0.5).astype(int)
@@ -152,6 +152,7 @@ def tune_hyperparams(
     cfg,
     price_returns: np.ndarray | None = None,
     warm_start_params: dict | None = None,
+    t1: np.ndarray | None = None,
 ) -> dict:
     n_trials = int(cfg.model.optuna_n_trials)
     patience = int(cfg.model.optuna_patience)
@@ -170,7 +171,7 @@ def tune_hyperparams(
         n_est = params.pop("n_estimators")
 
         fold_scores = []
-        for train_idx, val_idx in splitter.split(X_train, y_train):
+        for train_idx, val_idx in splitter.split(X_train, y_train, groups=t1):
             X_tr = X_train.iloc[train_idx].values
             y_tr = y_train.iloc[train_idx].values
             w_tr = weights.iloc[train_idx].values if hasattr(weights, "iloc") else weights[train_idx]
@@ -304,8 +305,10 @@ def compute_oof_predictions(
     splitter: PurgedTimeSeriesSplit,
     params: dict,
     cfg,
+    t1: np.ndarray | None = None,
 ) -> tuple:
     # OOF predictions via PurgedTimeSeriesSplit — NEVER in-sample
+    # t1: barrier end times passed as groups for true purging (not just embargo)
     # Returns: (oof_proba, fold_val_losses, fold_best_iterations)
     oof_proba = np.zeros((len(X), 2))
     oof_proba[:, 0] = 0.5
@@ -314,7 +317,7 @@ def compute_oof_predictions(
     fold_val_losses = []
     fold_best_iterations = []
 
-    for train_idx, val_idx in splitter.split(X, y):
+    for train_idx, val_idx in splitter.split(X, y, groups=t1):
         X_t = X.iloc[train_idx].values
         y_t = y.iloc[train_idx].values
         w_t = weights.iloc[train_idx].values if hasattr(weights, "iloc") else weights[train_idx]

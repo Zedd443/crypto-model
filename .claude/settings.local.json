@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:developers.binance.com)",
+      "Bash(/d/Workspace/AI/crypto_model/.venv/Scripts/python.exe:*)",
+      "Bash(cmd.exe:*)",
+      "Bash(D:/Workspace/AI/crypto_model/.venv/Scripts/python.exe:*)",
+      "Bash(tasklist)",
+      "Bash(\"C:/Users/Irfan Z/miniconda3/python.exe\" -c \"import pandas as pd; from pathlib import Path; raw_dir = Path\\('data/raw'\\); sizes = {f.stem.replace\\('_4h',''\\):len\\(pd.read_parquet\\(f\\)\\) for f in raw_dir.glob\\('*_4h.parquet'\\)}; [print\\(s, n\\) for s,n in sorted\\(sizes.items\\(\\), key=lambda x:x[1]\\)[:10]]\")",
+      "Bash(cmd *)",
+      "Bash(powershell *)",
+      "Bash(Get-Process python*)",
+      "Bash(Select-Object Id,CPU,WorkingSet)",
+      "Bash(ls -la /d/Workspace/AI/crypto_model/results/pipeline_run_*.log)",
+      "Bash(pip install *)",
+      "Bash(wmic process *)",
+      "Bash(taskkill /PID 17248 /F)",
+      "Bash(taskkill /PID 17888 /F)",
+      "Bash(nohup .venv/Scripts/python.exe -m src.pipeline.run_pipeline --stage 8)",
+      "Bash(echo \"PID: $!\")",
+      "Bash(cd /d D:\\\\Workspace\\\\AI\\\\crypto_model)",
+      "Bash(find . -name \"*.py\" -type f -exec grep -l \"print\\(\" {} \\\\;)"
+    ]
+  }
+}

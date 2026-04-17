@@ -40,7 +40,8 @@ class LiveDashboard:
         self._ticker_thread: threading.Thread | None = None
 
         if _RICH_AVAILABLE:
-            self._console = Console()
+            import sys
+            self._console = Console(force_terminal=sys.stdout.isatty())
         else:
             self._console = None
 
@@ -146,11 +147,11 @@ class LiveDashboard:
             for sym, pos in open_positions.items():
                 direction = str(pos.get("direction", ""))
                 dir_style = "green" if direction == "long" else "red"
-                entry_p = float(pos.get("entry_price", 0))
-                size_usd = float(pos.get("size_usd", 0))
-                tp_price = float(pos.get("tp_price", 0))
-                sl_price = float(pos.get("sl_price", 0))
-                upnl = float(pos.get("unrealized_pnl", 0))
+                entry_p = float(pos.get("entry_price") or 0)
+                size_usd = float(pos.get("size_usd") or 0)
+                tp_price = float(pos.get("tp_price") or 0)
+                sl_price = float(pos.get("sl_price") or 0)
+                upnl = float(pos.get("unrealized_pnl") or 0)
                 upnl_style = "green" if upnl >= 0 else "red"
                 pos_table.add_row(
                     sym,
@@ -216,11 +217,11 @@ class LiveDashboard:
             for sym, pos in open_positions.items():
                 direction = str(pos.get("direction", ""))
                 dir_style = "green" if direction == "long" else "red"
-                entry_p = float(pos.get("entry_price", 0))
-                size_usd = float(pos.get("size_usd", 0))
-                tp_price = float(pos.get("tp_price", 0))
-                sl_price = float(pos.get("sl_price", 0))
-                upnl = float(pos.get("unrealized_pnl", 0))
+                entry_p = float(pos.get("entry_price") or 0)
+                size_usd = float(pos.get("size_usd") or 0)
+                tp_price = float(pos.get("tp_price") or 0)
+                sl_price = float(pos.get("sl_price") or 0)
+                upnl = float(pos.get("unrealized_pnl") or 0)
                 upnl_style = "green" if upnl >= 0 else "red"
                 pos_table.add_row(
                     sym,
@@ -255,8 +256,8 @@ class LiveDashboard:
             sig_table.add_row(
                 str(s.get("symbol", "")),
                 Text(dir_label, style=dir_style),
-                f"{float(s.get('primary_prob', 0)):.3f}",
-                f"{float(s.get('signal_strength', 0)):.3f}",
+                f"{float(s.get('primary_prob') or 0):.3f}",
+                f"{float(s.get('signal_strength') or 0):.3f}",
                 Text(_ACTION_LABELS.get(action, action), style=action_style),
             )
 
@@ -304,11 +305,11 @@ class LiveDashboard:
             print(f"  {'Symbol':<12} {'Dir':<6} {'Entry':>12} {'Volume':>12} {'Unreal P&L':>12} {'TP':>10} {'SL':>10}")
             for sym, pos in open_positions.items():
                 direction = str(pos.get("direction", "")).upper()
-                entry_p = float(pos.get("entry_price", 0))
-                size_usd = float(pos.get("size_usd", 0))
-                tp_price = float(pos.get("tp_price", 0))
-                sl_price = float(pos.get("sl_price", 0))
-                upnl = float(pos.get("unrealized_pnl", 0))
+                entry_p = float(pos.get("entry_price") or 0)
+                size_usd = float(pos.get("size_usd") or 0)
+                tp_price = float(pos.get("tp_price") or 0)
+                sl_price = float(pos.get("sl_price") or 0)
+                upnl = float(pos.get("unrealized_pnl") or 0)
                 print(f"  {sym:<12} {direction:<6} ${entry_p:>10,.4f} ${size_usd:>10,.2f} {upnl:>+11.2f} ${tp_price:>8,.4f} ${sl_price:>8,.4f}")
         else:
             print("  (no open positions)")

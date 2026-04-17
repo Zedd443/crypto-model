@@ -14,6 +14,13 @@
    To reopen: add `### ISSUE-XXX-REOPEN (date)`. Never delete or overwrite old entries.
 7. **Check Anti-Patterns section below before proposing any architectural change.** If a proposal matches an anti-pattern, it was already evaluated and rejected — do not re-propose without new evidence.
 
+## Python Environment
+- **Virtual env**: `D:\Workspace\AI\crypto_model\.venv\Scripts\python.exe`
+- **Run pipeline**: `.venv/Scripts/python.exe -m src.pipeline.run_pipeline --stage <N>`
+- **Run stage 8 (live)**: `nohup .venv/Scripts/python.exe -m src.pipeline.run_pipeline --stage 8 >> logs/stage_08_live.log 2>&1 &`
+- System `python` (Git bash default) is Python 3.11 from `C:\Program Files\Python311` — **no project deps installed there**.
+- `conda base` also lacks project deps. Always use `.venv`.
+
 ## Core Conventions
 - **XGBoost is the PRIMARY model.** LightGBM is additive only, never a replacement.
 - **No negative `.shift()` on features.** Negative shifts are only permitted on targets.
@@ -70,8 +77,8 @@ At end of EVERY session, **append** to DECISIONS.md — do NOT edit existing ent
   - DA ≈ majority class rate = model has no signal.
 - **Test period = last 3 months of available data. Val = 3 months before that. Train = rest.**
 - **Update dates in `config/base.yaml` before each retrain:**
-  - Current (as of 2026-04-03): train_end=2024-06-30, val_end=2024-09-30, test_start=2024-10-01 (STALE)
-  - Recommended next: train_end=2025-09-30, val_end=2025-12-31, test_start=2026-01-01
+  - Current (as of 2026-04-12): train_end=2025-09-30, val_end=2025-12-31, test_start=2026-01-01
+  - Next retrain: advance train_end to 2026-03-31, val_end=2026-06-30, test_start=2026-07-01
 - Backtest must filter signals to `>= test_start`. First trade in trade_log must be >= test_start.
 
 ## Live Trading (Stage 8)

@@ -33,7 +33,12 @@ class PurgedTimeSeriesSplit(BaseCrossValidator):
             # purge: remove train samples where t1 > test_start_time
             if groups is not None and hasattr(X, "index"):
                 test_start_time = X.index[test_start]
-                mask = pd.Series(groups).values[:train_end] <= test_start_time
+                g_vals = pd.DatetimeIndex(pd.Series(groups).values[:train_end])
+                if g_vals.tz is None and test_start_time.tzinfo is not None:
+                    g_vals = g_vals.tz_localize("UTC")
+                elif g_vals.tz is not None and test_start_time.tzinfo is None:
+                    test_start_time = test_start_time.tz_localize("UTC")
+                mask = g_vals <= test_start_time
                 train_idx = train_idx[mask]
 
             if self.val_start_date is not None and hasattr(X, "index"):

@@ -4,15 +4,13 @@ from src.utils.logger import get_logger
 
 logger = get_logger("onchain_merger")
 
-ONCHAIN_COLS = ["NVT", "SOPR", "exchange_flow"]
-
 
 def merge_onchain_to_index(
     master_index: pd.DatetimeIndex,
     fear_greed_df: pd.DataFrame | None,
-    onchain_df: pd.DataFrame,
     cfg: DictConfig,
 ) -> pd.DataFrame:
+    # Only fear & greed is available — coinmetrics data (NVT/SOPR/exchange_flow) never existed
     result = pd.DataFrame(index=master_index)
 
     # Fear & greed: 1-day lag then ffill to intraday
@@ -47,28 +45,5 @@ def merge_onchain_to_index(
         logger.warning("Fear & greed not available — columns will be NaN")
         result["fear_greed_value"] = float("nan")
         result["fear_greed_zscore"] = float("nan")
-
-    # Onchain (if available)
-    if onchain_df is not None and not onchain_df.empty:
-        onchain_df = onchain_df.copy()
-        onchain_df.index = onchain_df.index.tz_localize("UTC") if onchain_df.index.tz is None else onchain_df.index.tz_convert("UTC")
-
-        onchain_reset = onchain_df.reset_index().rename(columns={"index": "timestamp"})
-        onchain_reset = onchain_reset.sort_values("timestamp")
-
-        master_reset = pd.DataFrame({"timestamp": master_index})
-        merged = pd.merge_asof(master_reset, onchain_reset, on="timestamp", direction="backward")
-        merged = merged.set_index("timestamp")
-
-        for col in ONCHAIN_COLS:
-            # Check case-insensitive match
-            match = next((c for c in onchain_df.columns if c.lower() == col.lower()), None)
-            if match:
-                result[f"onchain_{col.lower()}"] = merged[match].ffill()
-                logger.debug(f"Onchain column '{match}' merged as 'onchain_{col.lower()}'")
-            else:
-                logger.debug(f"Onchain column '{col}' not found in data")
-    else:
-        logger.info("No onchain data available — skipping onchain features")
 
     return result

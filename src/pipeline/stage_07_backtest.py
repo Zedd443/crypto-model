@@ -33,7 +33,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     all_symbols = get_symbols(cfg)
     if symbol_filter:
-        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) == symbol_filter]
+        _sf = set(symbol_filter) if isinstance(symbol_filter, list) else {symbol_filter}
+        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) in _sf]
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
     checkpoints_dir = Path(cfg.data.checkpoints_dir)

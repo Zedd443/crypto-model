@@ -49,18 +49,19 @@ def _label_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path) -> 
         # Count fee-reclassified bars (tp_level < round_trip_cost_pct → reclassified to neutral)
         fee_reclassified = 0
         if "tp_level" in labels_df.columns:
-            cost = 0.006  # default; exact value comes from config but unavailable in worker
+            cost = float(cfg.labels.get("round_trip_cost_pct", 0.006))
             fee_reclassified = int((
-                (labels_df["label"] == 0) &
-                (labels_df.get("original_label", labels_df["label"]) == 1) |
-                ((labels_df["tp_level"] < cost) & (labels_df["label"] == 0))
+                (labels_df["label"] == 0) & (
+                    (labels_df.get("original_label", labels_df["label"]) == 1) |
+                    (labels_df["tp_level"] < cost)
+                )
             ).sum())
 
         logger.info(f"{symbol}: {n_total} labels — long={n_long}, short={n_short}, neutral={n_neutral}")
         return symbol, {
             "n_long": n_long, "n_short": n_short, "n_neutral": n_neutral,
             "pct_neutral": pct_neutral, "fee_reclassified": fee_reclassified,
-        }
+        }, None
 
     except Exception as e:
         import traceback
@@ -80,7 +81,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     all_symbols = get_symbols(cfg)
     if symbol_filter:
-        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) == symbol_filter]
+        _sf = set(symbol_filter) if isinstance(symbol_filter, list) else {symbol_filter}
+        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) in _sf]
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
     checkpoints_dir = Path(cfg.data.checkpoints_dir)

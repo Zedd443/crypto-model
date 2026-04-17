@@ -31,6 +31,11 @@ features:
   spread_window: 20                            # bid-ask spread proxy rolling window (bars)
   funding_zscore_window: 672                   # funding rate z-score window (~7 days of 15m bars)
   funding_percentile_window: 2880              # funding percentile rank window (~30 days)
+  oi_zscore_window: 96                         # open interest z-score window (96 × 15m = 24h)
+  oi_change_windows: [4, 16, 96]              # OI change windows: 1h, 4h, 24h in 15m bars
+  ls_zscore_window: 96                         # long/short ratio z-score window (24h)
+  taker_zscore_window: 96                      # taker buy/sell ratio z-score window (24h)
+  positioning_extreme_zscore: 2.0             # z-score threshold for OI/LS/taker extreme flags
   btc_corr_window: 20                          # rolling BTC correlation window (bars)
   granger_window: 20                           # Granger causality test window (bars)
   perm_entropy_window: 100                     # permutation entropy window — measures randomness
@@ -54,7 +59,7 @@ labels:
   vol_lookback: 20                             # ATR lookback window for barrier sizing
   max_hold_bars: 32                            # time barrier — exit after 32 bars (8h) if no hit
   fee_adjust_labels: true                      # reclassify marginal TP hits below round-trip cost as neutral
-  round_trip_cost_pct: 0.006                   # total round-trip cost: 2×0.002 slippage + 0.001 fee each side
+  round_trip_cost_pct: 0.003                   # total round-trip cost: 2×0.001 fee (Binance FAPI taker) + 2×0.0005 slippage
   h1_rolling_median_window: 480                # 1h volume median window for liquidity filter
   weight_clip_min: 0.1                         # minimum sample weight after clipping
   weight_clip_max: 3.0                         # maximum sample weight after clipping
@@ -83,9 +88,8 @@ model:
   xgb_early_stopping_rounds: 50               # stop if no improvement for 50 rounds
   cv_n_splits: 8                               # number of purged time-series CV folds (was 5)
   embargo_pct: 0.02                            # fraction of data embargoed between train/val folds (was 0.01)
-  embargo_bars_min: 192                        # minimum embargo gap in bars — 192×15m = 48h (was 50)
+  embargo_bars_min: 96                         # minimum embargo gap in bars — 96×15m = 24h (was 192/48h; reduced for CVaR tail sample count)
   optuna_n_trials: 20                          # hyperparameter search trials per symbol (faster with better objective)
-  optuna_n_trials_wfo: 5                      # trials for walk-forward optimisation (dead code — unused)
   optuna_patience: 5                          # early-stop Optuna if no improvement after N trials
   objective_da_weight: 0.2                     # weight of directional accuracy in Optuna objective (was 0.4)
   objective_ic_weight: 0.3                     # weight of information coefficient in objective
@@ -116,7 +120,6 @@ model:
   tier_A_pbo_max: 0.40                         # tier A: maximum probability of backtest overfitting
   tier_A_sharpe_wfo_min: 0.5                   # tier A: minimum Sharpe on walk-forward windows
   tier_A_adversarial_auc_max: 0.60             # tier A: adversarial AUC must be below this (no drift)
-  tier_A_leverage_default: 2                   # tier A default leverage
   tier_A_leverage_max: 3                       # tier A maximum leverage
   tier_B_da_min: 0.51                          # tier B: minimum directional accuracy (lower bar)
   tier_B_leverage_max: 1                       # tier B: no leverage (1× only)
@@ -161,8 +164,8 @@ backtest:
   limit_requote_seconds: 15                    # wait N seconds before requoting a stale limit order
   limit_skip_seconds: 30                       # cancel limit order and skip if unfilled after N seconds
   partial_fill_min_ratio: 0.90                 # accept partial fill only if at least 90% filled
-  sl_atr_mult: 1.0                             # stop-loss distance in ATR multiples — matches labels (was 1.5)
-  tp_atr_mult: 2.0                             # take-profit distance in ATR multiples — matches labels (was 2.5)
+  sl_atr_mult: 1.0                             # stop-loss distance in ATR multiples — matches labels
+  tp_atr_mult: 2.0                             # take-profit distance in ATR multiples — matches labels
   trailing_trigger_pct: 0.005                  # activate trailing stop after 0.5% favourable move
   trailing_atr_mult: 1.0                       # trailing stop distance in ATR multiples
   funding_skip_net_pnl_threshold: 0.003        # skip entry if projected funding cost exceeds net PnL
@@ -185,8 +188,8 @@ growth_gate:
   # ── KONTROL UTAMA — ubah bagian ini saja ────────────────────────────
   max_open_positions: 2                        # max posisi terbuka bersamaan (0 = ikuti tier)
   fixed_leverage: 2                            # leverage tetap semua posisi (0 = ikuti tier)
-  tp_fixed_pct: 0.0                            # TP fixed pct disabled — use ATR-based TP matching training labels (tp_atr_mult=2.5)
-  sl_fixed_pct: 0.0                            # SL fixed pct disabled — use ATR-based SL matching training labels (sl_atr_mult=1.5)
+  tp_fixed_pct: 0.0                            # TP fixed pct disabled — use ATR-based TP matching training labels (tp_atr_mult=2.0)
+  sl_fixed_pct: 0.0                            # SL fixed pct disabled — use ATR-based SL matching training labels (sl_atr_mult=1.0)
   # ─────────────────────────────────────────────────────────────────────
 
   tiers:                                       # symbol dan leverage per tier (hanya aktif jika fixed_leverage=0)
@@ -200,6 +203,16 @@ growth_gate:
       max_symbols: 6                           # trade up to 6 symbols
       leverage_a_max: 3
       leverage_b_max: 1                        # tier B models: 1× leverage only
+
+htf_models:
+  enabled: true                              # train 4h/1d XGBoost models and inject predictions into 15m features
+  n_estimators: 300                          # max trees (early stopping may use fewer)
+  max_depth: 4                               # shallow — limited data on 1d
+  learning_rate: 0.05
+  early_stopping_rounds: 30
+  min_train_bars:
+    "4h": 200                                # ~33 days of 4h bars minimum
+    "1d": 100                                # ~100 days of daily bars minimum
 
 monitoring:
   psi_minor_threshold: 0.10                   # PSI above this → log warning (minor drift)

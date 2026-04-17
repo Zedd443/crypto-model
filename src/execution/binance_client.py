@@ -2,10 +2,13 @@ import hashlib
 import hmac
 import os
 import time
+import warnings
 from urllib.parse import urlencode
 
 import pandas as pd
 import requests
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 from src.utils.logger import get_logger
 
@@ -32,13 +35,17 @@ class BinanceClient:
         if not self._api_key:
             logger.warning(f"No API key found for mode={mode} — check .env (BINANCE_{mode}_API_KEY)")
 
-        self._session = requests.Session()
-        # Only set the API key header — do NOT set Content-Type here.
-        # POST endpoints require application/x-www-form-urlencoded; requests sets
-        # the correct Content-Type automatically based on whether data= or params= is used.
-        self._session.headers.update({
-            "X-MBX-APIKEY": self._api_key,
-        })
+        # Build bypass-aware session: connects to real Binance IP (resolved via dnspython)
+        # with correct SNI, bypassing Internet Positif DNS hijacking transparently.
+        try:
+            from urllib.parse import urlparse
+            from src.data.market_data_fetcher import _make_bypass_session
+            _hostname = urlparse(self._base_url).hostname
+            self._session = _make_bypass_session(_hostname)
+        except Exception:
+            self._session = requests.Session()
+        # API key header — do NOT set Content-Type here (requests sets it from data= vs params=)
+        self._session.headers.update({"X-MBX-APIKEY": self._api_key})
         self._mode = mode.upper()
         # Cache for symbol exchange info (step size, max qty, min notional, tick size)
         self._qty_step_cache: dict[str, float] = {}
@@ -73,8 +80,11 @@ class BinanceClient:
 
         while True:
             try:
-                resp = self._session.request(method, url, params=params if method == "GET" else None,
-                                             data=params if method != "GET" else None)
+                resp = self._session.request(
+                    method, url,
+                    params=params if method == "GET" else None,
+                    data=params if method != "GET" else None,
+                )
             except requests.RequestException as exc:
                 logger.error(f"Request error {path}: {exc}")
                 raise

@@ -8,6 +8,7 @@ from src.utils.time_utils import assert_no_future_leakage
 from src.features.technical import build_technical_features
 from src.features.microstructure import build_microstructure_features
 from src.features.funding_rates import build_funding_features
+from src.features.market_positioning import build_market_positioning_features
 from src.features.fracdiff import fit_and_save_d_values, load_d_values, apply_fracdiff_transform
 from src.features.regime import (
     fit_hmm, get_regime_probs, label_regime_states,
@@ -63,13 +64,13 @@ def build_features_for_symbol(
     btc_df,
     cfg,
     train_end_date: str,
+    models_dir=None,
 ) -> pd.DataFrame:
 
     train_end = pd.Timestamp(train_end_date, tz="UTC")
     checkpoints_dir = Path(cfg.data.checkpoints_dir)
     hmm_dir = checkpoints_dir / "hmm" / symbol
     fracdiff_cache = checkpoints_dir / "fracdiff"
-    is_train_period = df_15m.index.max() <= train_end
 
     # 1. Technical features on 15m
     logger.info(f"{symbol}: computing technical features")
@@ -87,6 +88,27 @@ def build_features_for_symbol(
         tech_1d = build_technical_features(df_1d, cfg)
         all_features = _merge_htf(all_features, tech_1d, "1d", cfg)
 
+    # 2b. Inject HTF model predictions (4h, 1d) as features
+    # These are trained separately in stage_04b and forward-filled to 15m index.
+    # Leakage-safe: predictions use shift(1) inside _build_htf_features, and ffill is
+    # bounded by htf_ffill_limits (same as HTF technical features above).
+    if models_dir is not None:
+        _models_dir = Path(models_dir)
+        for _tf, _df_htf in [("4h", df_4h), ("1d", df_1d)]:
+            _htf_model_path = _models_dir / f"{symbol}_{_tf}_htf_model.json"
+            if _df_htf is not None and _htf_model_path.exists():
+                try:
+                    from src.models.htf_model import load_htf_model, predict_htf_proba
+                    _htf_model, _htf_cal, _htf_feat_names = load_htf_model(symbol, _tf, _models_dir)
+                    _htf_pred = predict_htf_proba(_htf_model, _htf_cal, _htf_feat_names, _df_htf, _tf)
+                    # Reindex to 15m with bounded ffill — same limits as HTF technical features
+                    _ffill_limit = cfg.features.htf_ffill_limits.get(_tf, 4)
+                    _htf_pred_aligned = _htf_pred.reindex(all_features.index, method="ffill", limit=_ffill_limit)
+                    all_features = pd.concat([all_features, _htf_pred_aligned], axis=1)
+                    logger.info(f"{symbol}: injected htf_pred_{_tf}")
+                except Exception as _e:
+                    logger.warning(f"{symbol}: htf_pred_{_tf} injection failed — {_e}")
+
     # 3. Microstructure on 15m
     logger.info(f"{symbol}: computing microstructure features")
     micro = build_microstructure_features(df_15m, cfg)
@@ -101,8 +123,16 @@ def build_features_for_symbol(
     # Global shift(1) at step 9 makes these fully backward-looking at bar t
     if btc_df is not None and symbol != "BTCUSDT":
         btc_ret = np.log(btc_df["close"] / btc_df["close"].shift(1))
-        for lag in [1, 2, 3, 4]:
-            all_features[f"btc_lag_{lag}"] = btc_ret.reindex(df_15m.index).shift(lag)
+        btc_ret_aligned = btc_ret.reindex(df_15m.index)
+        btc_lag_cols = {f"btc_lag_{lag}": btc_ret_aligned.shift(lag) for lag in [1, 2, 3, 4]}
+        all_features = pd.concat([all_features, pd.DataFrame(btc_lag_cols, index=df_15m.index)], axis=1)
+
+    # 4c. Market positioning features (OI, LS ratio, taker ratio)
+    # Reindexed via ffill from 15m FAPI data — no look-ahead (all backward-looking)
+    raw_dir = Path(cfg.data.raw_dir)
+    positioning = build_market_positioning_features(symbol, df_15m.index, raw_dir, cfg)
+    if not positioning.empty:
+        all_features = pd.concat([all_features, positioning], axis=1)
 
     # 5. HMM regime features
     logger.info(f"{symbol}: computing regime features")
@@ -113,14 +143,21 @@ def build_features_for_symbol(
         hmm_model, scaler, state_labels = load_hmm_artifacts(hmm_dir)
         regime_probs = get_regime_probs(hmm_model, hmm_input, scaler)
     elif len(hmm_input) >= int(cfg.regime.hmm_burnin_bars):
-        # Fit on train portion
+        # Fit on train portion only — never fall back to full series (would leak val/test)
         train_hmm_input = hmm_input[hmm_input.index <= train_end]
         if len(train_hmm_input) < int(cfg.regime.hmm_burnin_bars):
-            train_hmm_input = hmm_input  # fallback
-        hmm_model, scaler = fit_hmm(train_hmm_input, int(cfg.regime.n_states), cfg)
-        state_labels = label_regime_states(hmm_model, train_hmm_input)
-        save_hmm_artifacts(hmm_model, scaler, state_labels, hmm_dir)
-        regime_probs = get_regime_probs(hmm_model, hmm_input, scaler)
+            # Insufficient train bars — skip HMM rather than fit on future data (leakage)
+            logger.warning(f"{symbol}: insufficient train bars for HMM ({len(train_hmm_input)} < {cfg.regime.hmm_burnin_bars}), emitting NaN regime probs")
+            n_states = int(cfg.regime.n_states)
+            regime_probs = pd.DataFrame(
+                np.nan, index=hmm_input.index,
+                columns=[f"regime_prob_{i}" for i in range(n_states)]
+            )
+        else:
+            hmm_model, scaler = fit_hmm(train_hmm_input, int(cfg.regime.n_states), cfg)
+            state_labels = label_regime_states(hmm_model, train_hmm_input)
+            save_hmm_artifacts(hmm_model, scaler, state_labels, hmm_dir)
+            regime_probs = get_regime_probs(hmm_model, hmm_input, scaler)
     else:
         n_states = int(cfg.regime.n_states)
         regime_probs = pd.DataFrame(
@@ -148,19 +185,25 @@ def build_features_for_symbol(
         d_step = float(cfg.features.fracdiff_d_step)
         threshold = float(cfg.features.fracdiff_threshold)
         d_values = load_d_values(symbol, "15m", fracdiff_cache)
-        if not d_values and is_train_period:
+        if not d_values:
+            # Fit on train-only subset — leakage-safe regardless of whether full series spans beyond train_end
             train_df_for_fracdiff = all_features[all_features.index <= train_end]
-            d_values = fit_and_save_d_values(train_df_for_fracdiff, price_vol_cols, symbol, "15m", fracdiff_cache)
+            if len(train_df_for_fracdiff) >= 100:
+                d_values = fit_and_save_d_values(train_df_for_fracdiff, price_vol_cols, symbol, "15m", fracdiff_cache)
+            else:
+                logger.warning(f"{symbol}: insufficient train bars for fracdiff ({len(train_df_for_fracdiff)}), skipping")
         if d_values:
             all_features = apply_fracdiff_transform(all_features, d_values)
 
     # 7. Merge macro and onchain panels (forward-fill alignment already done in stage 1)
+    # limit=2880 = 30 days of 15m bars — prevents stale monthly releases propagating indefinitely
+    _macro_ffill_limit = 2880
     if macro_panel is not None and len(macro_panel) > 0:
-        macro_aligned = macro_panel.reindex(all_features.index, method="ffill")
+        macro_aligned = macro_panel.reindex(all_features.index, method="ffill", limit=_macro_ffill_limit)
         all_features = pd.concat([all_features, macro_aligned], axis=1)
 
     if onchain_panel is not None and len(onchain_panel) > 0:
-        onchain_aligned = onchain_panel.reindex(all_features.index, method="ffill")
+        onchain_aligned = onchain_panel.reindex(all_features.index, method="ffill", limit=_macro_ffill_limit)
         all_features = pd.concat([all_features, onchain_aligned], axis=1)
 
     # 8. Mark warmup bars — use concat to avoid fragmenting an already-wide DataFrame
@@ -192,6 +235,7 @@ def build_all_features(
     onchain_panel: pd.DataFrame,
     cfg,
     train_end_date: str,
+    models_dir=None,
 ) -> dict:
     # symbols_dict: {symbol: df_15m}
     # timeframe_dicts: {symbol: {tf: df}}
@@ -211,7 +255,8 @@ def build_all_features(
         try:
             feat_df = build_features_for_symbol(
                 symbol, df_15m, df_1h, df_4h, df_1d,
-                macro_panel, onchain_panel, btc_df, cfg, train_end_date
+                macro_panel, onchain_panel, btc_df, cfg, train_end_date,
+                models_dir=models_dir,
             )
             return symbol, feat_df, None
         except Exception as e:

@@ -97,9 +97,24 @@ def _generate_symbol_signals(
             ofi = features_df.get("ofi_20", pd.Series(0.0, index=features_df.index))
 
             from src.models.meta_labeler import build_meta_features
+            spread_series = (
+                features_df.get("spread_proxy_20", pd.Series(np.nan, index=features_df.index))
+            )
+            atr_series = (
+                features_df.get("atr_14", pd.Series(np.nan, index=features_df.index))
+            )
             meta_X = build_meta_features(
-                raw_proba, regime_probs, rv, vol_z, ofi
+                raw_proba, regime_probs, rv, vol_z, ofi,
+                spread_series=spread_series,
+                atr_series=atr_series,
             ).fillna(0.0)
+            # Align columns to what meta model was trained on (prevents shape mismatch)
+            if meta_entry.get("feature_names"):
+                expected_cols = meta_entry["feature_names"]
+                for col in expected_cols:
+                    if col not in meta_X.columns:
+                        meta_X[col] = 0.0
+                meta_X = meta_X[expected_cols]
             meta_raw = meta_model.predict_proba(meta_X.values)[:, 1]
             meta_proba_series = pd.Series(meta_raw, index=features_df.index, name="meta_prob")
         except Exception as e:
@@ -179,7 +194,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     all_symbols = get_symbols(cfg)
     if symbol_filter:
-        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) == symbol_filter]
+        _sf = set(symbol_filter) if isinstance(symbol_filter, list) else {symbol_filter}
+        all_symbols = [s for s in all_symbols if s.get("name", s.get("symbol")) in _sf]
     symbol_names = [s.get("name", s.get("symbol")) for s in all_symbols]
 
     checkpoints_dir = Path(cfg.data.checkpoints_dir)
