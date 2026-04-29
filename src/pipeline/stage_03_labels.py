@@ -35,7 +35,7 @@ def _label_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path) -> 
 
         # Sample weights
         return_weights = compute_return_weights(df["close"], labels_df, cfg)
-        uniqueness = compute_label_uniqueness(labels_df, len(df))
+        uniqueness = compute_label_uniqueness(labels_df)
         weights = combine_weights(return_weights, uniqueness)
 
         _save_labels(labels_df, weights, symbol, labels_dir)
@@ -46,15 +46,17 @@ def _label_symbol(symbol: str, cfg, checkpoints_dir: Path, labels_dir: Path) -> 
         n_total = len(labels_df)
         pct_neutral = round(n_neutral / max(n_total, 1), 4)
 
-        # Count fee-reclassified bars (tp_level < round_trip_cost_pct → reclassified to neutral)
+        # Count fee-reclassified bars: neutral bars where tp_level < fee threshold.
+        # These are bars that were TP hits but reclassified to 0 by label_all_bars fee-adjust.
+        # Original label is not stored separately — but only TP hits near the clip floor
+        # have tp_level < threshold after reclassification, so this approximation is tight.
         fee_reclassified = 0
-        if "tp_level" in labels_df.columns:
-            cost = float(cfg.labels.get("round_trip_cost_pct", 0.006))
+        if "tp_level" in labels_df.columns and getattr(cfg.labels, "fee_adjust_labels", False):
+            cost = float(getattr(cfg.labels, "round_trip_cost_pct", 0.003))
+            multiple = float(getattr(cfg.labels, "dead_zone_cost_multiple", 1.0))
+            threshold = cost * multiple
             fee_reclassified = int((
-                (labels_df["label"] == 0) & (
-                    (labels_df.get("original_label", labels_df["label"]) == 1) |
-                    (labels_df["tp_level"] < cost)
-                )
+                (labels_df["label"] == 0) & (labels_df["tp_level"] < threshold)
             ).sum())
 
         logger.info(f"{symbol}: {n_total} labels — long={n_long}, short={n_short}, neutral={n_neutral}")

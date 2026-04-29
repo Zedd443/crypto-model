@@ -1,7 +1,7 @@
+import os
 import numpy as np
 import pandas as pd
 import pickle
-import json
 from pathlib import Path
 from scipy.stats import spearmanr
 from sklearn.isotonic import IsotonicRegression
@@ -61,12 +61,10 @@ def build_xgb_params(trial_or_dict, cfg) -> dict:
         params["scale_pos_weight"] = trial_or_dict["scale_pos_weight"]
 
     # Fixed architecture params — device auto-detected via env var or config
-    import os
     device = os.environ.get("XGB_DEVICE", getattr(getattr(cfg, "model", cfg), "xgb_device", "cpu"))
     params.update({
         "objective": "binary:logistic",
         "eval_metric": "logloss",
-        "use_label_encoder": False,
         "tree_method": "hist",
         "device": device,
         "random_state": 42,
@@ -207,6 +205,7 @@ def tune_hyperparams(
 
         if not fold_scores:
             return 0.0
+        trial.set_user_attr("fold_scores", fold_scores)
         return float(np.mean(fold_scores))
 
     def _no_improvement_callback(study, trial):
@@ -217,9 +216,12 @@ def tune_hyperparams(
             if all(v <= recent[0] for v in recent[1:]):
                 study.stop()
 
+    # n_startup_trials: pure random exploration before TPE switches to exploitation.
+    # Ensures warm-start doesn't dominate from trial 1 — forces genuine search first.
+    n_startup = max(5, n_trials // 4)
     study = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=1),
+        sampler=optuna.samplers.TPESampler(seed=1, n_startup_trials=n_startup),
         pruner=optuna.pruners.HyperbandPruner(),
     )
     if warm_start_params:
@@ -234,6 +236,14 @@ def tune_hyperparams(
         f"Optuna best score: {study.best_value:.4f}, params: {best_params} "
         f"[n_estimators={best_params.get('n_estimators','?')} — actual trees determined by early stopping]"
     )
+    # Expose per-trial per-fold score matrix for CSCV PBO computation downstream.
+    # Each completed trial stores fold_scores as user_attr set inside objective.
+    # We re-attach them here so the caller can build the (K_trials × N_folds) matrix.
+    trial_fold_scores = []
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.COMPLETE and "fold_scores" in t.user_attrs:
+            trial_fold_scores.append(t.user_attrs["fold_scores"])
+    best_params["_trial_fold_scores"] = trial_fold_scores
     return best_params
 
 
@@ -367,9 +377,10 @@ def compute_oof_predictions(
 
 def compute_shap_importance(model, X_train: pd.DataFrame, top_k: int = 20) -> pd.Series:
     explainer = shap.TreeExplainer(model)
-    # Use sample for speed if large
+    # Sample from the TAIL (most recent bars) — regime stationarity assumption means
+    # recent data better represents the distribution the final model will face at inference.
     n_sample = min(len(X_train), 2000)
-    X_sample = X_train.iloc[:n_sample] if hasattr(X_train, "iloc") else X_train[:n_sample]
+    X_sample = X_train.iloc[-n_sample:] if hasattr(X_train, "iloc") else X_train[-n_sample:]
     shap_values = explainer.shap_values(X_sample.values if hasattr(X_sample, "values") else X_sample)
     # For binary classifier shap returns array of shape (n, features)
     if isinstance(shap_values, list):

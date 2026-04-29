@@ -18,10 +18,11 @@ from src.features.regime import (
 
 logger = get_logger("feature_pipeline")
 
-# Columns to apply fracdiff (price/vol levels that may be non-stationary)
+# Columns to apply fracdiff — must match columns actually produced by build_technical_features.
+# Rolling-mean closes (close_N_mean) are never produced; the pipeline uses log-return rolling
+# stats (log_ret_N_mean) which are already stationary. Only OBV and VWAP are price-level
+# accumulators that benefit from fractional differencing.
 _FRACDIFF_COLS = [
-    "close_5_mean", "close_10_mean", "close_20_mean",
-    "close_50_mean", "close_100_mean", "close_200_mean",
     "obv", "vwap_20",
 ]
 
@@ -41,7 +42,7 @@ def _build_hmm_features_df(df: pd.DataFrame) -> pd.DataFrame:
     # Features fed to HMM: log_return, realized_vol_20, volume_zscore
     log_ret = np.log(df["close"] / df["close"].shift(1))
     r2 = log_ret ** 2
-    realized_vol = r2.rolling(20, min_periods=20).mean().apply(np.sqrt)
+    realized_vol = np.sqrt(r2.rolling(20, min_periods=20).mean())
     vol_mean = df["volume"].rolling(20, min_periods=20).mean()
     vol_std = df["volume"].rolling(20, min_periods=20).std()
     volume_zscore = (df["volume"] - vol_mean) / (vol_std + 1e-9)
@@ -64,7 +65,6 @@ def build_features_for_symbol(
     btc_df,
     cfg,
     train_end_date: str,
-    models_dir=None,
 ) -> pd.DataFrame:
 
     train_end = pd.Timestamp(train_end_date, tz="UTC")
@@ -87,27 +87,6 @@ def build_features_for_symbol(
     if df_1d is not None:
         tech_1d = build_technical_features(df_1d, cfg)
         all_features = _merge_htf(all_features, tech_1d, "1d", cfg)
-
-    # 2b. Inject HTF model predictions (4h, 1d) as features
-    # These are trained separately in stage_04b and forward-filled to 15m index.
-    # Leakage-safe: predictions use shift(1) inside _build_htf_features, and ffill is
-    # bounded by htf_ffill_limits (same as HTF technical features above).
-    if models_dir is not None:
-        _models_dir = Path(models_dir)
-        for _tf, _df_htf in [("4h", df_4h), ("1d", df_1d)]:
-            _htf_model_path = _models_dir / f"{symbol}_{_tf}_htf_model.json"
-            if _df_htf is not None and _htf_model_path.exists():
-                try:
-                    from src.models.htf_model import load_htf_model, predict_htf_proba
-                    _htf_model, _htf_cal, _htf_feat_names = load_htf_model(symbol, _tf, _models_dir)
-                    _htf_pred = predict_htf_proba(_htf_model, _htf_cal, _htf_feat_names, _df_htf, _tf)
-                    # Reindex to 15m with bounded ffill — same limits as HTF technical features
-                    _ffill_limit = cfg.features.htf_ffill_limits.get(_tf, 4)
-                    _htf_pred_aligned = _htf_pred.reindex(all_features.index, method="ffill", limit=_ffill_limit)
-                    all_features = pd.concat([all_features, _htf_pred_aligned], axis=1)
-                    logger.info(f"{symbol}: injected htf_pred_{_tf}")
-                except Exception as _e:
-                    logger.warning(f"{symbol}: htf_pred_{_tf} injection failed — {_e}")
 
     # 3. Microstructure on 15m
     logger.info(f"{symbol}: computing microstructure features")
@@ -167,11 +146,12 @@ def build_features_for_symbol(
 
     # BOCPD changepoint distance
     bocpd_model = fit_bocpd(hmm_input["log_return"][hmm_input.index <= train_end], cfg)
-    cp_dist = get_changepoint_distance(hmm_input["log_return"], bocpd_model)
+    cp_dist = get_changepoint_distance(hmm_input["log_return"], bocpd_model, cfg)
 
     # ADX fallback for trend
     if "adx" in all_features.columns:
-        adx_flag = apply_adx_fallback(all_features["adx"])
+        adx_threshold = float(getattr(cfg.regime, 'adx_trend_threshold', 25.0))
+        adx_flag = apply_adx_fallback(all_features["adx"], threshold=adx_threshold)
         all_features = pd.concat([all_features, adx_flag.to_frame()], axis=1)
 
     # Merge regime features
@@ -213,6 +193,9 @@ def build_features_for_symbol(
     all_features = pd.concat([all_features, is_warmup], axis=1)
 
     # Remove duplicate columns before shift (can arise from HTF merge or concat)
+    dup_cols = all_features.columns[all_features.columns.duplicated()].tolist()
+    if dup_cols:
+        logger.warning(f"{symbol}: dropping {len(dup_cols)} duplicate columns: {dup_cols[:10]}")
     all_features = all_features.loc[:, ~all_features.columns.duplicated()]
 
     # 9. SHIFT ALL FEATURES by 1 bar to prevent look-ahead
@@ -227,63 +210,6 @@ def build_features_for_symbol(
     logger.info(f"{symbol}: feature pipeline complete — {all_features.shape[1]} features, {len(all_features)} bars")
     return all_features
 
-
-def build_all_features(
-    symbols_dict: dict,
-    timeframe_dicts: dict,
-    macro_panel: pd.DataFrame,
-    onchain_panel: pd.DataFrame,
-    cfg,
-    train_end_date: str,
-    models_dir=None,
-) -> dict:
-    # symbols_dict: {symbol: df_15m}
-    # timeframe_dicts: {symbol: {tf: df}}
-
-    all_feature_dfs = {}
-
-    # Phase 1: per-symbol features in parallel
-    def _process(symbol):
-        tf_data = timeframe_dicts.get(symbol, {})
-        df_15m = symbols_dict.get(symbol)
-        if df_15m is None:
-            return symbol, None, "No 15m data"
-        df_1h = tf_data.get("1h")
-        df_4h = tf_data.get("4h")
-        df_1d = tf_data.get("1d")
-        btc_df = symbols_dict.get("BTCUSDT") if symbol != "BTCUSDT" else None
-        try:
-            feat_df = build_features_for_symbol(
-                symbol, df_15m, df_1h, df_4h, df_1d,
-                macro_panel, onchain_panel, btc_df, cfg, train_end_date,
-                models_dir=models_dir,
-            )
-            return symbol, feat_df, None
-        except Exception as e:
-            return symbol, None, str(e)
-
-    for symbol in symbols_dict:
-        sym, feat_df, err = _process(symbol)
-        if err:
-            logger.error(f"{sym}: feature pipeline failed — {err}")
-        else:
-            all_feature_dfs[sym] = feat_df
-
-    # Phase 2: cross-sectional features are applied in stage_02_features.py
-    # (requires all symbols loaded, done serially)
-
-    # Phase 3: leakage check
-    train_end = pd.Timestamp(train_end_date, tz="UTC")
-    for symbol, feat_df in all_feature_dfs.items():
-        # Verify no feature col has non-NaN values ahead of bar (warmup rows shifted away)
-        train_feats = feat_df[feat_df.index <= train_end]
-        val_feats = feat_df[feat_df.index > train_end]
-        if len(train_feats) > 0 and len(val_feats) > 0:
-            # Basic sanity: train max < val min in time
-            assert train_feats.index.max() < val_feats.index.min(), \
-                f"Leakage: train/val index overlap for {symbol}"
-
-    return all_feature_dfs
 
 
 def save_feature_manifest(all_feature_cols: dict, manifest_path: Path) -> None:

@@ -36,26 +36,42 @@ features:
   ls_zscore_window: 96                         # long/short ratio z-score window (24h)
   taker_zscore_window: 96                      # taker buy/sell ratio z-score window (24h)
   positioning_extreme_zscore: 2.0             # z-score threshold for OI/LS/taker extreme flags
-  btc_corr_window: 20                          # rolling BTC correlation window (bars)
-  granger_window: 20                           # Granger causality test window (bars)
-  perm_entropy_window: 100                     # permutation entropy window — measures randomness
-  btc_nvt_window: 90                           # BTC NVT ratio smoothing window (days)
-  vix_zscore_days: 60                          # VIX z-score lookback window (days)
   use_chronos: false                           # enable Amazon Chronos time-series embeddings (slow)
+  ema_spans: [9, 21, 50]                       # EMA spans for price-vs-EMA deviation and crossover features
+  supertrend_period: 10                        # ATR period for Supertrend bands
+  supertrend_mult: 3.0                         # ATR multiplier for Supertrend bands
+  stochrsi_period: 14                          # RSI + Stochastic period for StochRSI
+  stochrsi_smooth_k: 3                         # %K smoothing bars for StochRSI
+  williams_r_period: 14                        # lookback period for Williams %R
+  keltner_period: 20                           # EMA period for Keltner Channel midline
+  keltner_mult: 1.5                            # ATR multiplier for Keltner Channel bands
+  squeeze_momentum_period: 12                  # momentum oscillator period for TTM Squeeze
+  vwap_session_hours: [0, 8, 16]              # UTC hours at which session-anchored VWAP resets (matches funding)
+  cmf_window: 20                               # rolling window for Chaikin Money Flow
+  parkinson_vol_windows: [14, 50]             # ATR/Parkinson volatility estimation windows
+  macd_fast: 12                                # MACD fast EMA span
+  macd_slow: 26                                # MACD slow EMA span
+  macd_signal: 9                               # MACD signal line EMA span
+  bb_period: 20                                # Bollinger Band rolling window
+  bb_std_mult: 2.0                             # Bollinger Band standard deviation multiplier
+  adx_period: 14                               # ADX / DI smoothing period (Wilder EMA)
+  atr_periods: [14, 50]                        # ATR/NATR periods computed as features
+  macro_ffill_limit_bars: 2880                 # max bars to forward-fill macro/onchain data (~30 days of 15m)
   fracdiff_threshold: 0.01                     # ADF p-value threshold for fractional differencing
   fracdiff_d_step: 0.1                         # step size when searching for minimum d
   htf_ffill_limits:                            # max bars to forward-fill higher-timeframe features
     "1h": 4                                    # 1h feature stale after 4 × 15m bars
     "4h": 16                                   # 4h feature stale after 16 × 15m bars
     "1d": 96                                   # 1d feature stale after 96 × 15m bars
+  htf_approval_threshold: 0.45                 # HTF approval filter: LONG requires pred >= threshold, SHORT requires pred <= (1-threshold); intentionally loose to avoid over-filtering
 
 labels:
-  tp_atr_mult: 2.0                             # take-profit = ATR × 2.0 (2:1 R:R numerator)
-  sl_atr_mult: 1.0                             # stop-loss = ATR × 1.0 (2:1 R:R denominator)
-  tp_min_pct: 0.015                            # minimum take-profit distance (1.5% of price)
-  tp_max_pct: 0.06                             # maximum take-profit distance (6% of price)
-  sl_min_pct: 0.01                             # minimum stop-loss distance (1%)
-  sl_max_pct: 0.05                             # maximum stop-loss distance (5%)
+  tp_atr_mult: 1.5                             # take-profit = ATR × 1.5 ≈ 1% at median ATR 0.69% (matches live tp_fixed_pct=0.01)
+  sl_atr_mult: 7.0                             # stop-loss = ATR × 7.0 ≈ 5% at median ATR 0.69% (matches live sl_fixed_pct=0.05)
+  tp_min_pct: 0.008                            # minimum take-profit distance (0.8%)
+  tp_max_pct: 0.015                            # maximum take-profit distance (1.5%)
+  sl_min_pct: 0.04                             # minimum stop-loss distance (4%)
+  sl_max_pct: 0.06                             # maximum stop-loss distance (6%)
   vol_lookback: 20                             # ATR lookback window for barrier sizing
   max_hold_bars: 32                            # time barrier — exit after 32 bars (8h) if no hit
   fee_adjust_labels: true                      # reclassify marginal TP hits below round-trip cost as neutral
@@ -71,8 +87,10 @@ regime:
   hmm_n_iter: 100                              # EM iterations for HMM fitting
   hmm_retrain_hours: 6                         # retrain HMM every 6h in live mode (immediate for regime shifts)
   hmm_burnin_bars: 100                         # bars discarded before HMM state assignment
+  adx_trend_threshold: 25.0                   # ADX value above which the market is considered trending
   bocpd_min_size: 50                           # minimum segment size for BOCPD changepoint detection
-  bocpd_penalty: "bic"                         # model selection penalty for BOCPD (BIC/AIC)
+  bocpd_penalty_floor: 5                       # minimum penalty value for BOCPD predict (pen = max(floor, log(n)*mult))
+  bocpd_penalty_mult: 2.0                      # log(n) multiplier for BOCPD penalty
 
 model:
   xgb_device: "cpu"                            # override to "cuda" on Kaggle GPU or set env XGB_DEVICE=cuda
@@ -90,7 +108,7 @@ model:
   embargo_pct: 0.02                            # fraction of data embargoed between train/val folds (was 0.01)
   embargo_bars_min: 96                         # minimum embargo gap in bars — 96×15m = 24h (was 192/48h; reduced for CVaR tail sample count)
   optuna_n_trials: 20                          # hyperparameter search trials per symbol (faster with better objective)
-  optuna_patience: 5                          # early-stop Optuna if no improvement after N trials
+  optuna_patience: 10                         # early-stop Optuna if no improvement after N trials (was 5 — too tight, stopped after warm-start won trial 1)
   objective_da_weight: 0.2                     # weight of directional accuracy in Optuna objective (was 0.4)
   objective_ic_weight: 0.3                     # weight of information coefficient in objective
   objective_sortino_weight: 0.5                 # weight of Calmar-adjusted Sortino in objective (renamed from objective_sharpe_weight)
@@ -110,18 +128,26 @@ model:
   conformal_q_level: 0.85                      # conformal prediction quantile level (was 0.90)
   conformal_width_full: 0.20                   # prediction interval width below this → full position size
   conformal_width_60pct: 0.40                  # width between 0.20–0.40 → 60% position size (above → 30%)
+  # uncertainty_proxy = 1 - 2|p - 0.5| ranges: p=0.55→0.10, p=0.65→0.30, p=0.70→0.40, p=0.75→0.50, p=0.80→0.60
+  uncertainty_proxy_full: 0.30                 # proxy below this → full position size (p > 0.65 confidence)
+  uncertainty_proxy_partial: 0.50             # proxy below this → 60% position size (p > 0.75); above → 30%
   meta_n_estimators: 300                      # meta-labeler max tree count (early stopping may use fewer)
   meta_max_depth: 6                            # meta-labeler max depth (was 4)
   meta_early_stopping_rounds: 10              # patience for meta-labeler early stopping (8-12 features → overfit risk)
   meta_signal_floor: 0.25                     # minimum meta-prob to pass a signal (was 0.1)
-  tier_A_da_min: 0.53                          # tier A: minimum directional accuracy on validation
-  tier_A_da_min_folds: 6                       # tier A: DA threshold must hold in at least N folds
-  tier_A_dsr_min: 0.0                          # tier A: minimum deflated Sharpe ratio
+  # Tier gate — edge-based, not raw DA. With 89% class imbalance post-neutral-drop,
+  # raw DA is dominated by majority baseline; only edge (DA − baseline) carries signal.
+  tier_A_edge_min: 0.03                        # tier A: DA must exceed naive majority baseline by ≥3pp
+  tier_A_edge_min_folds: 5                     # tier A: per-fold edge must hold in at least N of 8 folds
+  tier_A_overfit_ratio_max: 1.8                # tier A: train_logloss / val_logloss ≤ 1.8 (reject severe memorisation)
+  tier_A_fold_quality_min: 0.0                  # tier A: minimum fold_quality_score (fold_consistency × sharpe); currently unused in tier condition
   tier_A_pbo_max: 0.40                         # tier A: maximum probability of backtest overfitting
-  tier_A_sharpe_wfo_min: 0.5                   # tier A: minimum Sharpe on walk-forward windows
+  tier_A_sharpe_wfo_min: 2.0                   # tier A: min pertrade_sharpe_mean (OOF per-trade, net of cost; NOT walk-forward equity Sharpe)
   tier_A_adversarial_auc_max: 0.60             # tier A: adversarial AUC must be below this (no drift)
   tier_A_leverage_max: 3                       # tier A maximum leverage
-  tier_B_da_min: 0.51                          # tier B: minimum directional accuracy (lower bar)
+  tier_A_leverage_default: 2                   # tier A default leverage applied in stage_06 signal sizing
+  tier_B_edge_min: 0.015                       # tier B: minimum edge over naive baseline (lower bar)
+  tier_reject_baseline: 0.80                   # hard reject: pct_positive_val > 0.80 AND edge < tier_B_edge → Tier C
   tier_B_leverage_max: 1                       # tier B: no leverage (1× only)
   fdr_alpha: 0.05                              # false discovery rate threshold for feature selection
   # Kaggle GPU run reference values — applied via OmegaConf.update in notebook.py
@@ -130,7 +156,7 @@ model:
 
 portfolio:
   signal_floor_prob: 0.2                      # minimum signal_strength to enter a trade
-  volume_multiplier: 2.0                       # total volume = wallet × volume_multiplier, split across max_symbols positions
+  volume_multiplier: 2.0                       # volume per posisi = wallet × volume_multiplier (full wallet per slot, sesuai Est Profit.xlsx)
   max_volume_usdt: 0                           # hard cap on total volume in USDT (0 = no cap)
   max_position_size: 0.10                      # maximum single position as fraction of equity
   max_total_margin_pct: 0.80                   # maximum total margin deployed (80% of equity)
@@ -139,6 +165,8 @@ portfolio:
   dead_zone_signal: 0.03                       # prob distance from 0.5 below which signal cancelled (was 0.02)
   cvar_confidence_levels: [0.95, 0.99]         # CVaR confidence levels for tail risk estimation
   cvar_lambda_penalty: 0.5                     # CVaR penalty weight in position sizing
+  cvar_z_score: 2.33                           # z-score for parametric CVaR approximation (99th percentile normal)
+  h4_reduce_scale: 0.5                         # size multiplier when h4 filter flags a conflict (50% reduction)
   dcc_fallback_ewm_span: 60                    # EWM span for correlation when DCC-GARCH unavailable
   correlation_reduce_threshold: 0.85           # reduce second position size if correlation exceeds this
   correlation_skip_threshold: 0.95             # skip entry entirely if correlation exceeds this
@@ -164,8 +192,8 @@ backtest:
   limit_requote_seconds: 15                    # wait N seconds before requoting a stale limit order
   limit_skip_seconds: 30                       # cancel limit order and skip if unfilled after N seconds
   partial_fill_min_ratio: 0.90                 # accept partial fill only if at least 90% filled
-  sl_atr_mult: 1.0                             # stop-loss distance in ATR multiples — matches labels
-  tp_atr_mult: 2.0                             # take-profit distance in ATR multiples — matches labels
+  sl_atr_mult: 7.0                             # stop-loss distance in ATR multiples — matches labels
+  tp_atr_mult: 1.5                             # take-profit distance in ATR multiples — matches labels
   trailing_trigger_pct: 0.005                  # activate trailing stop after 0.5% favourable move
   trailing_atr_mult: 1.0                       # trailing stop distance in ATR multiples
   funding_skip_net_pnl_threshold: 0.003        # skip entry if projected funding cost exceeds net PnL
@@ -186,33 +214,46 @@ growth_gate:
   demo_trades_required: 500                    # minimum demo trades before mainnet is allowed
 
   # ── KONTROL UTAMA — ubah bagian ini saja ────────────────────────────
-  max_open_positions: 2                        # max posisi terbuka bersamaan (0 = ikuti tier)
-  fixed_leverage: 2                            # leverage tetap semua posisi (0 = ikuti tier)
-  tp_fixed_pct: 0.0                            # TP fixed pct disabled — use ATR-based TP matching training labels (tp_atr_mult=2.0)
-  sl_fixed_pct: 0.0                            # SL fixed pct disabled — use ATR-based SL matching training labels (sl_atr_mult=1.0)
+  max_open_positions: 2                        # max posisi terbuka bersamaan
+  fixed_leverage: 10                           # leverage tetap semua posisi (10x, margin kecil per posisi)
+  tp_fixed_pct: 0.01                           # TP = 1% price move per posisi (sesuai Est Profit.xlsx)
+  sl_fixed_pct: 0.05                           # SL = 5% price move (ruang gerak 15m)
+  daily_profit_target_pct: 0.04               # stop buka posisi baru setelah +4% wallet/hari
+  daily_loss_limit_pct: 0.05                  # hard stop setelah -5% wallet/hari
   # ─────────────────────────────────────────────────────────────────────
 
-  tiers:                                       # symbol dan leverage per tier (hanya aktif jika fixed_leverage=0)
-    - max_equity: 150                          # tier 1: equity ≤ $150
-      max_symbols: 2                           # trade up to 2 symbols
-      leverage_a_max: 2                        # tier A models: up to 2× leverage
-    - max_equity: 300                          # tier 2: equity ≤ $300
-      max_symbols: 3                           # trade up to 3 symbols
-      leverage_a_max: 3                        # tier A models: up to 3× leverage
-    - max_equity: 600                          # tier 3: equity ≤ $600
-      max_symbols: 6                           # trade up to 6 symbols
-      leverage_a_max: 3
-      leverage_b_max: 1                        # tier B models: 1× leverage only
+  tiers:                                       # vol_mult per tier (wallet × vol_mult = notional per posisi)
+    - max_equity: 150                          # tier 1: wallet < $150 — konservatif
+      max_symbols: 2
+      vol_mult: 2.0                            # notional = wallet × 2
+      leverage_a_max: 3                        # tier 1: max leverage for tier-A symbols (conservative)
+    - max_equity: 2500                         # tier 2: $150 ≤ wallet < $2500 — growth phase agresif
+      max_symbols: 2
+      vol_mult: 3.0                            # notional = wallet × 3
+      leverage_a_max: 5                        # tier 2: growth phase allows more leverage
+    - max_equity: 999999                       # tier 3: wallet >= $2500 — income phase
+      max_symbols: 2
+      vol_mult: 2.0                            # notional = wallet × 2 (turun lagi)
+      leverage_a_max: 3                        # tier 3: income phase — reduced leverage for capital preservation
 
 htf_models:
-  enabled: true                              # train 4h/1d XGBoost models and inject predictions into 15m features
+  enabled: true                              # train 1h/4h/1d XGBoost approval-filter models (independent of 15m primary)
   n_estimators: 300                          # max trees (early stopping may use fewer)
   max_depth: 4                               # shallow — limited data on 1d
   learning_rate: 0.05
   early_stopping_rounds: 30
+  val_es_ratio: 0.8                          # fraction of val bars used for early stopping (rest = calibration)
+  min_cal_bars: 2                            # minimum calibration bars; cal_split = min(80%*val, val-min_cal_bars)
   min_train_bars:
+    "1h": 500                                # ~21 days of 1h bars minimum
     "4h": 200                                # ~33 days of 4h bars minimum
     "1d": 100                                # ~100 days of daily bars minimum
+  # ATR-based triple-barrier label (on native HTF bars, not resampled from 15m)
+  label_tp_mult: 1.5                         # TP = entry + label_tp_mult × ATR14
+  label_sl_mult: 1.0                         # SL = entry - label_sl_mult × ATR14
+  label_n_bars:                              # look-ahead window per timeframe
+    "4h": 6                                  # 4h × 6 = 24h forward window
+    "1d": 5                                  # 1d × 5 = 1 trading week forward window
 
 monitoring:
   psi_minor_threshold: 0.10                   # PSI above this → log warning (minor drift)
@@ -229,7 +270,7 @@ monitoring:
 
 trading:
   mode: "DEMO"                                 # active trading mode: DEMO / MAINNET
-  leverage: 2                                  # leverage untuk semua posisi live (alias fixed_leverage di growth_gate)
+  leverage: 10                                 # leverage untuk semua posisi live (alias fixed_leverage di growth_gate)
   endpoints:
     DEMO: "https://demo-fapi.binance.com"       # Binance paper trading futures (no real money)
     MAINNET: "https://fapi.binance.com"        # Binance live futures — NEVER use accidentally
@@ -240,7 +281,15 @@ trading:
   memecoin_symbols: ["TRUMPUSDT", "1000BONKUSDT", "WIFUSDT", "PNUTUSDT", "PENGUUSDT", "1000FLOKIUSDT"]
   memecoin_demo_trades_required: 200           # minimum demo trades before trading memecoins
   memecoin_sharpe_required: 0.3               # minimum backtest Sharpe to trade a memecoin
+  # Symbols permanently excluded from live trading regardless of model results.
+  # Add symbols here if they consistently underperform or have exchange issues.
+  exclude_symbols: []
+  # Bear/ranging regime filter: skip new LONG entries when BTC is in confirmed bear/sideways.
+  # SHORT entries are still allowed in bear regime (regime_filter_allow_short: true).
+  bear_regime_filter_enabled: true
+  bear_regime_filter_allow_short: true         # allow short entries even in bear regime
   dead_man_switch_seconds: 60                  # cancel all orders if main loop silent for 60s
+  bar_seconds: 900                             # bar duration in seconds (15m=900); used to compute bars_held drift metric
 
 macro:
   release_lags:                                # publication delay per macro indicator (forward-fill safe)
@@ -305,3 +354,12 @@ ab_testing:
   h0_da: 0.51                                  # null hypothesis directional accuracy (baseline)
   h1_da: 0.53                                  # alternative hypothesis DA (meaningful improvement)
   shadow_min_trades: 50                        # minimum shadow trades before SPRT decision
+
+telegram:
+  enabled: true                                # set false to disable all Telegram notifications
+  notify_entry: true                           # send message on every position entry
+  notify_exit: true                            # send message on every position exit
+  notify_daily_summary: true                   # send daily P&L summary
+  notify_heartbeat: true                       # hourly heartbeat message
+  chart_n_bars: 80                             # candlestick bars shown in entry/exit charts
+  heartbeat_interval_hours: 1                  # hours between heartbeat messages

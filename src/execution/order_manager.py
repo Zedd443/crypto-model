@@ -33,6 +33,14 @@ _TRADE_LOG_COLS = [
     "fee_pct",           # round-trip fee actually charged (taker × 2)
     "regime",
     "signal_strength",
+    # Drift-detection columns — let offline analysis compare live vs trained expectations
+    "tp_pct_used",            # actual TP distance used at entry (live R:R numerator)
+    "sl_pct_used",            # actual SL distance used at entry (live R:R denominator)
+    "atr_pct_at_entry",       # ATR/price at entry — regime vol proxy vs training ATR dist
+    "bars_held",              # bars between entry and exit (vs labels.max_hold_bars=32)
+    "exit_reason",            # TP / SL / TIME / MANUAL / DMS / UNKNOWN
+    "primary_prob_at_entry",  # raw primary model prob before meta gating
+    "meta_prob_at_entry",     # meta-labeler prob (0.5 if no meta model)
 ]
 
 
@@ -57,11 +65,13 @@ class OrderManager:
         self._heartbeat_lock = threading.Lock()
         self._last_heartbeat = time.monotonic()
 
-        # Ensure CSV file has a header row if it doesn't exist yet
+        # Ensure CSV file has a header row if it doesn't exist yet, or migrate schema if columns were added
         if not self._log_path.exists():
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._log_path, "w", newline="") as f:
                 csv.DictWriter(f, fieldnames=_TRADE_LOG_COLS).writeheader()
+        else:
+            self._migrate_trade_log_schema()
 
         # Start dead-man-switch background thread
         self._dms_thread = threading.Thread(target=self._dead_man_switch_loop, daemon=True)
@@ -71,6 +81,22 @@ class OrderManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _drift_fields(self, pos: dict, exit_reason: str) -> dict:
+        # Drift-detection fields: R:R, ATR regime, hold duration, prob decomposition.
+        # Read at session start by monitoring tooling to compare live vs training dist.
+        bar_seconds = float(getattr(self._cfg.trading, "bar_seconds", 900))  # default 15m
+        entry_epoch = float(pos.get("entry_epoch", 0.0) or 0.0)
+        bars_held = int((time.time() - entry_epoch) / bar_seconds) if entry_epoch > 0 else -1
+        return {
+            "tp_pct_used":            round(float(pos.get("tp_pct_used", 0.0)), 6),
+            "sl_pct_used":            round(float(pos.get("sl_pct_used", 0.0)), 6),
+            "atr_pct_at_entry":       round(float(pos.get("atr_pct_at_entry", 0.0)), 6),
+            "bars_held":              bars_held,
+            "exit_reason":            exit_reason,
+            "primary_prob_at_entry":  round(float(pos.get("primary_prob_at_entry", 0.5)), 4),
+            "meta_prob_at_entry":     round(float(pos.get("meta_prob_at_entry", 0.5)), 4),
+        }
 
     def _get_taker_fee(self, symbol: str) -> float:
         # Returns taker fee rate for symbol — fetched from API once, cached per symbol
@@ -100,6 +126,9 @@ class OrderManager:
         sl_pct: float,
         regime: str = "",
         signal_strength: float = 0.0,
+        atr_pct: float = 0.0,
+        primary_prob: float = 0.5,
+        meta_prob: float = 0.5,
     ) -> str | None:
         if symbol in self.positions:
             logger.warning(f"{symbol}: submit_entry called but position already tracked — skipping")
@@ -153,10 +182,13 @@ class OrderManager:
             qty = qty_bumped
             size_usd = bumped_notional
 
-        # 3c. DEMO precision guard: if step from exchange is wrong (e.g. 0.0001 for integer-only
-        # symbols) and the qty has sub-integer decimals, try integer qty first to avoid -1111.
-        # This is checked here, before placing the order, so we don't need an exception retry path.
-        if self._mode == "DEMO" and qty_step <= 0.001 and qty > 1.0 and qty != math.floor(qty):
+        # 3c. DEMO precision guard: if step from exchange is suspiciously small (< 0.001,
+        # e.g. 0.0001 for symbols where DEMO actually enforces integer qty) and the qty has
+        # sub-integer decimals, floor to integer to avoid -1111 precision errors.
+        # Threshold is < 0.001 (strict): stepSize=0.001 symbols like ETHUSDT are genuinely
+        # decimal and must NOT be floored — only truly fine-grained steps (0.0001, 0.00001)
+        # indicate a DEMO quirk where the reported precision is tighter than what's accepted.
+        if self._mode == "DEMO" and qty_step < 0.001 and qty > 1.0 and qty != math.floor(qty):
             qty_int = math.floor(qty)
             notional_int = qty_int * entry_price
             if notional_int >= min_notional:
@@ -203,37 +235,31 @@ class OrderManager:
         time.sleep(1)
 
         # Compute TP / SL prices.
-        # DEMO: demo-fapi enforces PERCENT_PRICE ±5% from live mark price (not entry_price).
-        # Cap TP/SL to ±4% of entry to stay safely inside that band even if mark drifts.
-        # MAINNET: no special cap needed (real stopPrice orders don't have this restriction).
+        # DEMO: bracket orders are NOT sent to exchange — TP/SL simulated via mark price in sync_fills.
+        # No PERCENT_PRICE cap needed for DEMO (cap was only relevant for real exchange stop orders).
+        # MAINNET: real STOP_MARKET orders must stay within exchange price bands — no special cap needed
+        # because stopPrice is allowed far from mark price on MAINNET FAPI.
         tick = self._client.get_tick_size(symbol)
-        _max_bracket_pct = 0.04 if self._mode == "DEMO" else 1.0
-        tp_pct_eff = min(tp_pct, _max_bracket_pct)
-        sl_pct_eff = min(sl_pct, _max_bracket_pct)
 
-        import math as _math
         if direction == "long":
-            raw_tp = entry_price * (1.0 + tp_pct_eff)
-            raw_sl = entry_price * (1.0 - sl_pct_eff)
+            raw_tp = entry_price * (1.0 + tp_pct)
+            raw_sl = entry_price * (1.0 - sl_pct)
             tp_price = self._client.round_price(symbol, raw_tp)
             if tp_price <= entry_price:
                 tp_price = round(entry_price + tick, 10)
-            # For DEMO: floor SL so it never exceeds the ±4% band after rounding
-            sl_price = round(_math.floor(raw_sl / tick) * tick, 10) if self._mode == "DEMO" else self._client.round_price(symbol, raw_sl)
+            # DEMO: floor SL so rounding never pushes it past the intended level
+            sl_price = round(math.floor(raw_sl / tick) * tick, 10) if self._mode == "DEMO" else self._client.round_price(symbol, raw_sl)
             if sl_price >= entry_price:
                 sl_price = round(entry_price - tick, 10)
             close_side = "SELL"
         else:
-            raw_tp = entry_price * (1.0 - tp_pct_eff)
-            raw_sl = entry_price * (1.0 + sl_pct_eff)
+            raw_tp = entry_price * (1.0 - tp_pct)
+            raw_sl = entry_price * (1.0 + sl_pct)
             tp_price = self._client.round_price(symbol, raw_tp)
             if tp_price >= entry_price:
                 tp_price = round(entry_price - tick, 10)
-            # For DEMO: ceil SL so it never exceeds the ±4% band after rounding (short SL is above entry)
-            sl_price = round(_math.ceil(raw_sl / tick) * tick, 10) if self._mode == "DEMO" else self._client.round_price(symbol, raw_sl)
-            # After ceiling, still check it's within 4%
-            if self._mode == "DEMO" and sl_price > entry_price * (1.0 + _max_bracket_pct):
-                sl_price = round(_math.floor(entry_price * (1.0 + _max_bracket_pct) / tick) * tick, 10)
+            # DEMO: ceil SL (above entry for shorts) so rounding never pulls it below the intended level
+            sl_price = round(math.ceil(raw_sl / tick) * tick, 10) if self._mode == "DEMO" else self._client.round_price(symbol, raw_sl)
             if sl_price <= entry_price:
                 sl_price = round(entry_price + tick, 10)
             close_side = "BUY"
@@ -310,8 +336,14 @@ class OrderManager:
             "tp_order_id": tp_algo_id,
             "sl_order_id": sl_algo_id,
             "entry_time": datetime.now(timezone.utc).isoformat(),
+            "entry_epoch": time.time(),  # bars_held computed as (exit_epoch - entry_epoch) / bar_seconds
             "regime": regime,
             "signal_strength": signal_strength,
+            "tp_pct_used": tp_pct,
+            "sl_pct_used": sl_pct,
+            "atr_pct_at_entry": atr_pct,
+            "primary_prob_at_entry": primary_prob,
+            "meta_prob_at_entry": meta_prob,
         }
 
         logger.info(
@@ -423,6 +455,7 @@ class OrderManager:
                             "fee_pct": round(fee_pct, 6),
                             "regime": pos.get("regime", ""),
                             "signal_strength": pos.get("signal_strength", 0.0),
+                            **self._drift_fields(pos, exit_reason=hit),
                         }
                         self._write_trade_log(fill)
                         del self.positions[symbol]
@@ -447,6 +480,15 @@ class OrderManager:
             pnl_pct = (entry_price - exit_price) / (entry_price + 1e-12)
 
         fee_pct = self._get_taker_fee(symbol) * 2  # round-trip: entry + exit
+
+        # Infer exit reason from which bracket price the exit is closer to
+        tp_price = pos.get("tp_price") or 0
+        sl_price = pos.get("sl_price") or 0
+        if tp_price and sl_price:
+            exit_reason = "TP" if abs(exit_price - tp_price) <= abs(exit_price - sl_price) else "SL"
+        else:
+            exit_reason = "UNKNOWN"
+
         fill = {
             "timestamp_entry": pos["entry_time"],
             "timestamp_exit": datetime.now(timezone.utc).isoformat(),
@@ -460,6 +502,7 @@ class OrderManager:
             "fee_pct": round(fee_pct, 6),
             "regime": pos.get("regime", ""),
             "signal_strength": pos.get("signal_strength", 0.0),
+            **self._drift_fields(pos, exit_reason=exit_reason),
         }
 
         self._write_trade_log(fill)
@@ -520,6 +563,25 @@ class OrderManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _migrate_trade_log_schema(self) -> None:
+        # If the existing CSV header is missing any current column, rewrite the file with the
+        # full header, filling blanks for old rows. Safe no-op if schemas match.
+        try:
+            with open(self._log_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                existing_cols = reader.fieldnames or []
+                if set(_TRADE_LOG_COLS).issubset(set(existing_cols)):
+                    return  # already up to date
+                rows = list(reader)
+            with open(self._log_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_TRADE_LOG_COLS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({col: row.get(col, "") for col in _TRADE_LOG_COLS})
+            logger.info(f"Trade log schema migrated: added {set(_TRADE_LOG_COLS) - set(existing_cols)}")
+        except Exception as exc:
+            logger.warning(f"Trade log schema migration failed: {exc}")
 
     def _write_trade_log(self, row: dict) -> None:
         with open(self._log_path, "a", newline="") as f:

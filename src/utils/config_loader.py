@@ -27,6 +27,20 @@ def load_config(config_path: str = "config/base.yaml") -> DictConfig:
         logger.warning(f"symbols.yaml not found at {symbols_path}, proceeding without symbol metadata")
         cfg = base_cfg
 
+    # Env var overrides for date splits — used by Kaggle weekly retrain to shift window forward.
+    # TRAIN_END_DATE, VAL_START_DATE, VAL_END_DATE, TEST_START_DATE must be YYYY-MM-DD strings.
+    import os
+    _date_overrides = {
+        "train_end":   os.environ.get("TRAIN_END_DATE"),
+        "val_start":   os.environ.get("VAL_START_DATE"),
+        "val_end":     os.environ.get("VAL_END_DATE"),
+        "test_start":  os.environ.get("TEST_START_DATE"),
+    }
+    for key, val in _date_overrides.items():
+        if val:
+            OmegaConf.update(cfg, f"data.{key}", val, merge=True)
+            logger.info(f"Config override: data.{key} = {val} (from env)")
+
     _validate_config(cfg)
     _config_cache = cfg
     logger.info(f"Config loaded from {base_path}")

@@ -326,21 +326,28 @@ class BinanceClient:
             data = self._request("GET", "/fapi/v1/exchangeInfo", {"symbol": symbol})
             if "symbols" not in data or len(data["symbols"]) == 0:
                 raise ValueError("empty symbols list")
-            sym_info = data["symbols"][0]
+            # DEMO quirk: /fapi/v1/exchangeInfo ignores the ?symbol= filter and returns the full
+            # list. symbols[0] is always the first alphabetically (e.g. BTCUSDT), NOT the queried
+            # symbol. Search by name — if not found, raise so fallbacks are applied.
+            sym_info = next(
+                (s for s in data["symbols"] if s.get("symbol") == symbol),
+                None,
+            )
+            if sym_info is None:
+                raise ValueError(f"symbol {symbol} not found in exchangeInfo response")
             for filt in sym_info.get("filters", []):
                 ft = filt.get("filterType")
                 if ft == "LOT_SIZE":
                     self._qty_step_cache[symbol] = float(filt.get("stepSize", 1.0))
-                    max_qty = float(filt.get("maxQty", 0))
-                    if max_qty > 0:
-                        self._qty_max_cache[symbol] = max_qty
+                    # DEMO verified: maxQty from both LOT_SIZE and MARKET_LOT_SIZE are NOT enforced.
+                    # Orders above these limits succeed — only margin availability limits qty.
+                    # Set a very large sentinel so submit_entry never artificially caps the order.
+                    self._qty_max_cache[symbol] = float("inf")
                 elif ft == "MARKET_LOT_SIZE":
-                    # DEMO (testnet): MARKET_LOT_SIZE.maxQty=120 is a real limit for market orders.
-                    # MAINNET: this filter does not reflect actual position capacity (leverage bracket
-                    # notional limits apply instead). Only use for DEMO.
-                    max_qty = float(filt.get("maxQty", 0))
-                    if max_qty > 0 and self._mode == "DEMO":
-                        self._qty_max_cache[symbol] = max_qty
+                    # stepSize: take the larger value (MARKET_LOT_SIZE reflects real MARKET precision)
+                    mkt_step = float(filt.get("stepSize", 0))
+                    if mkt_step > 0 and mkt_step > self._qty_step_cache.get(symbol, 0):
+                        self._qty_step_cache[symbol] = mkt_step
                 elif ft == "MIN_NOTIONAL":
                     min_notional = float(filt.get("notional", filt.get("minNotional", 5.0)))
                     self._min_notional_cache[symbol] = min_notional

@@ -2,37 +2,41 @@
 # Run as module: python -m src.pipeline.run_pipeline [options]
 #
 # Examples:
-#   python -m src.pipeline.run_pipeline                        # run all stages 1-7
+#   python -m src.pipeline.run_pipeline                        # run all stages (1→2→3→4→4b→5→6→7)
 #   python -m src.pipeline.run_pipeline --stage 2              # run stage 2 only (features)
 #   python -m src.pipeline.run_pipeline --stage 4 --force      # re-run training even if done
-#   python -m src.pipeline.run_pipeline --stage 4b             # train 4h/1d HTF models
+#   python -m src.pipeline.run_pipeline --stage 4b             # train 1h/4h/1d HTF models only
 #   python -m src.pipeline.run_pipeline --stage 4 --symbol BTCUSDT SOLUSDT  # one or more symbols
 #   python -m src.pipeline.run_pipeline --stage 8              # run live execution loop
 #
 # Stage map:
 #   1  ingest       — download OHLCV + on-chain + macro data from APIs
-#   2  features     — compute technical/regime/cross-sectional features per symbol
+#   2  features     — compute technical/regime/cross-sectional features (no HTF model dependency)
 #   3  labels       — triple-barrier labeling + sample weights
 #   4  training     — XGBoost primary model with Optuna tuning + feature selection
-#   4b htf_train    — train lightweight 4h/1d XGBoost models (predictions injected into features)
-#   5  meta_labeling— meta-labeler trained on OOF predictions (signal confidence)
-#   6  portfolio    — generate signals, position sizing, correlation filter
+#   4b htf_train    — train independent 1h/4h/1d XGBoost approval-filter models (parallel to stage 4)
+#   5  meta_labeling— meta-labeler trained on OOF predictions (signal confidence, 15m only)
+#   6  portfolio    — signals + HTF approval filter + position sizing + correlation filter
 #   7  backtest     — walk-forward backtest with realistic costs
 #   8  live         — real-time execution loop (Binance Demo/Mainnet FAPI)
-#
-# Full retrain with HTF models:
-#   1. --stage 1                       (ingest)
-#   2. --stage 4b                      (train 4h/1d models)
-#   3. --stage 2 --force               (inject htf_pred_4h/1d, recompute all features)
-#   4. --stage 3 --force               (re-label)
-#   5. --stage 4 --force               (retrain 15m primary models)
-#   6. --stage 5 --force  through 7    (meta, portfolio, backtest)
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
+
+# Silence noisy sklearn parallel warning emitted when third-party libs (xgboost,
+# optuna, imblearn) invoke sklearn.utils.parallel.delayed without the paired
+# Parallel — not fixable from our code and not actionable.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*sklearn\.utils\.parallel\.delayed.*should be used with.*",
+    category=UserWarning,
+)
+
 from src.utils.config_loader import load_config
 from src.utils.logger import get_logger
+from src.utils.cli_progress import PipelineProgress, console
 from src.pipeline import (
     stage_01_ingest,
     stage_02_features,
@@ -98,31 +102,40 @@ def main():
 
     cfg = load_config(args.config)
 
+    # Full sequential order: 1 → 2 → 3 → 4 → 4b → 5 → 6 → 7
+    # 4b runs after stage 4 — both are training stages with no cross-dependency.
+    # HTF approval logic lives in stage 6 (loads models at signal time), not in features.
+    _FULL_SEQUENCE = [1, 2, 3, 4, "4b", 5, 6, 7]
+
     if args.stage:
         # Allow "4b" as a string stage key; convert numeric strings to int
         stage_key = args.stage if args.stage == "4b" else int(args.stage)
         stages_to_run = [stage_key]
     elif args.from_stage:
-        stages_to_run = list(range(args.from_stage, 8))  # 8 (live) not in batch run
+        # Slice _FULL_SEQUENCE from the requested stage onwards
+        from_key = int(args.from_stage)
+        try:
+            start_pos = _FULL_SEQUENCE.index(from_key)
+        except ValueError:
+            start_pos = 0
+        stages_to_run = _FULL_SEQUENCE[start_pos:]
     else:
-        stages_to_run = list(range(1, 8))
+        stages_to_run = _FULL_SEQUENCE
 
     # symbol_filter: None = all symbols, list with one item = single symbol (backwards compat), list = multi-symbol
     symbol_filter = args.symbol  # list[str] | None
 
+    console.print()
     for stage_num in stages_to_run:
-        stage_name = STAGE_NAMES[stage_num]
-        logger.info(f"=== Stage {stage_num}: {stage_name} ===")
-        try:
-            STAGES[stage_num](cfg, force=args.force, symbol_filter=symbol_filter)
-            logger.info(f"=== Stage {stage_num} ({stage_name}) finished ===")
-        except Exception as e:
-            logger.error(f"Stage {stage_num} ({stage_name}) failed: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            sys.exit(1)
+        with PipelineProgress(stage_num):
+            try:
+                STAGES[stage_num](cfg, force=args.force, symbol_filter=symbol_filter)
+            except Exception as e:
+                import traceback
+                logger.error(traceback.format_exc())
+                sys.exit(1)
 
-    logger.info("Pipeline run complete.")
+    console.print("[bold green]All stages complete.[/bold green]")
 
 
 if __name__ == "__main__":

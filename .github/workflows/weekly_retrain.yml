@@ -1,0 +1,132 @@
+name: Weekly Retrain
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"   # every Sunday 00:00 UTC
+  workflow_dispatch:        # allow manual trigger via gh workflow run or GitHub UI
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480    # 8 hour max — Kaggle kernels can take 4-6h for 59 symbols
+
+    steps:
+      - name: Trigger Kaggle kernel
+        id: kaggle_trigger
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pip install kaggle -q
+          mkdir -p ~/.kaggle
+          echo '{"username":"'"$KAGGLE_USERNAME"'","key":"'"$KAGGLE_KEY"'"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+          # Push the retrain script as a kernel to Kaggle and run it
+          # Kernel slug must exist in Kaggle (create once manually, then API updates it)
+          KERNEL_SLUG="${KAGGLE_USERNAME}/crypto-weekly-retrain"
+
+          # Create kernel metadata
+          cat > /tmp/kernel-meta.json << EOF
+          {
+            "id": "${KERNEL_SLUG}",
+            "title": "Crypto Weekly Retrain",
+            "code_file": "scripts/kaggle_retrain.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": false,
+            "enable_internet": true,
+            "dataset_sources": [],
+            "kernel_sources": []
+          }
+          EOF
+
+          # Checkout repo to get the script
+          git clone https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git /tmp/repo
+
+          cd /tmp/repo
+          kaggle kernels push -p /tmp 2>&1 || echo "Kernel push attempted (may already exist)"
+
+          # Run the kernel
+          kaggle kernels run $KERNEL_SLUG --quiet 2>&1
+          echo "kernel_slug=$KERNEL_SLUG" >> $GITHUB_OUTPUT
+
+      - name: Poll Kaggle kernel until complete
+        id: kaggle_poll
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          KERNEL_SLUG="${KAGGLE_USERNAME}/crypto-weekly-retrain"
+          MAX_POLLS=96   # 96 × 5min = 8 hours
+          for i in $(seq 1 $MAX_POLLS); do
+            STATUS=$(kaggle kernels status $KERNEL_SLUG -q 2>/dev/null | tail -1 || echo "error")
+            echo "Poll $i/$MAX_POLLS: $STATUS"
+            if echo "$STATUS" | grep -q "complete"; then
+              echo "Kaggle kernel completed successfully."
+              echo "kaggle_status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            if echo "$STATUS" | grep -qE "error|cancel|fail"; then
+              echo "Kaggle kernel failed: $STATUS"
+              echo "kaggle_status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+            sleep 300   # poll every 5 minutes
+          done
+          echo "Kaggle kernel timed out after 8 hours"
+          echo "kaggle_status=timeout" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Get artifact URL from latest GitHub Release
+        id: get_artifact
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find the most recent retrain-* release and get its zip download URL
+          URL=$(gh release list --limit 5 --json tagName,assets \
+            --jq '[.[] | select(.tagName | startswith("retrain-"))] | first | .assets[0].browserDownloadUrl' \
+            2>/dev/null || echo "")
+          if [[ -z "$URL" ]]; then
+            echo "No retrain release artifact found"
+            exit 1
+          fi
+          echo "artifact_url=$URL" >> $GITHUB_OUTPUT
+          echo "Artifact URL: $URL"
+
+      - name: SSH to VPS and run hot-swap
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          ARTIFACT_URL: ${{ steps.get_artifact.outputs.artifact_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "$SSH_KEY" > /tmp/vps_key
+          chmod 600 /tmp/vps_key
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/vps_key "${VPS_USER}@${VPS_HOST}" \
+            "ARTIFACT_URL='${ARTIFACT_URL}' \
+             GITHUB_TOKEN='${GITHUB_TOKEN}' \
+             TELEGRAM_BOT_TOKEN='${TELEGRAM_BOT_TOKEN}' \
+             TELEGRAM_CHAT_ID='${TELEGRAM_CHAT_ID}' \
+             bash ~/crypto_model/scripts/vps_hot_swap.sh"
+
+      - name: Notify failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MSG="🚨 <b>Weekly retrain FAILED</b> [$(date -u '+%Y-%m-%d %H:%M UTC')]%0A"
+          MSG="${MSG}Job: ${{ github.run_id }}%0A"
+          MSG="${MSG}VPS is still running old models — no hot-swap performed."
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            -d "text=${MSG}" > /dev/null

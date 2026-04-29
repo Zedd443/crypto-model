@@ -21,10 +21,13 @@ def _get_fracdiff_weights(d: float, size: int, threshold: float = 1e-5) -> np.nd
 def fracdiff_series(series: pd.Series, d: float, threshold: float = 1e-5) -> pd.Series:
     weights = _get_fracdiff_weights(d, len(series), threshold)
     width = len(weights)
-    result = np.full(len(series), np.nan)
-    arr = series.values
-    for i in range(width - 1, len(arr)):
-        result[i] = np.dot(weights, arr[i - width + 1: i + 1])
+    arr = series.values.astype(np.float64)
+
+    conv = np.convolve(arr, weights, mode="full")
+    result = np.full(len(arr), np.nan)
+
+    result[width - 1:] = conv[width - 1:len(arr)]
+
     return pd.Series(result, index=series.index, name=series.name)
 
 

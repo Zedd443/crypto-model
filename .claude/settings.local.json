@@ -19,7 +19,24 @@
       "Bash(nohup .venv/Scripts/python.exe -m src.pipeline.run_pipeline --stage 8)",
       "Bash(echo \"PID: $!\")",
       "Bash(cd /d D:\\\\Workspace\\\\AI\\\\crypto_model)",
-      "Bash(find . -name \"*.py\" -type f -exec grep -l \"print\\(\" {} \\\\;)"
+      "Bash(find . -name \"*.py\" -type f -exec grep -l \"print\\(\" {} \\\\;)",
+      "Bash(python3 *)",
+      "Bash(.venv/Scripts/python.exe test_inject_2pos.py)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(PYTHONPATH=. D:/Workspace/AI/crypto_model/.venv/Scripts/python.exe scripts/rr_sweep.py --symbols BTCUSDT --tp 2.0 --sl 1.0 --hold 32 --floor 0.55)",
+      "Bash(PYTHONPATH=. D:/Workspace/AI/crypto_model/.venv/Scripts/python.exe scripts/rr_sweep.py --symbols BTCUSDT --tp 1.0,2.0,3.0 --sl 1.0 --hold 32 --floor 0.55)",
+      "Bash(PYTHONPATH=. .venv/Scripts/python.exe scripts/clean_orphans.py)",
+      "Bash(rm -f data/checkpoints/model_registry.json)",
+      "Bash(rm -rf data/checkpoints/models/)",
+      "Bash(.venv/Scripts/python.exe scripts/clean_generated.py)",
+      "Bash(.venv/Scripts/python.exe scripts/clean_generated.py --stage 4)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_smoke_pipeline.py -v --tb=short)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/pip.exe install *)",
+      "Bash(D:/Workspace/AI/crypto_model/.venv/Scripts/python.exe *)",
+      "WebFetch(domain:github.com)",
+      "Bash(grep -n \"tqdm\" \"D:\\\\\\\\Workspace\\\\\\\\AI\\\\\\\\crypto_model\\\\\\\\src\\\\\\\\pipeline\\\\\\\\stage_08_live.py\")",
+      "Bash(grep *)"
     ]
   }
 }

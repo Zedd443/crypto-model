@@ -1,0 +1,53 @@
+name: Push Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "config/**"
+      - "scripts/**"
+      - "requirements.txt"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync code to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          echo "$SSH_KEY" > /tmp/vps_key
+          chmod 600 /tmp/vps_key
+
+          # Sync only source code — never overwrite models/ data/ or project_state.json
+          rsync -avz --delete \
+            -e "ssh -o StrictHostKeyChecking=no -i /tmp/vps_key" \
+            --exclude="*.pyc" --exclude="__pycache__" \
+            src/ config/ scripts/ requirements.txt \
+            "${VPS_USER}@${VPS_HOST}:~/crypto_model/"
+
+          echo "Code synced to VPS. Stage 8 picks up changes on next bar (no restart needed for non-stage8 changes)."
+
+      - name: Restart stage 8 if stage_08_live.py changed
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SERVICE_NAME: crypto-live
+        run: |
+          # Only restart if stage_08_live.py itself was modified
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          if echo "$CHANGED" | grep -q "stage_08_live.py"; then
+            echo "stage_08_live.py changed — restarting service (no open positions check, code-only change)"
+            ssh -o StrictHostKeyChecking=no -i /tmp/vps_key "${VPS_USER}@${VPS_HOST}" \
+              "systemctl restart ${SERVICE_NAME} && systemctl is-active ${SERVICE_NAME}"
+          else
+            echo "stage_08_live.py unchanged — no restart needed."
+          fi

@@ -2,7 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from src.utils.config_loader import load_config, get_symbols
+from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state
 from src.utils.logger import get_logger
 from src.utils.io_utils import read_checkpoint, checkpoint_exists, write_features
@@ -26,13 +26,9 @@ def _read_saved_hash(features_dir: Path) -> str:
     return p.read_text().strip() if p.exists() else ""
 
 
-def _write_saved_hash(features_dir: Path, h: str) -> None:
-    features_dir.mkdir(parents=True, exist_ok=True)
-    (features_dir / "feature_config_hash.txt").write_text(h)
-
 
 def _process_symbol(args: tuple) -> tuple:
-    symbol, cfg_dict, train_end, force, models_dir = args
+    symbol, cfg_dict, train_end, force = args
     from omegaconf import OmegaConf
     cfg = OmegaConf.create(cfg_dict)
 
@@ -85,7 +81,6 @@ def _process_symbol(args: tuple) -> tuple:
         features_df = build_features_for_symbol(
             symbol, df_15m, df_1h, df_4h, df_1d,
             macro_panel, onchain_panel, btc_df, cfg, train_end,
-            models_dir=models_dir,
         )
 
         write_features(features_df, symbol, "15m", features_dir)
@@ -129,8 +124,7 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
 
     # Phase 1: per-symbol features — parallel with ProcessPoolExecutor
     # Use max_workers=4 to avoid OOM on large feature sets
-    models_dir = str(cfg.data.models_dir)
-    args_list = [(sym, cfg_dict, train_end, force, models_dir) for sym in symbol_names]
+    args_list = [(sym, cfg_dict, train_end, force) for sym in symbol_names]
 
     with ProcessPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_process_symbol, args): args[0] for args in args_list}

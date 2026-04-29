@@ -37,14 +37,17 @@ def compute_funding_percentile(funding_proxy: pd.Series, window: int) -> pd.Seri
 
 def compute_hours_to_funding(index: pd.DatetimeIndex) -> pd.Series:
     # Compute minimum hours until next settlement at 0h, 8h, 16h UTC
-    hours = pd.Series(index.hour + index.minute / 60.0, index=index)
-    def _min_hours_to_next(h_float):
-        candidates = [fh - h_float for fh in _FUNDING_HOURS if fh - h_float > 0]
-        # Wrap around midnight: next 0h next day
-        candidates.append(24.0 - h_float)
-        return min(candidates)
-    hours_to_funding = hours.apply(_min_hours_to_next)
-    return hours_to_funding.rename("hours_to_funding")
+    h = index.hour + index.minute / 60.0  # float hours array, shape (n,)
+
+    # For each funding hour fh, distance = fh - h; negative means already passed this cycle.
+    # The wrap-around candidate is always 24 - h (time until midnight, which equals next 0h).
+    # Stack into (n, 4) matrix and take row-wise minimum, keeping only positive distances.
+    candidates = np.column_stack([
+        np.where(fh - h > 0, fh - h, np.inf) for fh in _FUNDING_HOURS
+    ] + [24.0 - h])  # 24-h is always positive since h in [0, 24)
+
+    hours_to_funding = np.min(candidates, axis=1)
+    return pd.Series(hours_to_funding, index=index, name="hours_to_funding")
 
 
 def compute_pre_funding_window(hours_to_funding: pd.Series, threshold: float = 1.0) -> pd.Series:
@@ -53,11 +56,20 @@ def compute_pre_funding_window(hours_to_funding: pd.Series, threshold: float = 1
 
 
 def compute_funding_sign_persistence(proxy: pd.Series, window: int = 8) -> pd.Series:
-    # Count how many bars in rolling window have same sign as the current bar
+    # Count how many bars in rolling window have same sign as the current bar.
+    # sign is in {-1, 0, 1}. Precompute rolling sum for each sign value,
+    # then select the count matching the current bar's sign using np.where.
     sign = np.sign(proxy)
-    return sign.rolling(window, min_periods=1).apply(
-        lambda x: np.sum(np.sign(x[-1]) == np.sign(x)), raw=True
-    ).rename(f"funding_sign_persistence_{window}")
+
+    roll_pos  = (sign ==  1).astype(np.float64).rolling(window, min_periods=1).sum()
+    roll_zero = (sign ==  0).astype(np.float64).rolling(window, min_periods=1).sum()
+    roll_neg  = (sign == -1).astype(np.float64).rolling(window, min_periods=1).sum()
+
+    # Select the precomputed count whose sign matches the current bar's sign.
+    result = np.where(sign ==  1, roll_pos,
+             np.where(sign == -1, roll_neg, roll_zero))
+
+    return pd.Series(result, index=proxy.index, name=f"funding_sign_persistence_{window}")
 
 
 def compute_cross_coin_funding_divergence(funding_proxy: pd.Series, btc_funding_proxy: pd.Series) -> pd.Series:
@@ -78,14 +90,15 @@ def build_funding_features(df: pd.DataFrame, btc_df, cfg) -> pd.DataFrame:
 
     proxy = compute_funding_proxy(open_, high, low, close)
 
+    hours_to_funding = compute_hours_to_funding(df.index)
     parts = [
         proxy.to_frame(),
         compute_funding_velocity(proxy, 1).to_frame(),
         compute_funding_velocity(proxy, 3).to_frame(),
         compute_funding_zscore(proxy, zscore_window).to_frame(),
         compute_funding_percentile(proxy, pct_window).to_frame(),
-        compute_hours_to_funding(df.index).to_frame(),
-        compute_pre_funding_window(compute_hours_to_funding(df.index), 1.0).to_frame(),
+        hours_to_funding.to_frame(),
+        compute_pre_funding_window(hours_to_funding, 1.0).to_frame(),
         compute_funding_sign_persistence(proxy, 8).to_frame(),
     ]
 

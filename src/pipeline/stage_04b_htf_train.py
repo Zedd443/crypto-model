@@ -1,18 +1,19 @@
-"""
-Stage 4b — Train 4h and 1d HTF models per symbol.
-
-These lightweight XGBoost classifiers are trained directly on raw 4h/1d OHLCV bars.
-Their calibrated predictions are injected into the 15m feature frame at stage_02
-as `htf_pred_4h` and `htf_pred_1d` columns, giving the primary 15m model access to
-higher-timeframe trend context that HTF technical features alone cannot fully capture.
-
-Run order: after stage_01 (ingest) but before or alongside stage_02 (features).
-Stage_02 --force is needed after this stage to inject HTF predictions into features.
-
-Usage:
-  python -m src.pipeline.run_pipeline --stage 4b
-  python -m src.pipeline.run_pipeline --stage 4b --force --symbol BTCUSDT SOLUSDT
-"""
+# Stage 4b — Train 4h and 1d HTF approval-filter models per symbol.
+#
+# Each model is a lightweight XGBoost classifier trained directly on raw HTF OHLCV bars.
+# They act as independent directional confirmation filters in stage_06 (signal generation):
+# a 15m signal is zeroed out when HTF models disagree with it beyond the approval threshold.
+# These models are NOT features fed into the 15m primary model.
+#
+# Label: ATR-based triple-barrier on NATIVE HTF bars (not resampled from 15m).
+# Macro features: merged from macro_panel_{tf}.parquet at native HTF resolution.
+#
+# Run order: after stage_04 (both are training stages, no cross-dependency).
+# Stage_06 loads HTF models at signal time — no stage_02 re-run required.
+#
+# Usage:
+#   python -m src.pipeline.run_pipeline --stage 4b
+#   python -m src.pipeline.run_pipeline --stage 4b --force --symbol BTCUSDT SOLUSDT
 from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
@@ -35,7 +36,30 @@ def _htf_models_exist(symbol: str, models_dir: Path) -> bool:
     return True
 
 
-def _train_symbol_htf(symbol: str, cfg, checkpoints_dir: Path, models_dir: Path) -> tuple:
+def _load_macro_panels(cfg) -> dict:
+    """Load macro panels for each HTF — keyed by timeframe string."""
+    processed_dir = Path(cfg.data.processed_dir)
+    panels = {}
+    for tf in _HTF_TIMEFRAMES:
+        p = processed_dir / f"macro_panel_{tf}.parquet"
+        if p.exists():
+            try:
+                panels[tf] = pd.read_parquet(p)
+                logger.debug(f"Loaded macro_panel_{tf}: {panels[tf].shape}")
+            except Exception as exc:
+                logger.warning(f"Could not load macro_panel_{tf}: {exc}")
+        else:
+            logger.warning(f"macro_panel_{tf}.parquet not found at {p} — macro features skipped for {tf}")
+    return panels
+
+
+def _train_symbol_htf(
+    symbol: str,
+    cfg,
+    checkpoints_dir: Path,
+    models_dir: Path,
+    macro_panels: dict,
+) -> tuple:
     train_end = pd.Timestamp(cfg.data.train_end, tz="UTC")
     val_end = pd.Timestamp(cfg.data.val_end, tz="UTC")
 
@@ -46,8 +70,10 @@ def _train_symbol_htf(symbol: str, cfg, checkpoints_dir: Path, models_dir: Path)
             continue
         try:
             df_htf = read_checkpoint("ingest", symbol, tf, checkpoints_dir)
+            macro_panel = macro_panels.get(tf, None)
             model, calibrator, feature_names = train_htf_model(
-                symbol, tf, df_htf, train_end, val_end, cfg
+                symbol, tf, df_htf, train_end, val_end, cfg,
+                macro_panel=macro_panel,
             )
             save_htf_model(model, calibrator, feature_names, symbol, tf, models_dir)
             results[tf] = "ok"
@@ -71,6 +97,10 @@ def run(cfg, force: bool = False, symbol_filter=None) -> None:
     models_dir = Path(cfg.data.models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    macro_panels = _load_macro_panels(cfg)
+    if not macro_panels:
+        logger.warning("No macro panels loaded — HTF models will train without macro features")
+
     issues = []
     completed = []
 
@@ -80,7 +110,7 @@ def run(cfg, force: bool = False, symbol_filter=None) -> None:
             completed.append(symbol)
             continue
 
-        sym, results = _train_symbol_htf(symbol, cfg, checkpoints_dir, models_dir)
+        sym, results = _train_symbol_htf(symbol, cfg, checkpoints_dir, models_dir, macro_panels)
         errors = [f"{tf}:{v}" for tf, v in results.items() if v != "ok"]
         if errors:
             issues.append(f"{sym}: {'; '.join(errors)}")
@@ -88,9 +118,6 @@ def run(cfg, force: bool = False, symbol_filter=None) -> None:
             completed.append(sym)
             logger.info(f"{sym}: HTF models trained (4h + 1d)")
 
-    logger.info(
-        f"Stage 4b complete. {len(completed)}/{len(symbol_names)} symbols OK. "
-        f"Reminder: run --stage 2 --force to inject HTF predictions into 15m feature frames."
-    )
-    # We don't gate stage_04b in project_state — it's a sub-stage.
-    # Issues are logged but don't block pipeline progression.
+    logger.info(f"Stage 4b complete. {len(completed)}/{len(symbol_names)} symbols OK.")
+    if issues:
+        logger.warning(f"Issues: {issues}")

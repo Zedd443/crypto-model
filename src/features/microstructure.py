@@ -70,6 +70,13 @@ def compute_spread_proxy(high: pd.Series, low: pd.Series, close: pd.Series, wind
     return spread.rename(f"spread_proxy_{window}")
 
 
+def compute_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
+    mf_mult = ((close - low) - (high - close)) / (high - low + 1e-9)
+    mf_vol = mf_mult * volume
+    cmf = mf_vol.rolling(window, min_periods=window).sum() / (volume.rolling(window, min_periods=window).sum() + 1e-9)
+    return cmf.rename(f"cmf_{window}")
+
+
 def build_microstructure_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     open_ = df["open"]
     high = df["high"]
@@ -86,18 +93,21 @@ def build_microstructure_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     # Volume in USD (approximate)
     volume_usd = volume * close
 
+    cmf_window = int(getattr(cfg.features, 'cmf_window', 20))
+    parkinson_windows = list(getattr(cfg.features, 'parkinson_vol_windows', [14, 50]))
+
     parts = [
-        log_ret.to_frame(),
         compute_ofi(open_, high, low, close, volume, ofi_window).to_frame(),
         compute_amihud(log_ret, volume_usd, amihud_window).to_frame(),
         compute_kyle_lambda(log_ret, volume, kyle_window).to_frame(),
         compute_roll_measure(close, amihud_window).to_frame(),
-        compute_parkinson_vol(high, low, 14).to_frame(),
-        compute_parkinson_vol(high, low, 50).to_frame(),
+        compute_cmf(high, low, close, volume, cmf_window).to_frame(),
         compute_volume_surprise(volume, ofi_window).to_frame(),
         compute_volume_ratio(volume, ofi_window).to_frame(),
         compute_spread_proxy(high, low, close, spread_window).to_frame(),
     ]
+    for pw in parkinson_windows:
+        parts.append(compute_parkinson_vol(high, low, pw).to_frame())
 
     result = pd.concat(parts, axis=1)
     result.index = df.index

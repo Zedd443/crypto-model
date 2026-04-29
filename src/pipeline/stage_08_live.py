@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -6,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
-from tqdm import tqdm
+from src.utils.cli_progress import LiveBarPanel, console as _rich_console
 
 # Load .env before any Binance client is instantiated so API keys are in os.environ
 try:
@@ -19,6 +20,7 @@ from src.dashboard.live_dashboard import LiveDashboard
 from src.execution.binance_client import BinanceClient
 from src.execution.live_features import compute_live_features, get_lookback_bars_needed
 from src.execution.order_manager import OrderManager
+from src.pipeline.live_vs_training import write_rollup as _write_drift_rollup
 from src.models.model_versioning import get_latest_model
 from src.models.primary_model import load_model
 from src.models.meta_labeler import load_meta_model, build_meta_features
@@ -27,8 +29,17 @@ from src.portfolio.position_sizer import (
     get_growth_gate_limits,
     check_portfolio_capacity,
 )
+from src.features.technical import compute_atr as _compute_atr_series
 from src.utils.logger import get_logger
-from src.utils.state_manager import load_state, update_equity
+from src.utils.state_manager import load_state, save_state, update_equity
+from src.utils.telegram_notifier import (
+    notify_entry as _tg_entry,
+    notify_exit as _tg_exit,
+    notify_daily_summary as _tg_daily,
+    notify_heartbeat as _tg_heartbeat,
+    notify_alert as _tg_alert,
+    notify_maintenance as _tg_maintenance,
+)
 
 logger = get_logger("stage_08_live")
 
@@ -37,6 +48,7 @@ _model_cache: dict = {}
 _SYMBOLS_PATH = Path("config/symbols.yaml")
 _TRADE_LOG_PATH = Path("results/live_trade_log.csv")
 _BAR_CLOSE_BUFFER = 5    # seconds after bar close before sampling
+_RETRAIN_FLAG = Path(".retrain_pending")  # touch this file to trigger graceful shutdown
 
 
 def _parse_timeframe_seconds(tf: str) -> int:
@@ -67,16 +79,36 @@ def _seconds_until_next_bar(bar_seconds: int) -> float:
 
 def _get_forecast_symbols(all_symbols: list[str], primary_timeframe: str) -> list[str]:
     # Return all symbols that have a registered primary model — these get forecasted every bar
-    from src.models.model_versioning import get_latest_model
     forecast = [s for s in all_symbols if get_latest_model(s, primary_timeframe, model_type="primary") is not None]
     logger.info(f"Forecast symbols ({len(forecast)} with trained models): {forecast}")
     return forecast
 
 
+def _get_vol_mult(wallet: float, cfg) -> float:
+    tiers = list(cfg.growth_gate.tiers)
+    for tier in sorted(tiers, key=lambda t: float(t.max_equity)):
+        if wallet <= float(tier.max_equity):
+            return float(getattr(tier, "vol_mult", 2.0))
+    return 2.0
+
+
 def _get_trade_limit(cfg, state: dict) -> int:
-    # Growth gate: max simultaneous open positions allowed based on equity
+    # Growth gate: max simultaneous open positions, gated by daily P&L limits
     equity = float(state.get("account", {}).get("current_equity", 0.0))
     max_symbols, _ = get_growth_gate_limits(equity, cfg)
+
+    wallet_day_start = float(state.get("wallet_day_start", equity))
+    if wallet_day_start > 0:
+        daily_pnl_pct = (equity - wallet_day_start) / wallet_day_start
+        profit_cap = float(getattr(cfg.growth_gate, "daily_profit_target_pct", 0.04))
+        loss_limit  = float(getattr(cfg.growth_gate, "daily_loss_limit_pct",   0.05))
+        if daily_pnl_pct >= profit_cap:
+            logger.info(f"Daily profit cap hit ({daily_pnl_pct:.2%} >= +{profit_cap:.0%}) — no new entries today")
+            return 0
+        if daily_pnl_pct <= -loss_limit:
+            logger.info(f"Daily hard stop hit ({daily_pnl_pct:.2%} <= -{loss_limit:.0%}) — no new entries today")
+            return 0
+
     return max_symbols
 
 
@@ -106,7 +138,8 @@ def _load_meta(symbol: str, cfg):
         return None, None
 
 
-def _predict(model, calibrator, meta_model, feature_series: pd.Series, meta_entry=None) -> tuple[float, float]:
+def _predict(model, calibrator, meta_model, feature_series: pd.Series, meta_entry=None) -> tuple[float, float, float]:
+    # Returns (primary_prob, signal_strength, meta_prob). meta_prob=0.5 when no meta model.
     X_arr = feature_series.values.reshape(1, -1)
 
     raw_prob = float(model.predict_proba(X_arr)[0][1])
@@ -115,25 +148,37 @@ def _predict(model, calibrator, meta_model, feature_series: pd.Series, meta_entr
     else:
         primary_prob = raw_prob
 
+    meta_prob = 0.5
     if meta_model is not None:
-        # Meta model was trained on build_meta_features() output — NOT primary features.
-        # Reconstruct the same feature space: prob_long/short, confidence, vol, zscore, ofi.
-        # Regime probs are not available live per-bar so we pass None (meta_df will have NaN cols).
-        oof_proba_1bar = np.array([[1.0 - primary_prob, primary_prob]])
-        # Column names may have suffixes (e.g. realized_vol_20, ofi_20) — find first match
-        _idx = feature_series.index
-        _vol_col = next((c for c in _idx if c.startswith("realized_vol")), None)
-        _zscore_col = next((c for c in _idx if c.startswith("volume_zscore")), None)
-        _ofi_col = next((c for c in _idx if c.startswith("ofi")), None)
-        _spread_col = next((c for c in _idx if c.startswith("spread_proxy")), None)
-        _atr_col = next((c for c in _idx if c == "atr_14"), None)
-        realized_vol = pd.Series([feature_series[_vol_col] if _vol_col else np.nan])
-        volume_zscore = pd.Series([feature_series[_zscore_col] if _zscore_col else np.nan])
-        ofi = pd.Series([feature_series[_ofi_col] if _ofi_col else np.nan])
-        spread_series = pd.Series([feature_series[_spread_col] if _spread_col else np.nan])
-        atr_series = pd.Series([feature_series[_atr_col] if _atr_col else np.nan])
+        # Meta model trained on build_meta_features() output.
+        # Use raw_prob (pre-calibration) to match stage_05 training distribution — Platt
+        # scaling changes the probability distribution and would cause feature drift.
+        oof_proba_1bar = np.array([[1.0 - raw_prob, raw_prob]])
+
+        # Use raw (pre-scale) values captured before StandardScaler in compute_live_features.
+        # stage_05 training reads these from the unscaled features parquet — must match.
+        # Exact column names must match stage_05: rv_daily, volume_surprise_20, ofi_20, etc.
+        _meta_raw = feature_series.attrs.get("meta_raw", {})
+        realized_vol  = pd.Series([_meta_raw.get("rv_daily",           np.nan)])
+        volume_zscore = pd.Series([_meta_raw.get("volume_surprise_20", np.nan)])
+        ofi           = pd.Series([_meta_raw.get("ofi_20",             np.nan)])
+        spread_series = pd.Series([_meta_raw.get("spread_proxy_20",    np.nan)])
+        atr_series    = pd.Series([_meta_raw.get("atr_14",             np.nan)])
+
+        # Extract regime_prob_* from feature_series — these are available because
+        # compute_live_features loads HMM artifacts and appends regime_prob_* columns
+        # before scaling. Passing them to build_meta_features matches the training path
+        # in stage_05 where regime probs were also included.
+        _regime_cols = [c for c in feature_series.index if c.startswith("regime_prob_")]
+        if _regime_cols:
+            _regime_vals = pd.DataFrame(
+                {c: [float(feature_series[c])] for c in _regime_cols}
+            )
+        else:
+            _regime_vals = None
+
         meta_X = build_meta_features(
-            oof_proba_1bar, None, realized_vol, volume_zscore, ofi,
+            oof_proba_1bar, _regime_vals, realized_vol, volume_zscore, ofi,
             spread_series=spread_series, atr_series=atr_series,
         )
         # Align to training feature schema to prevent shape mismatch
@@ -155,7 +200,7 @@ def _predict(model, calibrator, meta_model, feature_series: pd.Series, meta_entr
     else:
         signal_strength = abs(primary_prob - 0.5) * 2.0
 
-    return primary_prob, signal_strength
+    return primary_prob, signal_strength, meta_prob
 
 
 def _compute_daily_pnl_pct(trade_log_path: Path, equity: float) -> float:
@@ -237,8 +282,14 @@ def _reconcile_positions_from_api(client, order_manager, trading_mode: str) -> N
                     "tp_order_id": None,
                     "sl_order_id": None,
                     "entry_time": datetime.now(timezone.utc).isoformat(),
+                    "entry_epoch": time.time(),
                     "regime": "unknown",
                     "signal_strength": 0.0,
+                    "tp_pct_used": 0.0,
+                    "sl_pct_used": 0.0,
+                    "atr_pct_at_entry": 0.0,
+                    "primary_prob_at_entry": 0.5,
+                    "meta_prob_at_entry": 0.5,
                 }
 
         # Ghost positions: in local dict but exchange shows zero — already closed externally
@@ -303,7 +354,14 @@ def run(cfg, **kwargs) -> None:
 
     try:
         server_ms = client.get_server_time()
-        logger.info(f"Connected [{trading_mode}] — {datetime.fromtimestamp(server_ms/1000, tz=timezone.utc).strftime('%H:%M:%S UTC')}  tf={primary_tf}  floor={signal_floor}")
+        server_dt = datetime.fromtimestamp(server_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S UTC")
+        logger.info(f"Connected [{trading_mode}] — {server_dt}  tf={primary_tf}  floor={signal_floor}")
+        _rich_console.print(
+            f"\n[bold cyan]━━━ STAGE 8 LIVE ━━━[/bold cyan]  "
+            f"mode=[yellow]{trading_mode}[/yellow]  "
+            f"tf=[cyan]{primary_tf}[/cyan]  "
+            f"server=[dim]{server_dt}[/dim]"
+        )
     except Exception as exc:
         logger.error(f"Cannot connect to Binance: {exc}")
         raise
@@ -311,27 +369,43 @@ def run(cfg, **kwargs) -> None:
     state = load_state()
     forecast_symbols = _get_forecast_symbols(all_symbols, primary_tf)
 
+    # Filter 0: user-defined permanent exclude list from config
+    _manual_exclude = set(list(getattr(cfg.trading, "exclude_symbols", [])))
+    if _manual_exclude:
+        _was = len(forecast_symbols)
+        forecast_symbols = [s for s in forecast_symbols if s not in _manual_exclude]
+        logger.info(f"Filter 0: {_was - len(forecast_symbols)} symbols excluded by exclude_symbols config: {_manual_exclude}")
+
     # Filter 1: artifacts (imputer/scaler must exist)
     _missing = [s for s in forecast_symbols
                 if not (Path(cfg.data.checkpoints_dir) / "imputers" / f"imputer_{s}_15m.pkl").exists()
                 or not (Path(cfg.data.checkpoints_dir) / "imputers" / f"scaler_{s}_15m.pkl").exists()]
     forecast_symbols = [s for s in forecast_symbols if s not in _missing]
     if _missing:
-        logger.debug(f"Excluded (missing artifacts): {_missing}")
+        logger.info(f"Filter 1: {len(_missing)} excluded (missing imputer/scaler artifacts): {_missing}")
 
     # Filter 2: negative backtest Sharpe OR critically low hit_rate (inverted signal)
     # hit_rate < 0.40 on 2:1 R:R labels means model has inverted signal, not just bad luck
     _metrics_path = Path(cfg.data.results_dir) / "per_symbol_metrics.csv"
     _bad: set = set()
     if _metrics_path.exists():
-        import pandas as _pd
-        _pm = _pd.read_csv(_metrics_path)
+        _pm = pd.read_csv(_metrics_path)
         _bad_sharpe = set(_pm.loc[_pm["sharpe"] < 0, "symbol"].tolist())
         _hit_rate_col = "hit_rate" if "hit_rate" in _pm.columns else None
-        _bad_hr = set(_pm.loc[_pm[_hit_rate_col] < 0.40, "symbol"].tolist()) if _hit_rate_col else set()
+        if _hit_rate_col:
+            # Exclude only rows with real hit_rate data (n_trades > 0) below threshold.
+            # hit_rate=0.0 with n_trades>0 means corrupt backtest sizing — skip the filter
+            # rather than blacklisting every symbol. NaN (no trades) also skipped.
+            _has_trades = _pm.get("n_trades", pd.Series(0, index=_pm.index)) > 0
+            _valid_hr = _pm[_hit_rate_col].notna() & (_pm[_hit_rate_col] > 0) & _has_trades
+            _bad_hr = set(_pm.loc[_valid_hr & (_pm[_hit_rate_col] < 0.40), "symbol"].tolist())
+        else:
+            _bad_hr = set()
         _bad = _bad_sharpe | _bad_hr
+        if _bad_sharpe:
+            logger.info(f"Filter 2: {len(_bad_sharpe)} excluded (negative backtest Sharpe): {sorted(_bad_sharpe)}")
         if _bad_hr - _bad_sharpe:
-            logger.warning(f"Excluded by hit_rate < 0.40 (inverted signal): {_bad_hr - _bad_sharpe}")
+            logger.info(f"Filter 2: {len(_bad_hr - _bad_sharpe)} excluded (hit_rate < 0.40 — inverted signal): {sorted(_bad_hr - _bad_sharpe)}")
         forecast_symbols = [s for s in forecast_symbols if s not in _bad]
 
     # Filter 3: structurally untradeable — exclude only if max_qty × price < min_notional.
@@ -349,7 +423,6 @@ def run(cfg, **kwargs) -> None:
             _step = client.get_qty_step(_sym)
             _min_notional = client.get_min_notional(_sym)
             # Minimum qty needed to satisfy min_notional, rounded up to nearest step
-            import math
             _min_qty_needed = math.ceil((_min_notional / _price) / _step) * _step if _price > 0 else float("inf")
             _max_qty = client.get_max_qty(_sym, _price)
             # Untradeable only if even 1 lot × price < min_notional AND max_qty can't cover it
@@ -366,12 +439,19 @@ def run(cfg, **kwargs) -> None:
     forecast_symbols = [s for s in forecast_symbols if s not in _untradeable]
 
     logger.info(
-        f"Active symbols: {len(forecast_symbols)} "
-        f"(excluded: {len(_missing)} no artifacts, {len(_bad)} neg sharpe, "
-        f"{len(_untradeable)} untradeable, {len(_probe_errors)} probe errors kept)"
+        f"━━━ Symbol filters complete ━━━\n"
+        f"  Total in config:       {len(all_symbols)}\n"
+        f"  Have trained model:    {len(forecast_symbols) + len(_missing) + len(_bad) + len(_untradeable) + len(list(_manual_exclude & set(all_symbols)))}\n"
+        f"  Excluded manual list:  {len(_manual_exclude & set(all_symbols))}\n"
+        f"  Excluded no artifacts: {len(_missing)}\n"
+        f"  Excluded neg Sharpe/HR:{len(_bad)}\n"
+        f"  Excluded untradeable:  {len(_untradeable)}\n"
+        f"  ─────────────────────────────\n"
+        f"  ACTIVE for trading:    {len(forecast_symbols)} → {sorted(forecast_symbols)}"
     )
 
     # Pre-load models
+    logger.info(f"Pre-loading {len(forecast_symbols)} models...")
     for _sym in forecast_symbols:
         order_manager.heartbeat()  # DMS keepalive during model preload
         try:
@@ -393,6 +473,8 @@ def run(cfg, **kwargs) -> None:
 
     # Rolling Sharpe guardrail: if last 7-day Sharpe from trade log < 0, log warning + halve sizing
     _sharpe_size_factor: float = 1.0  # 1.0 = full size, 0.5 = halved
+
+    _bar_panel = LiveBarPanel()
 
     try:
         while True:
@@ -429,9 +511,12 @@ def run(cfg, **kwargs) -> None:
             if today_utc != wallet_today_date:
                 wallet_today = equity
                 wallet_today_date = today_utc
-                vol_mult = float(getattr(cfg.portfolio, "volume_multiplier", 2.0))
-                _total_vol = wallet_today * vol_mult
-                logger.info(f"Wallet locked for {today_utc}: ${wallet_today:.2f} × {vol_mult}× = total_volume ${_total_vol:.2f} (leverage={leverage}× for margin only)")
+                # Persist wallet_day_start so _get_trade_limit can compute daily P&L vs day-open
+                _state_snap = load_state()
+                _state_snap["wallet_day_start"] = wallet_today
+                save_state(_state_snap)
+                _vol_mult_log = _get_vol_mult(wallet_today, cfg)
+                logger.info(f"Wallet locked for {today_utc}: ${wallet_today:.2f} × {_vol_mult_log}x = notional ${wallet_today * _vol_mult_log:.2f} per position (leverage={leverage}x)")
 
             state = load_state()
             trade_limit = _get_trade_limit(cfg, state)
@@ -440,17 +525,35 @@ def run(cfg, **kwargs) -> None:
             # Position reconciliation: every bar, check API vs local dict for orphan/ghost positions
             _reconcile_positions_from_api(client, order_manager, trading_mode)
 
+            # Graceful shutdown via flag file — set by vps_hot_swap.sh before model swap.
+            # Wait for all positions to close naturally (TP/SL) before exiting.
+            if _RETRAIN_FLAG.exists():
+                open_count_now = len(order_manager.positions)
+                if open_count_now == 0:
+                    logger.info("Retrain flag detected and no open positions — shutting down for model hot-swap")
+                    _tg_maintenance("stopped", "Stage 8 stopped cleanly. Model hot-swap in progress.")
+                    _RETRAIN_FLAG.unlink(missing_ok=True)
+                    return
+                else:
+                    _tg_alert(
+                        "maintenance_waiting",
+                        f"Retrain pending — waiting for {open_count_now} open position(s) to close before shutdown.",
+                        cooldown_s=300,
+                    )
+                    logger.info(f"Retrain flag present — waiting for {open_count_now} open position(s) to close")
+
             daily_pnl_pct = _compute_daily_pnl_pct(_TRADE_LOG_PATH, equity)
             daily_target_hit = daily_pnl_pct >= daily_profit_target
 
-            # Rolling Sharpe guardrail: halve sizing if 7-day Sharpe is negative
+            # Rolling Sharpe guardrail: halve sizing if 7-day Sharpe is negative. NaN → full size.
             _rolling_sharpe = _compute_rolling_sharpe(_TRADE_LOG_PATH, days=7)
-            if not (isinstance(_rolling_sharpe, float) and _rolling_sharpe != _rolling_sharpe):  # not nan
-                if _rolling_sharpe < 0:
-                    _sharpe_size_factor = 0.5
-                    logger.warning(f"Rolling 7d Sharpe={_rolling_sharpe:.3f} < 0 — sizing halved to 50%")
-                else:
-                    _sharpe_size_factor = 1.0
+            if math.isnan(_rolling_sharpe):
+                _sharpe_size_factor = 1.0
+            elif _rolling_sharpe < 0:
+                _sharpe_size_factor = 0.5
+                logger.warning(f"Rolling 7d Sharpe={_rolling_sharpe:.3f} < 0 — sizing halved to 50%")
+            else:
+                _sharpe_size_factor = 1.0
 
             btc_klines_bar: pd.DataFrame | None = None
             try:
@@ -463,8 +566,21 @@ def run(cfg, **kwargs) -> None:
             # sort by signal_strength and open the highest-conviction positions first.
             bar_signals = []
             scored: list[dict] = []  # candidates eligible for entry (above floor, slot available)
+            # Circuit breaker removals are collected here and applied AFTER the loop —
+            # modifying forecast_symbols inside the tqdm loop only affects the *next* bar
+            # (tqdm iterates the original list snapshot), so we use an explicit skip set.
+            _circuit_tripped: set[str] = set()
 
-            for symbol in tqdm(forecast_symbols, desc="scoring", unit="sym", position=0, leave=False):
+            from src.utils.cli_progress import make_symbol_progress
+            _score_prog = make_symbol_progress()
+            _score_task = _score_prog.add_task(
+                f"[cyan]scoring {len(forecast_symbols)} symbols[/cyan]",
+                total=len(forecast_symbols),
+            )
+            _score_prog.start()
+            for symbol in forecast_symbols:
+                if symbol in _circuit_tripped:
+                    continue
                 try:
                     sig_info = _score_symbol(
                         symbol=symbol,
@@ -498,12 +614,24 @@ def run(cfg, **kwargs) -> None:
                             f"Circuit breaker: {symbol} failed {_sym_error_count[symbol]} consecutive bars "
                             f"— removing from forecast_symbols"
                         )
-                        forecast_symbols = [s for s in forecast_symbols if s != symbol]
+                        _circuit_tripped.add(symbol)
                         _sym_error_count.pop(symbol, None)
+                _score_prog.advance(_score_task)
                 order_manager.heartbeat()
 
-            # Phase 2: sort candidates by signal_strength desc, open top-N positions
-            scored.sort(key=lambda x: x["signal_strength"], reverse=True)
+            _score_prog.stop()
+
+            # Apply circuit breaker removals — takes effect from the next bar onwards
+            if _circuit_tripped:
+                forecast_symbols = [s for s in forecast_symbols if s not in _circuit_tripped]
+
+            # Phase 2: sort by composite score = signal_strength × tp_reach_score.
+            # tp_reach_score = atr_pct / tp_pct: how many ATRs the price needs to move to hit TP.
+            # Higher value → price volatility is large relative to TP distance → faster TP hit.
+            # This prevents picking a slow coin when a volatile one has the same signal quality.
+            for _c in scored:
+                _c["composite_score"] = _c["signal_strength"] * _c.get("tp_reach_score", 1.0)
+            scored.sort(key=lambda x: x["composite_score"], reverse=True)
             open_count = len(order_manager.positions)
             slots_left = trade_limit - open_count
 
@@ -527,13 +655,28 @@ def run(cfg, **kwargs) -> None:
                     if order_id:
                         cand["action"] = "ENTERED"
                         slots_left -= 1
-                        # Use actual filled size from position dict (may be capped by maxQty)
                         actual_size = order_manager.positions.get(symbol, {}).get("size_usd", cand["volume_usdt"])
                         logger.info(
                             f"{symbol}: ENTERED {cand['direction_str'].upper()} — "
                             f"wallet={equity:.2f} USDT volume={actual_size:.2f} USDT ({cand['leverage']}×) "
                             f"tp={cand['tp_pct']:.2%} sl={cand['sl_pct']:.2%} signal={cand['signal_strength']:.3f} orderId={order_id}"
                         )
+                        # Telegram: entry notification
+                        if getattr(getattr(cfg, "telegram", None), "notify_entry", True):
+                            _pos = order_manager.positions.get(symbol, {})
+                            _tg_entry(
+                                symbol=symbol,
+                                direction=cand["direction_str"],
+                                entry_price=cand["entry_price"],
+                                size_usd=actual_size,
+                                tp_pct=cand["tp_pct"],
+                                sl_pct=cand["sl_pct"],
+                                signal_strength=cand["signal_strength"],
+                                primary_prob=cand.get("primary_prob", 0.5),
+                                meta_prob=cand.get("meta_prob", 0.5),
+                                leverage=cand["leverage"],
+                                regime=cand.get("regime", ""),
+                            )
                     else:
                         cand["action"] = "FAILED"
                 except Exception as exc:
@@ -541,12 +684,12 @@ def run(cfg, **kwargs) -> None:
                     cand["action"] = "FAILED"
                 order_manager.heartbeat()
 
-            # Bar summary — show entered/failed/skipped at a glance
-            _entered = [s["symbol"] for s in bar_signals if s.get("action") == "ENTERED"]
-            _failed  = [s["symbol"] for s in bar_signals if s.get("action") == "FAILED"]
-            _skipped = [s["symbol"] for s in bar_signals if s.get("action", "").startswith("SKIP")]
-            logger.info(
-                f"Bar summary — ENTERED: {_entered} | FAILED: {_failed} | SKIPPED: {len(_skipped)}"
+            # Rich bar summary panel
+            _bar_panel.print_bar_result(
+                bar_signals=bar_signals,
+                equity=equity,
+                bar_time=bar_start,
+                open_positions=order_manager.positions,
             )
 
             # Post-bar equity refresh for dashboard
@@ -561,6 +704,12 @@ def run(cfg, **kwargs) -> None:
             _demo_done = int(_state_now.get("account", {}).get("demo_trades_completed", 0))
             _demo_req = int(cfg.growth_gate.demo_trades_required)
             _daily_pnl = _compute_daily_pnl_pct(_TRADE_LOG_PATH, live_equity)
+
+            # Refresh drift rollup (live vs training) — cheap, reads trade log + training summary
+            try:
+                _write_drift_rollup()
+            except Exception as _rollup_exc:
+                logger.debug(f"Drift rollup write failed: {_rollup_exc}")
 
             dashboard.update({
                 "mode": trading_mode,
@@ -616,18 +765,8 @@ def run(cfg, **kwargs) -> None:
 
 
 def _compute_atr(klines_df: pd.DataFrame, period: int = 14) -> float:
-    # Wilder ATR on the fetched klines — matches triple-barrier logic in labels
-    high = klines_df["high"]
-    low = klines_df["low"]
-    close = klines_df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr_series = tr.ewm(span=period, min_periods=period, adjust=False).mean()
-    return float(atr_series.iloc[-1]) if not atr_series.empty else float(close.iloc[-1] * 0.01)
+    atr_series = _compute_atr_series(klines_df["high"], klines_df["low"], klines_df["close"], period)
+    return float(atr_series.iloc[-1]) if not atr_series.empty else float(klines_df["close"].iloc[-1] * 0.01)
 
 
 def _score_symbol(
@@ -654,19 +793,21 @@ def _score_symbol(
     if len(klines_df) < lookback_needed // 2:
         logger.warning(f"{symbol}: insufficient kline data ({len(klines_df)} bars) — skipping")
         return None
+    # Drop the last (currently-forming) bar — its close is mid-bar and not a completed
+    # candle. Training was done on completed bars only, so including it creates a
+    # live/training feature-distribution mismatch. After shift(1) in compute_live_features
+    # the penultimate bar becomes the feature row, which is always complete.
+    klines_df = klines_df.iloc[:-1]
 
-    klines_1h, klines_4h, klines_1d = None, None, None
-    for tf, limit in [("1h", 500), ("4h", 200), ("1d", 100)]:
+    htf: dict[str, pd.DataFrame | None] = {"1h": None, "4h": None, "1d": None}
+    for tf, limit in (("1h", 500), ("4h", 200), ("1d", 100)):
         try:
-            df_htf = client.get_klines(symbol, tf, limit=limit)
-            if tf == "1h":
-                klines_1h = df_htf
-            elif tf == "4h":
-                klines_4h = df_htf
-            elif tf == "1d":
-                klines_1d = df_htf
+            _htf_raw = client.get_klines(symbol, tf, limit=limit)
+            # Drop forming bar on HTF as well
+            htf[tf] = _htf_raw.iloc[:-1] if len(_htf_raw) > 1 else _htf_raw
         except Exception as _htf_exc:
             logger.warning(f"{symbol}: could not fetch {tf} klines — HTF features will be missing: {_htf_exc}")
+    klines_1h, klines_4h, klines_1d = htf["1h"], htf["4h"], htf["1d"]
 
     feature_series = compute_live_features(
         symbol, cfg, klines_df,
@@ -682,53 +823,66 @@ def _score_symbol(
         logger.warning(f"{symbol}: no cached model, skipping bar")
         return None
 
-    primary_prob, signal_strength = _predict(primary_model, calibrator, meta_model, feature_series, meta_entry=meta_entry)
+    primary_prob, signal_strength, meta_prob = _predict(primary_model, calibrator, meta_model, feature_series, meta_entry=meta_entry)
 
     # Sync fills — detect TP/SL hits and DEMO simulated exits
     fill = order_manager.sync_fills(symbol)
     if fill is not None:
-        pnl_usd = fill['pnl_pct'] * fill['size_usd']
-        pnl_style = "+" if fill['pnl_pct'] >= 0 else ""
+        pnl_usd   = fill["pnl_pct"] * fill["size_usd"]
+        pnl_style = "+" if fill["pnl_pct"] >= 0 else ""
         logger.info(f"{symbol}: CLOSED — P&L {pnl_style}{pnl_usd:.2f} USDT ({pnl_style}{fill['pnl_pct']:.2%})")
+        # Telegram: exit notification
+        if getattr(getattr(cfg, "telegram", None), "notify_exit", True):
+            _tg_exit(
+                symbol=symbol,
+                direction=str(fill.get("direction", "long")),
+                entry_price=float(fill.get("entry_price", 0)),
+                exit_price=float(fill.get("exit_price", 0)),
+                pnl_pct=float(fill["pnl_pct"]),
+                pnl_usd=float(pnl_usd),
+                exit_reason=str(fill.get("exit_reason", "UNKNOWN")),
+                bars_held=int(fill.get("bars_held", 0)),
+            )
 
     regime = state.get("model_tiers", {}).get(symbol, {}).get("last_regime", "unknown")
-
+    direction_str = "long" if primary_prob >= 0.5 else "short"
+    # dead_zone_direction: only mark a direction (for dashboard) if conviction is outside dead zone
     direction_int = 0
     if abs(primary_prob - 0.5) >= float(cfg.portfolio.dead_zone_direction):
         direction_int = 1 if primary_prob >= 0.5 else -1
 
-    direction_str = "long" if primary_prob >= 0.5 else "short"
-
-    # Sizing: volume per posisi = (wallet × volume_multiplier) / max_symbols
-    # volume_multiplier dari config (default 2.0) menentukan total notional target.
-    # Leverage hanya mempengaruhi margin requirement di exchange, bukan ukuran posisi.
-    # Contoh: wallet=$100, mult=2×, max_symbols=2, leverage=8×
-    #   → volume_per_posisi = $100 × 2 / 2 = $100
-    #   → margin_per_posisi = $100 / 8 = $12.5 (exchange-side, bukan urusan kita)
-    # Naikkan leverage → margin lebih kecil, volume tetap sama. Sesuai Est Profit.xlsx.
-    vol_mult = float(getattr(cfg.portfolio, "volume_multiplier", 2.0))
-    volume_usdt = (wallet_today * vol_mult) / max(trade_limit, 1)
-    max_volume_usdt = float(getattr(cfg.portfolio, "max_volume_usdt", 0))
-    if max_volume_usdt > 0 and volume_usdt > max_volume_usdt:
-        volume_usdt = max_volume_usdt
-    logger.debug(f"{symbol}: wallet={wallet_today:.2f} × {vol_mult}× / {trade_limit} slots = volume {volume_usdt:.2f} USDT (leverage={leverage}× for margin)")
+    # Sizing sesuai Est Profit.xlsx:
+    # - vol_mult dari tier (wallet < $150 → 2x, $150-$2500 → 3x, >= $2500 → 2x)
+    # - volume per posisi = wallet × vol_mult (TIDAK dibagi jumlah slot)
+    # - leverage 10x fixed → margin per posisi = volume / 10
+    vol_mult    = _get_vol_mult(wallet_today, cfg)
+    volume_usdt = wallet_today * vol_mult
+    logger.debug(f"{symbol}: wallet={wallet_today:.2f} × {vol_mult}x = volume {volume_usdt:.2f} USDT (leverage={leverage}x → margin={volume_usdt/max(leverage,1):.2f})")
 
     entry_price = float(klines_df["close"].iloc[-1])
 
+    # Always compute ATR — used for logging/drift metrics even when fixed TP/SL override applies
+    atr = _compute_atr(klines_df)
+    atr_pct = atr / max(entry_price, 1e-12)
     tp_fixed = float(getattr(cfg.growth_gate, "tp_fixed_pct", 0))
     sl_fixed = float(getattr(cfg.growth_gate, "sl_fixed_pct", 0))
     if tp_fixed > 0 and sl_fixed > 0:
         tp_pct, sl_pct = tp_fixed, sl_fixed
     else:
-        atr = _compute_atr(klines_df)
-        atr_pct = atr / max(entry_price, 1e-12)
         tp_pct = min(max(float(cfg.labels.tp_min_pct), atr_pct * float(cfg.labels.tp_atr_mult)), float(cfg.labels.tp_max_pct))
         sl_pct = min(max(float(cfg.labels.sl_min_pct), atr_pct * float(cfg.labels.sl_atr_mult)), float(cfg.labels.sl_max_pct))
+
+    # ATR reachability score: how many ATRs is TP away?
+    # atr_pct / tp_pct = 1 means one ATR move hits TP (fast); < 1 means TP > 1 ATR (slower).
+    # Higher score → price volatility is large relative to TP distance → higher TP probability per bar.
+    tp_reach_score = atr_pct / max(tp_pct, 1e-9)
 
     sig_info = {
         "symbol": symbol,
         "primary_prob": round(primary_prob, 4),
+        "meta_prob": round(meta_prob, 4),
         "signal_strength": round(signal_strength, 4),
+        "tp_reach_score": round(tp_reach_score, 4),
         "direction": direction_int,
         "direction_str": direction_str,
         "regime": regime,
@@ -737,6 +891,7 @@ def _score_symbol(
         "leverage": leverage,
         "tp_pct": tp_pct,
         "sl_pct": sl_pct,
+        "atr_pct": atr_pct,
         "action": "NO_SIGNAL",
     }
 
@@ -746,6 +901,13 @@ def _score_symbol(
 
     if skip_new_entries:
         sig_info["action"] = "SKIP_DAILY"
+        return sig_info
+
+    # Dead zone: if model conviction is below threshold, direction is unreliable — skip.
+    # Must check before signal_floor: meta_prob can push signal_strength above floor
+    # even when the primary signal is near-random.
+    if direction_int == 0:
+        sig_info["action"] = "SKIP_DEAD_ZONE"
         return sig_info
 
     if signal_strength < signal_floor:
@@ -775,4 +937,7 @@ def _enter_position(
         sl_pct=sig_info["sl_pct"],
         regime=sig_info["regime"],
         signal_strength=sig_info["signal_strength"],
+        atr_pct=sig_info.get("atr_pct", 0.0),
+        primary_prob=sig_info.get("primary_prob", 0.5),
+        meta_prob=sig_info.get("meta_prob", 0.5),
     )

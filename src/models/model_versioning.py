@@ -83,16 +83,9 @@ def generate_version_string(
     train_start: str,
     train_end: str,
 ) -> str:
-    # SHA256 of sorted feature names + sorted hyperparams + train dates
-    hash_input = (
-        str(sorted(feature_names))
-        + str(sorted(hyperparams.items()))
-        + str(train_start)
-        + str(train_end)
-    )
-    h = hashlib.sha256(hash_input.encode()).hexdigest()[:8]
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"{symbol}_{tf}_{ts}_{h}"
+    # Fixed filename — retrain always overwrites the same file on disk.
+    # History is preserved in the registry (config_hash + created_at per entry).
+    return f"{symbol}_{tf}"
 
 
 def register_model(
@@ -142,6 +135,12 @@ def register_model(
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning(f"Could not read model_registry.json ({e}) — starting fresh")
 
+        # Upsert: replace existing entry for (symbol, tf, model_type) to avoid stale history bloat
+        key = (symbol, tf, model_type)
+        registry["models"] = [
+            m for m in registry["models"]
+            if not (m["symbol"] == symbol and m["tf"] == tf and m["model_type"] == model_type)
+        ]
         registry["models"].append(entry)
 
         with open(_REGISTRY_PATH, "w") as f:

@@ -12,9 +12,12 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = get_logger("meta_labeler")
 
 
-def create_meta_labels(y_true: np.ndarray, oof_proba: np.ndarray, dead_zone: float = 0.05) -> np.ndarray:
-    # meta_y = 1 if primary prediction was correct, 0 otherwise
-    # Dead-zone bars (|prob-0.5| < dead_zone): primary is near-random → exclude as "don't trust"
+def create_meta_labels(y_true: np.ndarray, oof_proba: np.ndarray, dead_zone: float = 0.05) -> tuple:
+    # Returns (meta_y, dead_zone_mask).
+    # meta_y = 1 if primary prediction was correct, 0 otherwise.
+    # dead_zone_mask = True where |prob-0.5| < dead_zone — caller should DROP these rows,
+    # not train on them. Setting meta_y=0 there would teach the meta-model to predict
+    # "incorrect" on near-random bars, polluting the correctness signal.
     if oof_proba.ndim == 2:
         prob_long = oof_proba[:, 1]
         pred_class = (prob_long > 0.5).astype(int)
@@ -22,9 +25,8 @@ def create_meta_labels(y_true: np.ndarray, oof_proba: np.ndarray, dead_zone: flo
         prob_long = oof_proba
         pred_class = (prob_long > 0.5).astype(int)
     meta_y = (pred_class == y_true.astype(int)).astype(int)
-    in_dead_zone = np.abs(prob_long - 0.5) < dead_zone
-    meta_y[in_dead_zone] = 0
-    return meta_y
+    dead_zone_mask = np.abs(prob_long - 0.5) < dead_zone
+    return meta_y, dead_zone_mask
 
 
 def build_meta_features(
@@ -66,7 +68,7 @@ def build_meta_features(
     # Time since last signal: bars since |prob_long - 0.5| > 0.1
     signal_active = (np.abs(prob_long - 0.5) > 0.1).astype(float)
     bars_since = np.zeros(len(signal_active))
-    counter = len(signal_active)  # large sentinel for "never"
+    counter = 0  # 0 = "at signal" for the very first bar, not "never seen"
     for i in range(len(signal_active)):
         if signal_active[i] > 0:
             counter = 0
@@ -104,11 +106,14 @@ def train_meta_labeler(
     meta_spw = n_meta0 / max(n_meta1, 1)
     logger.info(f"Meta scale_pos_weight: {meta_spw:.3f} (n0={n_meta0}, n1={n_meta1})")
 
-    # 10-trial Optuna mini-study to tune lr and subsample — temporal 80/20 split
-    split_idx = int(0.8 * len(X))
-    X_ms, X_mv = X[:split_idx], X[split_idx:]
-    y_ms, y_mv = meta_y_train[:split_idx], meta_y_train[split_idx:]
-    w_ms = w[:split_idx]
+    # Triple temporal split: 60% fit / 20% Optuna eval / 20% ES
+    # Optuna and final-model early stopping must see different data — using the same
+    # held-out set for both lets Optuna leak the ES signal into hyperparameter selection.
+    split_60 = int(0.6 * len(X))
+    split_80 = int(0.8 * len(X))
+    X_ms, y_ms, w_ms = X[:split_60], meta_y_train[:split_60], w[:split_60]
+    X_mv, y_mv = X[split_60:split_80], meta_y_train[split_60:split_80]  # Optuna eval
+    X_es, y_es = X[split_80:], meta_y_train[split_80:]                  # final ES
 
     def _meta_objective(trial):
         lr = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
@@ -130,7 +135,6 @@ def train_meta_labeler(
         )
         m.fit(X_ms, y_ms, sample_weight=w_ms)
         proba = m.predict_proba(X_mv)[:, 1]
-        # Use log-loss negated as maximize objective
         eps = 1e-9
         logloss = -np.mean(y_mv * np.log(proba + eps) + (1 - y_mv) * np.log(1 - proba + eps))
         return -logloss
@@ -146,9 +150,11 @@ def train_meta_labeler(
         best_lr = 0.05
         best_sub = 0.8
 
-    # Early stopping on temporal 80/20 split — patience from config (default 10)
-    # Prevents overfitting on small feature set (8-12 features), finds true optimal n_trees
+    # Final model: fit on 60%+20%=80%, early stop on held-out 20% ES set
     es_patience = int(getattr(cfg.model, "meta_early_stopping_rounds", 10))
+    X_fit = X[:split_80]
+    y_fit = meta_y_train[:split_80]
+    w_fit = w[:split_80]
     model = XGBClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
@@ -166,8 +172,8 @@ def train_meta_labeler(
         verbosity=0,
     )
     model.fit(
-        X, meta_y_train, sample_weight=w,
-        eval_set=[(X_mv, y_mv)],  # reuse the same temporal val split from Optuna
+        X_fit, y_fit, sample_weight=w_fit,
+        eval_set=[(X_es, y_es)],
         verbose=False,
     )
     best_n_trees = model.best_iteration + 1 if hasattr(model, "best_iteration") and model.best_iteration else n_estimators
@@ -181,37 +187,6 @@ def train_meta_labeler(
         "meta_best_n_trees": best_n_trees,
     }
     return model, meta_stats
-
-
-def compute_signal_strength(
-    primary_proba: np.ndarray,
-    meta_proba: np.ndarray,
-    cfg,
-) -> tuple:
-    # primary_proba: (N, 2) or scalar for single bar
-    # meta_proba: scalar probability of being correct
-    signal_floor = float(cfg.model.meta_signal_floor)
-
-    if primary_proba.ndim == 2:
-        prob_long = float(primary_proba[0, 1]) if primary_proba.shape[0] == 1 else primary_proba[:, 1]
-    else:
-        prob_long = float(primary_proba)
-
-    if np.isscalar(prob_long):
-        direction = 1 if prob_long > 0.5 else -1
-        primary_conf = prob_long if direction == 1 else (1.0 - prob_long)
-        strength = primary_conf * float(meta_proba)
-        if strength < signal_floor:
-            return 0, 0.0
-        return direction, strength
-    else:
-        # Vectorized
-        direction = np.where(prob_long > 0.5, 1, -1)
-        primary_conf = np.where(direction == 1, prob_long, 1.0 - prob_long)
-        strength = primary_conf * meta_proba
-        direction = np.where(strength < signal_floor, 0, direction)
-        strength = np.where(strength < signal_floor, 0.0, strength)
-        return direction, strength
 
 
 def save_meta_model(model: XGBClassifier, symbol: str, tf: str, version: str, models_dir) -> None:

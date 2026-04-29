@@ -27,15 +27,12 @@ def fit_garch_vol_forecasts(returns_df: pd.DataFrame, train_end: str) -> dict:
             # Forecast 1-step ahead for each bar
             n_out_of_sample = len(series) - len(train_series)
             if n_out_of_sample > 0:
-                forecasts = res.forecast(horizon=1, start=len(train_series) - 1, reindex=False)
-                forecast_var = forecasts.variance.values[:, 0] / 10000  # unscale
-                # Combine fitted conditional vol (train) + forecasted (test)
                 fitted_vol = pd.Series(
                     np.sqrt(res.conditional_volatility.values / 100.0),
                     index=train_series.index,
                 )
-                # Simple rolling std for out-of-sample
-                oos_vol = series.iloc[len(train_series):].rolling(20, min_periods=1).std()
+                # Rolling std from full series then slice — avoids truncated window at OOS start
+                oos_vol = series.rolling(20, min_periods=5).std().iloc[len(train_series):]
                 combined = pd.concat([fitted_vol, oos_vol])
                 vol_forecasts[col] = combined.reindex(series.index)
             else:
@@ -56,43 +53,32 @@ def compute_portfolio_cvar(
     returns_panel: pd.DataFrame,
     vol_forecasts: dict,
     confidence_levels: list,
-    n_scenarios: int = 10000,
 ) -> dict:
-    # Historical simulation with GARCH vol scaling
+    # Historical simulation with GARCH vol scaling — CVaR from full historical distribution
     symbols = list(weights.keys())
     w_arr = np.array([weights.get(s, 0.0) for s in symbols])
 
-    # Align returns
     ret_aligned = returns_panel[symbols].dropna()
     if len(ret_aligned) < 20:
         return {cl: np.nan for cl in confidence_levels}
 
     hist_vol = ret_aligned.std()
 
-    # Vol-adjusted scenario returns
     scaled_scenarios = ret_aligned.copy()
     for col in symbols:
         if col in vol_forecasts and vol_forecasts[col] is not None:
-            # Use last GARCH vol forecast
             garch_vol_last = vol_forecasts[col].dropna().iloc[-1] if len(vol_forecasts[col].dropna()) > 0 else hist_vol.get(col, 1.0)
             hist_v = hist_vol.get(col, 1.0)
             if hist_v > 0:
-                scale_factor = garch_vol_last / (hist_v + 1e-12)
-                scaled_scenarios[col] = ret_aligned[col] * scale_factor
+                scaled_scenarios[col] = ret_aligned[col] * (garch_vol_last / (hist_v + 1e-12))
 
-    # Portfolio PnL for each historical scenario
-    port_returns = (scaled_scenarios * w_arr).sum(axis=1).values
-
-    # Bootstrap to get n_scenarios
-    rng = np.random.RandomState(42)
-    sampled = rng.choice(port_returns, size=n_scenarios, replace=True)
+    port_returns = np.sort((scaled_scenarios * w_arr).sum(axis=1).values)
+    n = len(port_returns)
 
     result = {}
     for cl in confidence_levels:
-        cutoff_idx = int((1.0 - cl) * n_scenarios)
-        sorted_returns = np.sort(sampled)
-        cvar = float(np.mean(sorted_returns[:cutoff_idx])) if cutoff_idx > 0 else float(sorted_returns[0])
-        result[cl] = cvar
+        cutoff_idx = max(1, int((1.0 - cl) * n))
+        result[cl] = float(np.mean(port_returns[:cutoff_idx]))
 
     return result
 
@@ -111,8 +97,18 @@ def compute_component_var(
     if len(ret_aligned) < 20:
         return {s: np.nan for s in symbols}
 
-    # Covariance matrix
-    cov = ret_aligned.cov().values
+    # Apply same vol scaling as compute_portfolio_cvar for consistency
+    hist_vol = ret_aligned.std()
+    scaled = ret_aligned.copy()
+    for col in symbols:
+        if col in vol_forecasts and vol_forecasts[col] is not None:
+            garch_vol_last = vol_forecasts[col].dropna().iloc[-1] if len(vol_forecasts[col].dropna()) > 0 else hist_vol.get(col, 1.0)
+            hist_v = hist_vol.get(col, 1.0)
+            if hist_v > 0:
+                scaled[col] = ret_aligned[col] * (garch_vol_last / (hist_v + 1e-12))
+
+    # Covariance from vol-scaled returns
+    cov = scaled.cov().values
 
     # Portfolio variance = w^T Σ w
     port_var = float(w_arr @ cov @ w_arr)
@@ -133,27 +129,21 @@ def run_stress_scenarios(
     portfolio_state: dict,
     returns_panel: pd.DataFrame,
 ) -> dict:
-    # Stress scenarios: all_corr_1 and btc_dump_20pct
+    # Stress scenarios: all_corr_1 and btc_worst_1pct_bars
     weights = portfolio_state.get("weights", {})
     symbols = list(weights.keys())
     w_arr = np.array([weights.get(s, 0.0) for s in symbols])
 
     results = {}
 
-    # Scenario 1: all correlations = 1 (worst case linear loss)
+    # Scenario 1: worst 1% portfolio bar (historical)
     if len(symbols) > 0 and returns_panel is not None:
         ret_aligned = returns_panel[symbols].dropna()
         if len(ret_aligned) > 0:
-            # Portfolio loss when all assets move together (max loss direction)
-            mean_ret = ret_aligned.mean().values
-            # Weighted average of expected per-bar returns
-            all_corr_1_loss = float(w_arr @ mean_ret)
-            # Worst 1% historical bar
             port_ret = (ret_aligned * w_arr).sum(axis=1)
-            worst_1pct = float(port_ret.quantile(0.01))
-            results["all_corr_1"] = worst_1pct
+            results["worst_1pct_portfolio"] = float(port_ret.quantile(0.01))
 
-    # Scenario 2: BTC dumps 20%
+    # Scenario 2: portfolio loss on BTC worst-1%-bars (historical, not a synthetic -20% shock)
     if "BTCUSDT" in returns_panel.columns and len(symbols) > 0:
         ret_aligned = returns_panel[symbols].dropna()
         btc_ret = returns_panel["BTCUSDT"].dropna()
@@ -165,10 +155,10 @@ def run_stress_scenarios(
             if len(shared) > 0:
                 btc_stress_ret = ret_aligned.loc[shared]
                 port_loss = float((btc_stress_ret * w_arr).sum(axis=1).mean())
-                results["btc_dump_20pct"] = port_loss
+                results["btc_worst_1pct_bars"] = port_loss
             else:
-                results["btc_dump_20pct"] = np.nan
+                results["btc_worst_1pct_bars"] = np.nan
     else:
-        results["btc_dump_20pct"] = np.nan
+        results["btc_worst_1pct_bars"] = np.nan
 
     return results

@@ -5,20 +5,90 @@ import json
 from src.utils.config_loader import get_symbols
 from src.utils.state_manager import is_stage_complete, update_project_state
 from src.utils.logger import get_logger
-from src.utils.io_utils import read_features
+from src.utils.io_utils import read_features, read_checkpoint, checkpoint_exists
 from src.models.model_versioning import get_latest_model
 from src.models.primary_model import load_model
-from src.models.meta_labeler import load_meta_model, compute_signal_strength
+from src.models.meta_labeler import load_meta_model
 from src.models.imputer import transform_with_imputer, transform_with_scaler
-from src.portfolio.signal_generator import generate_signals, apply_conformal_size_scaling
+from src.models.htf_model import load_htf_model, predict_htf_proba
+from src.portfolio.signal_generator import generate_signals, apply_uncertainty_scaling
 from src.portfolio.position_sizer import compute_half_kelly, compute_position_size, apply_memecoin_rules
 from src.portfolio.correlation import fit_garch_per_asset, compute_dcc_correlations
-from src.portfolio.optimizer import optimize_portfolio_weights, equal_weight_fallback, rebalance_needed
-from src.portfolio.risk import fit_garch_vol_forecasts, compute_portfolio_cvar
+from src.portfolio.optimizer import optimize_portfolio_weights, equal_weight_fallback
 
 logger = get_logger("stage_06_portfolio")
 
 _TF = "15m"
+# HTF timeframes checked in the approval filter — must match stage_04b._HTF_TIMEFRAMES
+_HTF_APPROVAL_TFS = ["4h", "1d"]
+
+
+def _load_htf_macro_panels(cfg) -> dict:
+    processed_dir = Path(cfg.data.processed_dir)
+    panels = {}
+    for tf in _HTF_APPROVAL_TFS:
+        p = processed_dir / f"macro_panel_{tf}.parquet"
+        if p.exists():
+            try:
+                panels[tf] = pd.read_parquet(p)
+            except Exception as exc:
+                logger.warning(f"stage_06: could not load macro_panel_{tf}: {exc}")
+    return panels
+
+
+def _apply_htf_approval(
+    signals: pd.DataFrame,
+    symbol: str,
+    cfg,
+    checkpoints_dir: Path,
+    models_dir: Path,
+    htf_macro_panels: dict | None = None,
+) -> pd.DataFrame:
+    # Load HTF predictions for each timeframe and zero out signals where HTF disagrees.
+    # Graceful degradation: missing model or missing checkpoint → skip that timeframe's filter.
+    threshold = float(cfg.features.get("htf_approval_threshold", 0.45))
+
+    for tf in _HTF_APPROVAL_TFS:
+        model_path = models_dir / f"{symbol}_{tf}_htf_model.json"
+        if not model_path.exists():
+            logger.warning(f"  {symbol}: HTF model missing for {tf}, skipping approval filter")
+            continue
+
+        if not checkpoint_exists("ingest", symbol, tf, checkpoints_dir):
+            logger.warning(f"  {symbol}: no {tf} ingest checkpoint, skipping HTF approval for {tf}")
+            continue
+
+        try:
+            df_htf = read_checkpoint("ingest", symbol, tf, checkpoints_dir)
+            model, calibrator, feature_names = load_htf_model(symbol, tf, models_dir)
+            macro_panel = (htf_macro_panels or {}).get(tf, None)
+            htf_pred = predict_htf_proba(
+                model, calibrator, feature_names, df_htf, tf,
+                macro_panel=macro_panel,
+            )
+        except Exception as e:
+            logger.warning(f"  {symbol}: HTF {tf} prediction failed ({e}), skipping approval filter")
+            continue
+
+        # Forward-fill HTF predictions onto 15m index — bounded by htf_ffill_limits
+        ffill_limit = int(cfg.features.htf_ffill_limits.get(tf, 4))
+        htf_aligned = htf_pred.reindex(signals.index, method="ffill", limit=ffill_limit)
+
+        # Approval logic: LONG signal requires pred >= threshold; SHORT requires pred <= (1 - threshold)
+        # Bars where htf_aligned is NaN (beyond ffill window) are not penalised — only active disagreement zeroes the signal
+        htf_vals = htf_aligned.values
+        long_disapproved = (signals["direction"].values == 1) & (~np.isnan(htf_vals)) & (htf_vals < threshold)
+        short_disapproved = (signals["direction"].values == -1) & (~np.isnan(htf_vals)) & (htf_vals > (1.0 - threshold))
+        disapproved = long_disapproved | short_disapproved
+
+        n_disapproved = int(disapproved.sum())
+        if n_disapproved > 0:
+            logger.info(f"  {symbol}: HTF {tf} approval filter zeroed {n_disapproved} signals")
+            signals.loc[disapproved, "signal_strength"] = 0.0
+            signals.loc[disapproved, "direction"] = 0
+            signals.loc[disapproved, "is_signal"] = 0
+
+    return signals
 
 
 def _generate_symbol_signals(
@@ -27,6 +97,7 @@ def _generate_symbol_signals(
     checkpoints_dir: Path,
     features_dir: Path,
     models_dir: Path,
+    htf_macro_panels: dict | None = None,
 ) -> tuple:
     # Load primary model
     primary_entry = get_latest_model(symbol, _TF, model_type="primary")
@@ -65,7 +136,7 @@ def _generate_symbol_signals(
     avail_feats = [f for f in selected_features if f in features_df.columns]
     if len(avail_feats) != len(selected_features):
         logger.warning(f"  {symbol}: {len(selected_features) - len(avail_feats)} selected features missing from feature file")
-    X = features_df[avail_feats].select_dtypes(include=[np.number]).fillna(0)
+    X = features_df[avail_feats].select_dtypes(include=[np.number])
 
     try:
         X_imp = transform_with_imputer(X.values, symbol, _TF, imp_dir)
@@ -73,13 +144,20 @@ def _generate_symbol_signals(
     except Exception:
         X_scaled = X.values
 
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Primary model predictions
+    # Use RAW (uncalibrated) proba for direction/signal_strength — calibrated proba collapses
+    # to a narrow band (e.g. 0.97-0.98) when val set is heavily imbalanced (>90% label=+1),
+    # causing direction to always be 1 and signal_strength to have near-zero variance.
+    # OOF proba (used to train meta) is raw — must stay consistent (ISSUE-051).
+    # Calibrated proba is only used for the uncertainty_proxy (1-2|p-0.5|) below.
     try:
         raw_proba = primary_model.predict_proba(X_scaled)
         cal_proba = calibrator.predict(raw_proba[:, 1])
         proba_df = pd.DataFrame({
-            "prob_long": cal_proba,
-            "prob_short": 1.0 - cal_proba,
+            "prob_long": raw_proba[:, 1],
+            "prob_short": raw_proba[:, 0],
         }, index=features_df.index)
     except Exception as e:
         return symbol, None, f"Primary model prediction failed: {e}"
@@ -130,10 +208,15 @@ def _generate_symbol_signals(
     # Generate signals (ALL pre-computed before backtest)
     signals = generate_signals(proba_df, meta_proba_series, regime_df, cfg)
 
-    # Apply conformal width scaling
-    # Invert so width=0 means certain (→ full position) and width=1 means uncertain (→ 30% position)
-    conformal_width = 1.0 - abs(raw_proba[:, 1] - 0.5) * 2  # 0=certain, 1=uncertain
-    signals["conformal_width"] = conformal_width
+    # HTF approval filter — zero out 15m signals where 1h/4h/1d models disagree
+    # Must run after generate_signals and before size scaling so disapproved signals
+    # carry zero strength through the entire position sizing path.
+    signals = _apply_htf_approval(signals, symbol, cfg, checkpoints_dir, models_dir, htf_macro_panels)
+
+    # uncertainty_proxy = 1 - 2|p - 0.5|: 0 = maximally certain (|p-0.5|=0.5), 1 = uncertain (p≈0.5)
+    # This is NOT a conformal interval width — use apply_uncertainty_scaling, not apply_conformal_size_scaling
+    uncertainty_proxy = 1.0 - abs(raw_proba[:, 1] - 0.5) * 2
+    signals["uncertainty_proxy"] = uncertainty_proxy
 
     # Add ATR for position sizing
     atr_col = "atr_14"
@@ -160,8 +243,8 @@ def _generate_symbol_signals(
             logger.warning(f"backtest_summary metrics.hit_rate={_wr} out of range or missing, using fallback 0.52")
     else:
         logger.warning("backtest_summary.json not found, using win_rate=0.52 fallback")
-    avg_win = float(cfg.labels.tp_atr_mult) * 0.01
-    avg_loss = float(cfg.labels.sl_atr_mult) * 0.01
+    avg_win = float(cfg.labels.tp_max_pct)
+    avg_loss = float(cfg.labels.sl_max_pct)
     half_kelly = compute_half_kelly(win_rate, avg_win, avg_loss)
 
     leverage = 1
@@ -172,15 +255,21 @@ def _generate_symbol_signals(
     base_size = compute_position_size(0.65, half_kelly, equity, leverage, cfg)
     base_notional = base_size["notional"]
 
+    # Kelly returns 0 when R:R is unfavorable (e.g. 1%TP/5%SL needs >80% win rate).
+    # Fall back to 5% of equity so the backtest has meaningful position sizes.
+    if base_notional <= 0:
+        base_notional = equity * 0.05
+        logger.warning(f"{symbol}: Kelly=0 (unfavorable R:R), using fixed 5% equity fallback={base_notional:.2f} USDT")
+
     # Apply memecoin rules
     base_notional = apply_memecoin_rules(symbol, base_notional, cfg)
 
-    # Scale by conformal width and signal strength
+    # Scale by uncertainty_proxy and signal strength
     def _compute_size(row):
         if not row["is_signal"]:
             return 0.0
-        conf_scaled = apply_conformal_size_scaling(base_notional, float(row["conformal_width"]), cfg)
-        return conf_scaled * float(row["signal_strength"])
+        scaled = apply_uncertainty_scaling(base_notional, float(row["uncertainty_proxy"]), cfg)
+        return scaled * float(row["signal_strength"])
 
     signals["position_size_usd"] = signals.apply(_compute_size, axis=1)
 
@@ -204,6 +293,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     signals_dir = checkpoints_dir / "signals"
     signals_dir.mkdir(parents=True, exist_ok=True)
 
+    htf_macro_panels = _load_htf_macro_panels(cfg)
+
     issues = []
     all_signals = {}
 
@@ -211,7 +302,8 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     logger.info("Phase 1: generating pre-computed signals")
     for symbol in symbol_names:
         sym, signals, err = _generate_symbol_signals(
-            symbol, cfg, checkpoints_dir, features_dir, models_dir
+            symbol, cfg, checkpoints_dir, features_dir, models_dir,
+            htf_macro_panels=htf_macro_panels,
         )
         if err:
             logger.error(f"{sym}: signal generation failed — {err}")
@@ -228,10 +320,12 @@ def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     corr_matrix_df = None
     if len(all_signals) > 1:
         try:
+            from tqdm import tqdm
             # Build returns panel from feature files (log_return column, train period only to avoid leakage)
             returns_parts = {}
             train_end = pd.Timestamp(cfg.data.train_end, tz="UTC")
-            for sym in all_signals:
+            syms_list = list(all_signals.keys())
+            for sym in tqdm(syms_list, desc="Phase 2 — loading returns", unit="sym", dynamic_ncols=True):
                 try:
                     feat_df = read_features(sym, _TF, features_dir)
                     if "log_return" in feat_df.columns:
@@ -274,9 +368,21 @@ def _run_portfolio_optimization(all_signals: dict, corr_matrix_df, cfg, checkpoi
     # Initial equal weights
     prev_weights = equal_weight_fallback(n_assets, max_weight)
 
-    # Compute expected returns from signal strength (proxy)
+    # Compute expected returns from signal strength on val period only.
+    # Excluding test period prevents test-period signal_strength from influencing
+    # portfolio weights that are subsequently evaluated on that same test period.
+    val_start_ts = pd.Timestamp(cfg.data.val_start, tz="UTC")
+    test_start_ts = pd.Timestamp(cfg.data.test_start, tz="UTC")
     expected_returns = np.array([
-        float(all_signals[sym]["signal_strength"].mean()) for sym in symbols
+        float(
+            all_signals[sym].loc[
+                (all_signals[sym].index >= val_start_ts) & (all_signals[sym].index < test_start_ts),
+                "signal_strength",
+            ].mean()
+        )
+        if ((all_signals[sym].index >= val_start_ts) & (all_signals[sym].index < test_start_ts)).any()
+        else float(all_signals[sym].loc[all_signals[sym].index < test_start_ts, "signal_strength"].mean())
+        for sym in symbols
     ])
 
     # Get latest correlation matrix snapshot

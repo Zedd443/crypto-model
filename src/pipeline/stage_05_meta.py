@@ -95,12 +95,22 @@ def _train_meta_symbol(
             f"oof_proba={len(oof_proba)}. Rerun stage_04."
         )
 
+    # Hard assert: index must match exactly, not just length — a length match with
+    # shuffled rows would silently pair predictions with wrong labels.
+    if oof_df is not None and not oof_df.index.equals(train_labels_aligned.index):
+        return symbol, None, "OOF index does not match label index after alignment — row order mismatch. Rerun stage_04."
+
     if len(y_train) < 100:
         return symbol, None, f"Insufficient train samples for meta-labeling: {len(y_train)}"
 
-    # Create meta labels: 1 if primary model was correct, 0 otherwise
-    # Dead-zone bars excluded — primary near 0.5 is noise, not signal
-    meta_y = create_meta_labels(y_train, oof_proba, dead_zone=float(cfg.model.objective_dead_zone))
+    # Create meta labels: 1 if primary model was correct, 0 otherwise.
+    # Dead-zone bars (|prob-0.5| < dead_zone) are MASKED OUT — not relabeled to 0.
+    # Relabeling would teach meta-model that near-random primary bars are "wrong",
+    # which is not meaningful and pollutes the correctness signal.
+    meta_y, dead_zone_mask = create_meta_labels(y_train, oof_proba, dead_zone=float(cfg.model.objective_dead_zone))
+    keep_mask = ~dead_zone_mask
+    n_dead = int(dead_zone_mask.sum())
+    logger.info(f"  {symbol}: dead-zone mask dropped {n_dead}/{len(meta_y)} bars ({n_dead/max(len(meta_y),1):.1%})")
 
     # Build meta features from OOF predictions + regime + microstructure
     # Use .loc slice instead of boolean mask to avoid OOM with 1.2GB DataFrames
@@ -149,18 +159,23 @@ def _train_meta_symbol(
     )
     meta_X = meta_X.fillna(0.0)
 
-    # Align weights (already on aligned_index, same length as meta_y)
-    w_meta = train_weights
+    # Apply dead-zone mask — drop bars where primary was near-random
+    meta_X_fit = meta_X[keep_mask]
+    meta_y_fit = meta_y[keep_mask]
+    w_meta = train_weights.values[keep_mask] if hasattr(train_weights, "values") else train_weights[keep_mask]
+
+    if len(meta_y_fit) < 50:
+        return symbol, None, f"Insufficient non-dead-zone meta samples: {len(meta_y_fit)}"
 
     # Train meta-labeler
     try:
-        meta_model, meta_stats = train_meta_labeler(meta_X, meta_y, w_meta, cfg)
+        meta_model, meta_stats = train_meta_labeler(meta_X_fit, meta_y_fit, w_meta, cfg)
     except Exception as e:
         return symbol, None, f"Meta training failed: {e}"
 
-    # Meta model accuracy on train (informational only)
-    meta_pred = (meta_model.predict_proba(meta_X.values)[:, 1] > 0.5).astype(int)
-    meta_acc = float(np.mean(meta_pred == meta_y))
+    # Meta model accuracy on train (informational only — in-sample)
+    meta_pred = (meta_model.predict_proba(meta_X_fit.values)[:, 1] > 0.5).astype(int)
+    meta_acc = float(np.mean(meta_pred == meta_y_fit))
     logger.info(f"  {symbol}: meta accuracy on train (in-sample) = {meta_acc:.3f}")
 
     # Version and register meta model

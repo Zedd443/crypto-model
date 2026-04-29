@@ -45,14 +45,9 @@ def generate_signals(
     dead_zone_direction_base = float(cfg.portfolio.dead_zone_direction)
     dead_zone_signal = float(cfg.portfolio.dead_zone_signal)
 
-    # Adaptive dead zone: scale up when conformal width signals model uncertainty
-    # conf_width is currently a static 0.20 placeholder — activates with real per-bar widths
-    conf_width_full = float(getattr(cfg.model, 'conformal_width_full', 0.20))
-    conf_width_60pct = float(getattr(cfg.model, 'conformal_width_60pct', 0.40))
-    conf_width_series = pd.Series(0.20, index=primary_proba_df.index)  # placeholder
-    scale = np.where(conf_width_series < conf_width_full, 1.0,
-                     np.where(conf_width_series < conf_width_60pct, 1.25, 1.5))
-    dead_zone_direction = dead_zone_direction_base * scale
+    # Adaptive dead zone: disabled until conformal width per-bar is wired into pipeline.
+    # Placeholder kept for wiring point — scale=1.0 means dead_zone unchanged.
+    dead_zone_direction = dead_zone_direction_base
 
     direction = np.where(prob_long > 0.5, 1, -1)
     dead_zone = np.abs(prob_long - 0.5) < dead_zone_direction
@@ -96,8 +91,9 @@ def generate_signals(
     else:
         regime_state = pd.Series("unknown", index=primary_proba_df.index)
 
-    # Conformal width placeholder — updated in pipeline with actual conformal q
-    conformal_width = pd.Series(0.20, index=primary_proba_df.index, name="conformal_width")
+    # uncertainty_proxy placeholder — stage_06 overwrites this with 1 - 2|p - 0.5|
+    # (0 = maximally certain, 1 = maximally uncertain; calibrated against uncertainty_proxy_full/partial thresholds)
+    uncertainty_proxy = pd.Series(1.0, index=primary_proba_df.index, name="uncertainty_proxy")
 
     signals = pd.DataFrame({
         "direction": direction,
@@ -106,7 +102,7 @@ def generate_signals(
         "signal_strength": signal_strength,
         "regime_state": regime_state.values,
         "is_signal": is_signal,
-        "conformal_width": conformal_width.values,
+        "uncertainty_proxy": uncertainty_proxy.values,
     }, index=primary_proba_df.index)
 
     n_signals = int(is_signal.sum())
@@ -159,14 +155,39 @@ def apply_h4_filter(
     return signals
 
 
+def apply_h4_size_scaling(position_size: float, h4_reduce_flag: int) -> float:
+    # Caller must check h4_reduce_size column from apply_h4_filter output
+    # scale factor configured as portfolio.h4_reduce_scale in config/base.yaml
+    h4_scale = 0.5  # mirrors cfg.portfolio.h4_reduce_scale — add cfg param to wire dynamically
+    return position_size * h4_scale if h4_reduce_flag else position_size
+
+
 def apply_conformal_size_scaling(position_size: float, conformal_width: float, cfg) -> float:
-    # Scale position based on prediction uncertainty
+    # Scale position based on REAL conformal prediction interval width (not proxy)
+    # Use only when conformal_width comes from an actual conformal predictor, not 1-2|p-0.5|
     w_full = float(cfg.model.conformal_width_full)       # < 0.20 → 1.0×
     w_partial = float(cfg.model.conformal_width_60pct)   # 0.20-0.40 → 0.6×; >0.40 → 0.3×
 
     if conformal_width < w_full:
         scale = 1.0
     elif conformal_width < w_partial:
+        scale = 0.6
+    else:
+        scale = 0.3
+
+    return position_size * scale
+
+
+def apply_uncertainty_scaling(position_size: float, uncertainty_proxy: float, cfg) -> float:
+    # Scale position based on uncertainty_proxy = 1 - 2|p - 0.5|
+    # 0 = maximally certain (|p-0.5|=0.5), 1 = maximally uncertain (p=0.5)
+    # Thresholds calibrated to proxy distribution: p=0.65→0.30, p=0.75→0.50
+    u_full = float(cfg.model.uncertainty_proxy_full)     # below this → full position (p > 0.65)
+    u_partial = float(cfg.model.uncertainty_proxy_partial)  # below this → 60% position (p > 0.75)
+
+    if uncertainty_proxy < u_full:
+        scale = 1.0
+    elif uncertainty_proxy < u_partial:
         scale = 0.6
     else:
         scale = 0.3

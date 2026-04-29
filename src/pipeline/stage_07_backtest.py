@@ -25,7 +25,6 @@ def _load_signals(symbol: str, signals_dir: Path) -> pd.DataFrame | None:
     return pd.read_parquet(signals_path)
 
 
-
 def run(cfg, force: bool = False, symbol_filter: str = None) -> None:
     if not force and is_stage_complete("backtest"):
         logger.info("Stage 7 already complete, skipping.")
@@ -196,22 +195,22 @@ def _aggregate_nav(nav_series_list: list, cfg) -> pd.Series:
     if len(nav_series_list) == 1:
         return nav_series_list[0]
 
-    # Build portfolio NAV as weighted sum of individual NAVs
-    # Normalize each NAV to start at 1, then average
-    normalized = []
+    initial_equity = float(getattr(getattr(cfg, "account", None), "current_equity", None) or 120.0)
+    n = len(nav_series_list)
+
+    # Each single-symbol backtest runs on a per-symbol capital slice (initial_equity / n_symbols).
+    # Normalize each NAV to its own start-of-period value (= per-symbol equity), then
+    # multiply by that slice to get dollar P&L, and sum across symbols.
+    # This gives a portfolio equity curve where all symbols share one capital pool.
+    per_symbol_equity = initial_equity / n
+    dollar_navs = []
     for nav in nav_series_list:
         if len(nav) > 0 and nav.iloc[0] != 0:
-            normalized.append(nav / nav.iloc[0])
+            dollar_navs.append((nav / nav.iloc[0]) * per_symbol_equity)
 
-    if not normalized:
+    if not dollar_navs:
         return nav_series_list[0]
 
-    # Align on common index
-    combined = pd.concat(normalized, axis=1).ffill()
-    portfolio_nav = combined.mean(axis=1)
-
-    # Scale to initial equity
-    initial_equity = float(getattr(getattr(cfg, "account", None), "current_equity", None) or 120.0)
-    portfolio_nav = portfolio_nav * initial_equity
-
+    combined = pd.concat(dollar_navs, axis=1).ffill()
+    portfolio_nav = combined.sum(axis=1)
     return portfolio_nav.rename("portfolio_nav")

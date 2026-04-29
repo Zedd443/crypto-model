@@ -4,14 +4,27 @@ from src.utils.logger import get_logger
 
 logger = get_logger("correlation")
 
+# Probe once at import time — avoids repeated try/except on every call
+try:
+    from arch.multivariate import DCC as _DCC
+    _DCC_AVAILABLE = True
+except Exception:
+    _DCC_AVAILABLE = False
+
 
 def fit_garch_per_asset(returns_df: pd.DataFrame, train_end: str) -> dict:
-    # Fit GARCH(1,1) per column on train data only
+    # Only needed when DCC is available — skip entirely otherwise (EWM doesn't use GARCH residuals)
+    if not _DCC_AVAILABLE:
+        logger.info("arch.multivariate.DCC not available — skipping GARCH fit, will use EWM correlations")
+        return {}
+
     from arch import arch_model
+    from tqdm import tqdm
     train_end_ts = pd.Timestamp(train_end, tz="UTC") if not isinstance(train_end, pd.Timestamp) else train_end
     results = {}
 
-    for col in returns_df.columns:
+    cols = returns_df.columns.tolist()
+    for col in tqdm(cols, desc="Phase 2 — GARCH fit", unit="asset", dynamic_ncols=True):
         series = returns_df[col].dropna()
         train_series = series[series.index <= train_end_ts]
         if len(train_series) < 50:
@@ -28,28 +41,25 @@ def fit_garch_per_asset(returns_df: pd.DataFrame, train_end: str) -> dict:
 
 
 def compute_dcc_correlations(returns_df: pd.DataFrame, garch_results: dict, cfg) -> pd.DataFrame:
-    try:
-        from arch.multivariate import DCC
-        cols = list(garch_results.keys())
-        if len(cols) < 2:
-            raise ImportError("Not enough assets for DCC")
-        sub_returns = returns_df[cols].dropna()
-        dcc = DCC(sub_returns * 100)
-        dcc_result = dcc.fit(disp="off")
-        corr_matrix = dcc_result.conditional_correlation
-        if hasattr(corr_matrix, "values"):
-            return corr_matrix
-        # Build DataFrame from numpy array
-        n = len(cols)
-        corr_rows = {}
-        for i, c1 in enumerate(cols):
-            for j, c2 in enumerate(cols):
-                corr_rows[f"corr_{c1}_{c2}"] = corr_matrix[:, i, j] if corr_matrix.ndim == 3 else corr_matrix[i, j]
-        return pd.DataFrame(corr_rows, index=sub_returns.index)
-    except (ImportError, Exception) as e:
-        logger.warning(f"DCC failed ({e}), falling back to EWM correlations")
-        ewm_span = int(cfg.portfolio.dcc_fallback_ewm_span)
-        return compute_ewm_correlations(returns_df, span=ewm_span)
+    if _DCC_AVAILABLE and len(garch_results) >= 2:
+        try:
+            cols = list(garch_results.keys())
+            sub_returns = returns_df[cols].dropna()
+            dcc = _DCC(sub_returns * 100)
+            dcc_result = dcc.fit(disp="off")
+            corr_matrix = np.asarray(dcc_result.conditional_correlation)
+            if corr_matrix.ndim != 3:
+                raise ValueError(f"DCC conditional_correlation unexpected shape {corr_matrix.shape}")
+            corr_rows = {}
+            for i, c1 in enumerate(cols):
+                for j, c2 in enumerate(cols):
+                    corr_rows[f"corr_{c1}_{c2}"] = corr_matrix[:, i, j]
+            return pd.DataFrame(corr_rows, index=sub_returns.index)
+        except Exception as e:
+            logger.warning(f"DCC failed ({e}), falling back to EWM correlations")
+
+    ewm_span = int(cfg.portfolio.dcc_fallback_ewm_span)
+    return compute_ewm_correlations(returns_df, span=ewm_span)
 
 
 def compute_ewm_correlations(returns_df: pd.DataFrame, span: int = 60) -> pd.DataFrame:
@@ -59,17 +69,17 @@ def compute_ewm_correlations(returns_df: pd.DataFrame, span: int = 60) -> pd.Dat
 
     for i, c1 in enumerate(cols):
         for j, c2 in enumerate(cols):
-            if i <= j:
-                corr_key = f"corr_{c1}_{c2}"
-                if i == j:
-                    ewm_corr_parts[corr_key] = pd.Series(1.0, index=returns_df.index)
-                else:
-                    # EWM covariance / (EWM std * EWM std)
-                    cov = returns_df[c1].ewm(span=span, adjust=False).cov(returns_df[c2])
-                    std1 = returns_df[c1].ewm(span=span, adjust=False).std()
-                    std2 = returns_df[c2].ewm(span=span, adjust=False).std()
-                    corr = cov / (std1 * std2 + 1e-12)
-                    ewm_corr_parts[corr_key] = corr.clip(-1.0, 1.0)
+            if i == j:
+                ewm_corr_parts[f"corr_{c1}_{c2}"] = pd.Series(1.0, index=returns_df.index)
+            elif i < j:
+                cov = returns_df[c1].ewm(span=span, adjust=False).cov(returns_df[c2])
+                std1 = returns_df[c1].ewm(span=span, adjust=False).std()
+                std2 = returns_df[c2].ewm(span=span, adjust=False).std()
+                corr = (cov / (std1 * std2 + 1e-12)).clip(-1.0, 1.0)
+                # Store both directions so check_entry_correlation lookup always hits
+                # .copy() prevents both keys sharing the same Series object (aliasing bug)
+                ewm_corr_parts[f"corr_{c1}_{c2}"] = corr
+                ewm_corr_parts[f"corr_{c2}_{c1}"] = corr.copy()
 
     return pd.DataFrame(ewm_corr_parts, index=returns_df.index)
 
@@ -80,7 +90,8 @@ def ensure_positive_definite(corr_matrix: np.ndarray) -> np.ndarray:
     eigenvalues_clipped = np.clip(eigenvalues, 1e-6, None)
     pd_matrix = eigenvectors @ np.diag(eigenvalues_clipped) @ eigenvectors.T
     # Normalize to correlation matrix (diagonal = 1)
-    d = np.sqrt(np.diag(pd_matrix))
+    # Clip before sqrt: floating point reconstruction can leave tiny negatives on diagonal
+    d = np.sqrt(np.clip(np.diag(pd_matrix), 1e-12, None))
     pd_matrix = pd_matrix / np.outer(d, d)
     return pd_matrix
 

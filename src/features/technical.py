@@ -123,8 +123,13 @@ def compute_rolling_stats(series: pd.Series, name: str, windows: list) -> pd.Dat
         roll = series.rolling(w, min_periods=w)
         frames[f"{name}_{w}_mean"] = roll.mean()
         frames[f"{name}_{w}_std"] = roll.std()
-        frames[f"{name}_{w}_skew"] = roll.skew()
-        frames[f"{name}_{w}_kurt"] = roll.kurt()
+        # Skew and kurt are numerically unstable for n<20 (Jondeau-Rockinger 2003; Bai-Ng):
+        # small-sample higher moments produce ±Inf / huge values that dominate tree splits.
+        # Skip these columns entirely for w<20; downstream iterators must not assume every
+        # window produces skew/kurt columns — use df.filter() or explicit column checks.
+        if w >= 20:
+            frames[f"{name}_{w}_skew"] = series.rolling(w, min_periods=w).skew()
+            frames[f"{name}_{w}_kurt"] = series.rolling(w, min_periods=w).kurt()
     return pd.DataFrame(frames, index=series.index)
 
 
@@ -135,11 +140,11 @@ def compute_lag_features(series: pd.Series, name: str, lags: list) -> pd.DataFra
     )
 
 
-def compute_har_rv(log_return: pd.Series, daily_bars: int = 96) -> pd.DataFrame:
+def compute_har_rv(log_return: pd.Series, daily_bars: int = 96, weekly_days: int = 5, monthly_days: int = 22) -> pd.DataFrame:
     r2 = log_return ** 2
     rv_daily = r2.rolling(daily_bars, min_periods=daily_bars).sum()
-    rv_weekly = rv_daily.rolling(5, min_periods=5).mean()
-    rv_monthly = rv_daily.rolling(22, min_periods=22).mean()
+    rv_weekly = rv_daily.rolling(weekly_days, min_periods=weekly_days).mean()
+    rv_monthly = rv_daily.rolling(monthly_days, min_periods=monthly_days).mean()
     return pd.DataFrame({
         "rv_daily": rv_daily,
         "rv_weekly": rv_weekly,
@@ -200,12 +205,20 @@ def build_technical_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     for w in windows:
         parts.append(compute_rsi(close, w).to_frame())
 
-    bb_period = 20
-    parts.append(compute_bb(close, bb_period))
-    parts.append(compute_macd(close))
-    parts.append(compute_adx(high, low, close, 14))
+    bb_period = int(getattr(cfg.features, 'bb_period', 20))
+    bb_std_mult = float(getattr(cfg.features, 'bb_std_mult', 2.0))
+    parts.append(compute_bb(close, bb_period, std=bb_std_mult))
 
-    for w in [14, 50]:
+    macd_fast = int(getattr(cfg.features, 'macd_fast', 12))
+    macd_slow = int(getattr(cfg.features, 'macd_slow', 26))
+    macd_signal = int(getattr(cfg.features, 'macd_signal', 9))
+    parts.append(compute_macd(close, fast=macd_fast, slow=macd_slow, signal_period=macd_signal))
+
+    adx_period = int(getattr(cfg.features, 'adx_period', 14))
+    parts.append(compute_adx(high, low, close, adx_period))
+
+    atr_periods = list(getattr(cfg.features, 'atr_periods', [14, 50]))
+    for w in atr_periods:
         parts.append(compute_atr(high, low, close, w).to_frame())
         parts.append(compute_natr(high, low, close, w).to_frame())
 
@@ -221,7 +234,9 @@ def build_technical_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     parts.append(compute_lag_features(log_ret, "log_ret", lags))
     parts.append(compute_lag_features(volume, "volume", lags))
 
-    parts.append(compute_har_rv(log_ret, daily_bars))
+    weekly_days = int(getattr(cfg.features, 'rv_weekly_days', 5))
+    monthly_days = int(getattr(cfg.features, 'rv_monthly_days', 22))
+    parts.append(compute_har_rv(log_ret, daily_bars, weekly_days, monthly_days))
     parts.append(compute_jump_decomposition(log_ret, daily_bars))
     parts.append(compute_realized_skewness(log_ret, daily_bars).to_frame())
     parts.append(compute_realized_kurtosis(log_ret, daily_bars).to_frame())
@@ -233,6 +248,41 @@ def build_technical_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
     acf_window = int(getattr(cfg.features, 'acf_window', 96))
     parts.append(compute_rolling_acf(log_ret, lag=1, window=acf_window).to_frame())
     parts.append(compute_rolling_acf(log_ret, lag=5, window=acf_window).to_frame())
+
+    # EMA deviation and crossover features
+    ema_spans = list(getattr(cfg.features, 'ema_spans', [9, 21, 50]))
+    if ema_spans:
+        parts.append(compute_ema_features(close, ema_spans))
+
+    # Supertrend — ATR-based trend line with direction and normalized distance
+    st_period = int(getattr(cfg.features, 'supertrend_period', 10))
+    st_mult = float(getattr(cfg.features, 'supertrend_mult', 3.0))
+    parts.append(compute_supertrend(high, low, close, period=st_period, mult=st_mult))
+
+    # StochRSI — RSI of RSI; more sensitive overbought/oversold detector
+    sr_period = int(getattr(cfg.features, 'stochrsi_period', 14))
+    sr_smooth = int(getattr(cfg.features, 'stochrsi_smooth_k', 3))
+    parts.append(compute_stochrsi(close, rsi_period=sr_period, stoch_period=sr_period, smooth_k=sr_smooth))
+
+    # Williams %R — momentum oscillator complementary to RSI
+    wr_period = int(getattr(cfg.features, 'williams_r_period', 14))
+    parts.append(compute_williams_r(high, low, close, period=wr_period).to_frame())
+
+    # Keltner Channel — EMA-based envelope; used standalone and for Squeeze
+    kc_period = int(getattr(cfg.features, 'keltner_period', 20))
+    kc_mult = float(getattr(cfg.features, 'keltner_mult', 1.5))
+    parts.append(compute_keltner_channel(high, low, close, period=kc_period, atr_mult=kc_mult))
+
+    # Squeeze Momentum (TTM Squeeze) — detects BB inside KC compression before breakout
+    sq_mom_period = int(getattr(cfg.features, 'squeeze_momentum_period', 12))
+    parts.append(compute_squeeze_momentum(high, low, close,
+                                           bb_period=bb_period, bb_std=bb_std_mult,
+                                           kc_period=kc_period, kc_mult=kc_mult,
+                                           mom_period=sq_mom_period))
+
+    # Session-anchored VWAP — reset at 0h/8h/16h UTC (same as funding settlement)
+    session_hours = list(getattr(cfg.features, 'vwap_session_hours', [0, 8, 16]))
+    parts.append(compute_vwap_session(high, low, close, volume, close.index, session_hours))
 
     return pd.concat(parts, axis=1)
 
@@ -251,3 +301,164 @@ def compute_rolling_acf(series: pd.Series, lag: int, window: int) -> pd.Series:
     return series.rolling(window, min_periods=window // 2).corr(
         series.shift(lag)
     ).rename(f"acf_lag{lag}_w{window}")
+
+
+def compute_supertrend(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 10, mult: float = 3.0) -> pd.DataFrame:
+    atr = compute_atr(high, low, close, period)
+    hl_mid = (high + low) / 2.0
+
+    # Work on numpy arrays for speed (state-dependent loop can't be fully vectorized)
+    raw_upper = (hl_mid + mult * atr).values
+    raw_lower = (hl_mid - mult * atr).values
+    close_v = close.values
+    n = len(close_v)
+
+    upper = raw_upper.copy()
+    lower = raw_lower.copy()
+    direction = np.ones(n)
+    supertrend = np.full(n, np.nan)
+
+    for i in range(1, n):
+        # Lock bands: upper can only decrease, lower can only increase
+        upper[i] = raw_upper[i] if close_v[i - 1] > upper[i - 1] else min(raw_upper[i], upper[i - 1])
+        lower[i] = raw_lower[i] if close_v[i - 1] < lower[i - 1] else max(raw_lower[i], lower[i - 1])
+
+        if direction[i - 1] == -1 and close_v[i] > upper[i]:
+            direction[i] = 1.0
+        elif direction[i - 1] == 1 and close_v[i] < lower[i]:
+            direction[i] = -1.0
+        else:
+            direction[i] = direction[i - 1]
+
+        supertrend[i] = lower[i] if direction[i] == 1 else upper[i]
+
+    atr_v = atr.values
+    distance = (close_v - supertrend) / (atr_v + 1e-9)
+    flip = np.abs(np.diff(direction, prepend=direction[0])).clip(0, 1)
+
+    return pd.DataFrame({
+        "supertrend_direction": direction,
+        "supertrend_distance": distance,
+        "supertrend_flip": flip,
+    }, index=close.index)
+
+
+def compute_stochrsi(close: pd.Series, rsi_period: int = 14, stoch_period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> pd.DataFrame:
+    rsi = compute_rsi(close, rsi_period)
+    rsi_min = rsi.rolling(stoch_period, min_periods=stoch_period).min()
+    rsi_max = rsi.rolling(stoch_period, min_periods=stoch_period).max()
+    stoch_rsi = (rsi - rsi_min) / (rsi_max - rsi_min + 1e-9)
+    k = stoch_rsi.rolling(smooth_k, min_periods=smooth_k).mean()
+    d = k.rolling(smooth_d, min_periods=smooth_d).mean()
+    return pd.DataFrame({
+        "stochrsi_k": k,
+        "stochrsi_d": d,
+        "stochrsi_kd_diff": k - d,
+    }, index=close.index)
+
+
+def compute_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    highest_high = high.rolling(period, min_periods=period).max()
+    lowest_low = low.rolling(period, min_periods=period).min()
+    wr = -100.0 * (highest_high - close) / (highest_high - lowest_low + 1e-9)
+    return wr.rename(f"williams_r_{period}")
+
+
+def compute_keltner_channel(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20, atr_mult: float = 1.5) -> pd.DataFrame:
+    ema_mid = close.ewm(span=period, adjust=False).mean()
+    atr = compute_atr(high, low, close, period)
+    upper = ema_mid + atr_mult * atr
+    lower = ema_mid - atr_mult * atr
+    kc_pct = (close - lower) / (upper - lower + 1e-9)  # 0=at lower, 1=at upper
+    kc_width = (upper - lower) / (ema_mid + 1e-9)
+    return pd.DataFrame({
+        "kc_upper": upper,
+        "kc_lower": lower,
+        "kc_pct": kc_pct,
+        "kc_width": kc_width,
+    }, index=close.index)
+
+
+def compute_squeeze_momentum(high: pd.Series, low: pd.Series, close: pd.Series,
+                              bb_period: int = 20, bb_std: float = 2.0,
+                              kc_period: int = 20, kc_mult: float = 1.5,
+                              mom_period: int = 12) -> pd.DataFrame:
+    # Squeeze = Bollinger Band inside Keltner Channel → low volatility compression
+    bb = compute_bb(close, bb_period, std=bb_std)
+    kc = compute_keltner_channel(high, low, close, kc_period, kc_mult)
+
+    squeeze_on = ((bb["bb_upper"] < kc["kc_upper"]) & (bb["bb_lower"] > kc["kc_lower"])).astype(float)
+
+    # Momentum oscillator: close vs midpoint of recent range (TTM Squeeze style)
+    highest_high = high.rolling(mom_period, min_periods=mom_period).max()
+    lowest_low = low.rolling(mom_period, min_periods=mom_period).min()
+    delta = close - (highest_high + lowest_low) / 2.0
+    momentum = delta.ewm(span=mom_period, adjust=False).mean()
+
+    return pd.DataFrame({
+        "squeeze_on": squeeze_on,
+        "squeeze_momentum": momentum,
+        "squeeze_momentum_sign": np.sign(momentum),
+    }, index=close.index)
+
+
+def compute_vwap_session(high: pd.Series, low: pd.Series, close: pd.Series,
+                          volume: pd.Series, index: pd.DatetimeIndex,
+                          session_hours: list = None) -> pd.DataFrame:
+    if session_hours is None:
+        session_hours = [0, 8, 16]
+    typical = (high + low + close) / 3.0
+    pv = typical * volume
+
+    # Assign each bar to its session boundary (the most recent session_hours mark)
+    hour = index.hour
+    session_id = pd.Series(np.zeros(len(index), dtype=int), index=index)
+    for h in sorted(session_hours, reverse=True):
+        session_id[hour >= h] = h
+    # Build cumulative session groups: group changes when session_id changes
+    session_group = (session_id != session_id.shift(1)).cumsum()
+
+    cum_pv = pv.groupby(session_group).cumsum()
+    cum_vol = volume.groupby(session_group).cumsum()
+    session_vwap = cum_pv / (cum_vol + 1e-9)
+
+    anchor_dist = (close - session_vwap) / (session_vwap + 1e-9)
+    # Rolling z-score of distance within session
+    anchor_std = anchor_dist.groupby(session_group).transform(lambda x: x.expanding().std())
+    anchor_zscore = anchor_dist / (anchor_std + 1e-9)
+
+    return pd.DataFrame({
+        "session_vwap": session_vwap,
+        "session_vwap_dist": anchor_dist,
+        "session_vwap_zscore": anchor_zscore.clip(-5, 5),
+    }, index=index)
+
+
+def compute_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
+    # Money flow multiplier: position of close in the bar's range
+    mf_mult = ((close - low) - (high - close)) / (high - low + 1e-9)
+    mf_vol = mf_mult * volume
+    cmf = mf_vol.rolling(window, min_periods=window).sum() / (volume.rolling(window, min_periods=window).sum() + 1e-9)
+    return cmf.rename(f"cmf_{window}")
+
+
+def compute_ema_features(close: pd.Series, spans: list[int]) -> pd.DataFrame:
+    # EMA values, EMA crossover signal, and price-vs-EMA deviation
+    parts = {}
+    emas = {}
+    for span in spans:
+        ema = close.ewm(span=span, adjust=False).mean()
+        emas[span] = ema
+        parts[f"ema_{span}"] = ema
+        parts[f"ema_{span}_dev"] = (close - ema) / (ema + 1e-9)  # price deviation from EMA
+
+    # Crossover signals: EMA fast vs EMA slow pairs (9/21, 9/50, 21/50)
+    span_pairs = [(s, l) for i, s in enumerate(spans) for l in spans[i+1:]]
+    for fast, slow in span_pairs:
+        cross_col = f"ema_{fast}_{slow}_cross"
+        # +1 = fast above slow (bullish), -1 = fast below slow (bearish)
+        parts[cross_col] = np.sign(emas[fast] - emas[slow])
+        # Distance as fraction — magnitude of trend
+        parts[f"ema_{fast}_{slow}_gap"] = (emas[fast] - emas[slow]) / (emas[slow] + 1e-9)
+
+    return pd.DataFrame(parts, index=close.index)

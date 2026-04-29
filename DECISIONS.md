@@ -10,6 +10,362 @@ Status values: `NOT FIXED` | `IN PROGRESS` | `FIXED` | `WONT FIX`
 
 ---
 
+### ISSUE-082: FIXED — macro/onchain ffill unbounded in live_features (train/live divergence)
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/execution/live_features.py` lines 227, 233
+- **Problem**: Training path (`feature_pipeline.py:180`) uses `reindex(..., method="ffill", limit=2880)` (30-day cap). Live inference path had `reindex(..., method="ffill")` with no limit. A macro series stale beyond 30 days would be NaN in training data (then imputed to median) but would propagate the last-known value at inference — silent distributional shift.
+- **Fix**: Added `limit=cfg.features.macro_ffill_limit_bars` (config default 2880) to both macro and onchain reindex calls in `live_features.py`. Added `macro_ffill_limit_bars: 2880` to `config/base.yaml`.
+- **Status**: FIXED
+
+### ISSUE-081: FIXED — fillna(0) before imputer corrupts signed feature semantics in stage_04/stage_06
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/pipeline/stage_04_train.py` lines 152-153; `src/pipeline/stage_06_portfolio.py` line 121
+- **Problem**: `X_train.select_dtypes(...).fillna(0)` ran before the SimpleImputer (median strategy). Zero is a meaningful value for signed features: `log_return`, `funding_proxy`, `macd_hist`, `regime_prob_*`, `oi_zscore`, `vwap_deviation`, etc. Filling NaN with 0 biases predictions toward zero-conditional behavior instead of distributional median. The imputer was effectively a no-op since all NaNs were pre-filled.
+- **Fix**: Removed `.fillna(0)` in stage_04 and stage_06. Imputer now receives raw NaN values and fills with training-set median per column. HTF model's `fillna(0)` retained — HTF features are ratio/normalized (no signed semantics issue) and HTF has no fitted imputer.
+- **Status**: FIXED
+
+### ISSUE-080: FIXED — _FRACDIFF_COLS referenced non-existent column names (silent no-op)
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/features/feature_pipeline.py` lines 22-26
+- **Problem**: `_FRACDIFF_COLS` listed `close_5_mean`, `close_10_mean`, ..., `close_200_mean`. These columns are never produced by `build_technical_features` — rolling stats are computed on `log_ret` and `volume`, not `close`. `apply_fracdiff_transform` silently skips missing columns. Result: only `obv` and `vwap_20` were actually fracdiff'd; 6 of 8 entries were dead. The fracdiff d-value cache (`fracdiff_d_*.json`) was nearly empty.
+- **Fix**: Trimmed `_FRACDIFF_COLS` to `["obv", "vwap_20"]` — the only price-level accumulators that actually exist and benefit from fractional differencing. `log_ret_N_mean` columns are already stationary (rolling mean of log-returns).
+- **Status**: FIXED
+
+### ISSUE-079: FIXED — compute_har_rv ignored rv_weekly_days/rv_monthly_days config keys
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/features/technical.py` `compute_har_rv` lines 146-147
+- **Problem**: Config had `rv_weekly_days: 5` and `rv_monthly_days: 22` but `compute_har_rv` hardcoded `rolling(5)` and `rolling(22)` — the config keys were decorative. Tuning them had no effect.
+- **Fix**: Added `weekly_days` and `monthly_days` parameters to `compute_har_rv`. Call site in `build_technical_features` now reads `cfg.features.rv_weekly_days` and `cfg.features.rv_monthly_days`.
+- **Status**: FIXED
+
+### ISSUE-078: FIXED — BOCPD penalty config key was decorative string "bic" but code used heuristic formula
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/features/regime.py` `get_changepoint_distance` line 124; `config/base.yaml` `bocpd_penalty`
+- **Problem**: Config had `bocpd_penalty: "bic"` (string) but code used `max(5, int(log(n)*2))` — a heuristic, not BIC. The string key was never read. Constants 5 and 2 were magic numbers.
+- **Fix**: Replaced `bocpd_penalty` with `bocpd_penalty_floor: 5` and `bocpd_penalty_mult: 2.0` in config. `get_changepoint_distance` now accepts optional `cfg` param and reads these keys. Both call sites (`feature_pipeline.py` and `live_features.py`) pass `cfg`.
+- **Status**: FIXED
+
+### ISSUE-077: FIXED — MACD/BB/ADX/ATR periods hardcoded at call sites, not in config
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/features/technical.py` `build_technical_features` lines 208-215
+- **Problem**: `bb_period=20`, `compute_macd(close)` (defaults 12/26/9), `compute_adx(..., 14)`, ATR loop `[14, 50]` were all hardcoded magic numbers not in config. Changing any would not update the config hash, causing stage_02 to reuse cached stale features silently.
+- **Fix**: Added `bb_period`, `bb_std_mult`, `macd_fast`, `macd_slow`, `macd_signal`, `adx_period`, `atr_periods` to `config/base.yaml` under `features:`. All call sites now read from `cfg.features` via `getattr` with the original values as defaults for backward compatibility.
+- **Status**: FIXED
+
+### ISSUE-076: FIXED — compute_ema_features defined but never called (dead code)
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/features/technical.py` lines 261-280
+- **Problem**: EMA deviation and crossover features (spans 9/21/50) were implemented but not called from `build_technical_features`. These are useful signals (EMA fast/slow crossovers, price-vs-EMA deviation) that were silently absent from all trained models.
+- **Fix**: Added `ema_spans: [9, 21, 50]` to `config/base.yaml`. Called `compute_ema_features(close, ema_spans)` in `build_technical_features`. Will add ~15 new EMA features per timeframe after stage_02 re-run.
+- **Note**: Requires stage_02 `--force` re-run for new features to take effect. Existing models trained without EMA features remain valid — they will simply not use these new columns.
+- **Status**: FIXED
+
+### ISSUE-075: FIXED — Duplicate column dedup in feature_pipeline silently dropped columns without logging
+- **Date discovered**: 2026-04-25
+- **Date fixed**: 2026-04-25
+- **Location**: `src/features/feature_pipeline.py` line 194
+- **Problem**: `all_features.loc[:, ~all_features.columns.duplicated()]` silently dropped duplicate columns. If a feature-builder refactor emitted the same column twice with different values, the second value was discarded without any alert.
+- **Fix**: Added a warning log before dedup listing the duplicate column names. This allows detection of unintended name collisions during development.
+- **Status**: FIXED
+
+### ISSUE-074: OBSERVATION — WIFUSDT OI/LS/taker columns are 100% NaN (no historical data)
+- **Date discovered**: 2026-04-25
+- **Location**: `data/raw/WIFUSDT_oi_15m.parquet` only covers 2026-04-11 to 2026-04-20 (9 days)
+- **Finding**: WIFUSDT OI raw file only contains April 2026 data. All train/val bars (Jan 2024–Dec 2025) have OI=NaN. The imputer correctly fills these with median=NaN→constant. In stage_04 these columns carry zero information (constant value throughout training). Not a bug — the feature builder handles missing OI gracefully with `build_market_positioning_features` returning an empty DataFrame when raw file has no overlap with the symbol's data range.
+- **Decision**: WONT FIX. Acceptable. OI data will populate once more history accumulates in future ingestion runs. The trained model simply doesn't use OI for WIFUSDT.
+- **Status**: WONT FIX
+
+### ISSUE-073: OBSERVATION — feature parquet has 65.7% NaN rows for WIFUSDT (listing date effect)
+- **Date discovered**: 2026-04-25
+- **Location**: `data/features/WIFUSDT_15m_features.parquet`
+- **Finding**: WIFUSDT listed 2024-01-18. The pipeline builds a 6.2-year index from 2020-01-01 to 2026-02-28 (aligned with BTC). Pre-listing bars are all NaN. Valid rows: 74,149 (34.3%). Train bars: 59,558. Val bars: 8,832. These counts are sufficient for training. The NaN pre-listing rows are correctly excluded by the `is_warmup` flag and by `dropna(how="all")` at pipeline end. Not a bug.
+- **Status**: WONT FIX
+
+### ISSUE-070: WONT FIX — model_versioning.py lock non-atomic on network FS
+- **Date reviewed**: 2026-04-24
+- **Location**: `src/models/model_versioning.py` `_acquire_lock`
+- **Claim**: `os.O_CREAT | os.O_EXCL` can race on network filesystems under Windows.
+- **Decision**: WONT FIX. Pipeline runs on a single local machine. `os.O_EXCL` is atomic on local NTFS. If ever deployed to shared storage, switch to `filelock` library.
+- **Status**: WONT FIX
+
+### ISSUE-069: WONT FIX — save_meta_model symbol/tf params appear unused
+- **Date reviewed**: 2026-04-24
+- **Location**: `src/models/meta_labeler.py` `save_meta_model`
+- **Claim**: `symbol` and `tf` not used in the filename path.
+- **Decision**: WONT FIX. `version = generate_version_string(symbol, tf, ...)` returns `"{symbol}_{tf}"`, so the filename `f"{version}_meta.pkl"` = `BTCUSDT_15m_meta.pkl` already encodes both. The params are consumed transitively — no bug.
+- **Status**: WONT FIX
+
+### ISSUE-068: FIXED — htf_model.py calibrator fallback called "identity" but isn't
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `src/models/htf_model.py` line ~169
+- **Problem**: Warning message said "using identity calibrator" but the fallback is an augmented-LR sigmoid, not a true identity (`y=x`). Also `max_iter=1` was too low for LR convergence.
+- **Fix**: Corrected log message to "augmenting with one synthetic opposite-class sample". Raised `max_iter=1000`. Added inline comment explaining why it's not a true identity and why that's acceptable.
+- **Status**: FIXED
+
+### ISSUE-067: FIXED — htf_model.py comment incorrectly said shift(-1) was removed
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `src/models/htf_model.py` `train_htf_model` line ~88
+- **Problem**: Comment `# Label: next bar direction (shift(-1) removed to prevent forward-looking leakage)` was wrong — `shift(-1)` is intentionally present and required for labeling. The comment described a fix that was never made, contradicting the code on the next line.
+- **Fix**: Replaced with accurate description of the feature/label timing relationship and why it's not leakage.
+- **Status**: FIXED
+
+### ISSUE-066: FIXED — splitter.py purging: NaT barrier ends crash pd.DatetimeIndex + tz mismatch
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `src/models/splitter.py` `PurgedTimeSeriesSplit.split`
+- **Problem**: `pd.DatetimeIndex(pd.Series(groups).values[:train_end])` — if `groups` contains `NaT` (labels that hit time barrier before t1 was recorded) or timezone-naive numpy timestamps, tz comparison with UTC-aware `X.index` would raise. Conditional `tz_localize` only handled one direction.
+- **Fix**: Use `pd.to_datetime(g_series, utc=True, errors="coerce")` to normalize all values to UTC and coerce bad values to NaT. `NaT` entries treated as no-overlap (kept in train) via `g_vals.isna()` inclusion in mask. `test_start_time` always converted to UTC via `tz_convert`/`tz_localize`.
+- **Status**: FIXED
+
+### ISSUE-065: WONT FIX — compute_objective fee subtracted "per bar" not "per trade"
+- **Date reviewed**: 2026-04-24
+- **Location**: `src/models/primary_model.py` `compute_objective` line ~105
+- **Claim**: `active_returns = positions[active_mask] * returns[active_mask] - fee_cost` subtracts fee every bar, but fee should be once per trade.
+- **Decision**: WONT FIX. `price_returns` passed to `compute_objective` is the **triple-barrier realized return** (tp_level or -sl_level from stage_04 `price_returns` array) — one scalar lump-sum return per labeling event, not a per-bar return series. `active_mask` filters to directional labels only (one entry per barrier event). Fee is therefore subtracted **once per trade event**, which is correct. Consistent with stage_04 fold Sharpe at line 359 (`active_net = active - cost`). The reviewer's analysis assumed returns were per-bar holding returns — they are not.
+- **Status**: WONT FIX
+
+### ISSUE-064: BUG — stage_06 used calibrated proba for direction/signal_strength — FIXED
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `src/pipeline/stage_06_portfolio.py` `_generate_symbol_signals` line ~133
+- **Problem**: `proba_df` was built from `cal_proba` (Platt-scaled). Val period Oct-Dec 2025 had 93.7% label=+1 directional bars (strong bull run), so calibrator learned to always predict ~0.98, collapsing `primary_prob` to a narrow band [0.97, 0.984] with no variance. Direction was always=1 (no short signals), `signal_strength` carried near-zero discriminative power. OOF proba (used to train meta) had full range [0.0001, 1.0] — using calibrated proba broke consistency with meta-labeler training.
+- **Fix**: `proba_df` now uses `raw_proba[:, 1]` and `raw_proba[:, 0]`. Calibrated proba is retained only for `uncertainty_proxy` (already computed from `raw_proba`). Result: direction 88.6% LONG / 9.7% SHORT (vs 100% LONG before), signal_strength mean=0.50 std=0.006 (vs 0.975 std=0.001).
+- **Status**: FIXED
+
+### ISSUE-063: BUG — position_size_usd = 0.0 for all symbols in signals checkpoints — FIXED
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `data/checkpoints/signals/*.parquet` (stale files)
+- **Problem**: Signals were written by an older stage_06 that read a `conformal_width` column from the signals DataFrame. That column was never written by `generate_signals`, so `float(row["conformal_width"])` returned NaN, causing `apply_conformal_size_scaling(base_notional, NaN)` → 0. All 14,786 backtest trades had `size_usd=0` → `pnl_usd=0` → `hit_rate=0`, `total_return=0`. Working-directory stage_06 already used `uncertainty_proxy` instead, but signals were never regenerated.
+- **Fix**: Updated stage_06 to use `uncertainty_proxy` (already done in working dir). Requires re-running stage_06 `--force` to regenerate signals. Also added explicit Kelly=0 fallback to `equity*0.05`.
+- **Status**: FIXED (code correct; signals need regeneration via `--force stage_06`)
+
+### ISSUE-062: BUG — model_health.py column name mismatch: looked up val_da/da_val, CSV has da — FIXED
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `src/pipeline/model_health.py` line 110
+- **Problem**: `t.get("val_da", t.get("da_val", nan))` — `training_summary.csv` column is named `da`, not `val_da` or `da_val`. All symbols showed `da_val=NaN` and `da_test=NaN` in model_health output. The `NO_SIGNAL_VAL` flag never fired. Also `pct_pos` read `pct_positive_train` but the flag check needed `pct_positive_val`.
+- **Fix**: Changed to `t.get("da", t.get("val_da", t.get("da_val", nan)))` and `pct_pos = t.get("pct_positive_val", t.get("pct_positive_train", nan))`.
+- **Status**: FIXED
+
+### ISSUE-061: BUG — BTCUSDT imputer stale: fit on 165 features, scaler fit on 136 — FIXED
+- **Date discovered**: 2026-04-24
+- **Date fixed**: 2026-04-24
+- **Location**: `data/checkpoints/imputers/imputer_BTCUSDT_15m.pkl`
+- **Problem**: Imputer was fit in an older training run on 165 features; a subsequent retrain reduced to 136 selected features and re-fit the scaler but not the imputer. In stage_06, `transform_with_imputer(136-col X)` raised `ValueError: X has 136 features, but SimpleImputer expecting 165` — the bare `except Exception` fallback silently used raw unimputed values instead. Only BTCUSDT affected.
+- **Fix**: Re-fit imputer on train-period 136-feature X (leakage-safe). Saved new pkl.
+- **Status**: FIXED
+
+### ISSUE-061: REDUNDANCY 2 — ATR inconsistency: htf_model and stage_08 used non-Wilder ATR — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/htf_model.py` `_build_htf_features`, `src/pipeline/stage_08_live.py` `_compute_atr`
+- **Problem**: `htf_model._build_htf_features` computed ATR as `tr.rolling(14).mean()` (simple average). `stage_08._compute_atr` used `tr.ewm(span=14)` (span-based EWM, α=2/15≈0.133). Both differ from `technical.compute_atr` which uses Wilder's EWM (α=1/14≈0.0714). Feature computed differently at train vs inference time creates systematic signal mismatch.
+- **Fix**: `htf_model` now imports and calls `compute_atr` from `technical.py`. `stage_08._compute_atr` is now a thin wrapper over `_compute_atr_series` (aliased import of `technical.compute_atr`). All ATR computations across the pipeline now use Wilder's α=1/period EWM.
+- **Status**: FIXED
+
+### ISSUE-060: LEAKAGE 8 — `compute_hours_to_funding` called twice with identical input — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/features/funding_rates.py` `build_funding_features` lines 87–88
+- **Problem**: `compute_hours_to_funding(df.index)` appeared twice in the `parts` list — once directly and once wrapped in `compute_pre_funding_window(compute_hours_to_funding(df.index), 1.0)`. `compute_hours_to_funding` runs a Python-level `.apply()` loop over every bar for every symbol — calling it twice doubles the cost.
+- **Fix**: Cached result into `hours_to_funding` variable before the `parts` list, reused for both entries.
+- **Status**: FIXED
+
+### ISSUE-059: LEAKAGE 7 — rolling skew/kurt at w=5 numerically unstable — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/features/technical.py` `compute_rolling_stats`
+- **Problem**: Default `lookback_windows = [5, 10, 20, 50, 100, 200]`. Rolling skew/kurt at w=5 with `min_periods=5` produces extreme/infinite values (skew=±Inf, kurt=NaN) for short windows — tree splits on these values produce garbage features that can dominate splits.
+- **Fix**: `skew_kurt_mp = max(w, 20)` — skew/kurt emit NaN rather than garbage for the first 20 bars and any window < 20. Mean and std still use the original `min_periods=w`.
+- **Status**: FIXED
+
+### ISSUE-058: BUG 27 — _rotate_logs keep_days semantics mismatch — NOT A BUG
+- **Date investigated**: 2026-04-20
+- **Finding**: `keep_days=2` deletes files with `age >= 2`. Age 0=today, 1=yesterday, 2=day-before. So it keeps today (age=0) and yesterday (age=1), deletes anything older. Comment "Keeps today and yesterday" is correct. Implementation is correct.
+- **Status**: WONT FIX (no bug)
+
+### ISSUE-057: BUG 26 — training_summary.csv written to models/, read from results/ — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/pipeline/stage_04_train.py` line ~588, `src/pipeline/model_health.py` line 26
+- **Problem**: Stage_04 wrote `training_summary.csv` to `models/`. `model_health.py` reads from `results/training_summary.csv`. File never found → all model health metrics None → every symbol flagged NO_SIGNAL_VAL.
+- **Fix**: Stage_04 now writes to both `results/training_summary.csv` (for model_health) and `models/training_summary.csv` (for stage_07 per-symbol chart). Both consumers satisfied.
+- **Status**: FIXED
+
+### ISSUE-056: BUG 25 — circuit breaker modifies list being iterated — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/pipeline/stage_08_live.py` lines ~528–536
+- **Problem**: `forecast_symbols = [s for s in forecast_symbols if s != symbol]` inside the tqdm loop. tqdm already captured the original list iterator at loop start — reassigning `forecast_symbols` doesn't stop the current bar from processing the tripped symbol. Log said "removing" but symbol still ran that bar.
+- **Fix**: Collect tripped symbols in `_circuit_tripped: set` during the loop, add `if symbol in _circuit_tripped: continue` at the top of the loop body, apply removal to `forecast_symbols` after the loop completes. Takes effect from next bar — which is the earliest semantically correct point anyway.
+- **Status**: FIXED
+
+### ISSUE-055: BUG 24 — stage_06 equity hardcoded 120.0, position_size_usd is dead computation — WONT FIX
+- **Date discovered**: 2026-04-20
+- **Location**: `src/pipeline/stage_06_portfolio.py` line ~150
+- **Finding**: `cfg.account` section does not exist in `config/base.yaml` → `equity` always 120.0. The `position_size_usd` column computed in stage_06 is never used by stage_08 — stage_08 computes sizing from live `wallet_today` each bar. So this is dead computation that produces a misleading column in the signals parquet.
+- **Decision**: WONT FIX — stage_08 correctly ignores stage_06 position sizing. Adding a `cfg.account` section would require an accurate equity value at stage_06 run time (which is offline, not live). The dead column is harmless; documenting the disconnect is sufficient.
+- **Status**: WONT FIX
+
+### ISSUE-054: BUG 23 — DSR proxy formula dimensionally inconsistent — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/pipeline/stage_04_train.py` line ~378
+- **Problem**: `dsr = max(synthetic_sharpe - pbo, 0.0)`. PBO is a probability [0,1], Sharpe can be >3 — subtracting them has no statistical meaning. Also `_assign_tier()` reads `dsr` but never uses it in the condition, so the `tier_A_dsr_min=0.0` check was always a no-op anyway.
+- **Fix**: Changed to `dsr = fold_consistency × max(synthetic_sharpe, 0.0)` — both must be positive for the product to be non-zero, combining the "model is consistently profitable across folds" signal with the "overall return quality" signal. Dimensionally coherent. Still not used in tier logic (correctly).
+- **Status**: FIXED
+
+### ISSUE-053: BUG 22 — stage_03 fee_reclassified counter always 0 — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/pipeline/stage_03_labels.py` lines ~52–58
+- **Problem**: `labels_df.get("original_label", labels_df["label"])` — `.get()` on a DataFrame returns a column, not a fallback attribute. When "original_label" column is absent it returns the default `labels_df["label"]`, so condition `(label==0) AND (label==1)` is always False. Second condition `tp_level < cost` also always False after BUG 7 fix (clip floor > cost). Counter always 0.
+- **Fix**: Simplified to `(label==0) AND (tp_level < threshold)` where `threshold = cost × dead_zone_cost_multiple`, only when `fee_adjust_labels=True`. This correctly counts bars reclassified by `label_all_bars` fee-adjust logic.
+- **Status**: FIXED
+
+### ISSUE-052: BUG 21 — stage_06 portfolio optimization uses in-sample signal_strength — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/pipeline/stage_06_portfolio.py:_run_portfolio_optimization` line ~278
+- **Problem**: `expected_returns = signal_strength.mean()` over all bars including training period. Model has seen training bars — signal_strength there is in-sample and biased upward. Portfolio weights overfit to training regime.
+- **Fix**: Filter signals to `index >= val_start` before computing mean signal_strength. Fallback to full range if no OOS rows exist (edge case for very short symbol history).
+- **Status**: FIXED
+
+### ISSUE-051: BUG 20 — stage_08 uses calibrated prob for meta features, stage_05 uses raw — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/pipeline/stage_08_live.py:_predict` line ~146
+- **Problem**: `oof_proba_1bar = [[1 - primary_prob, primary_prob]]` used `primary_prob` (post-calibration). Meta-labeler was trained in stage_05 on raw XGBoost OOF output (pre-calibration). Calibrated probs have a different distribution (Platt-shifted toward 0.5) — meta features like `primary_confidence` and `time_since_last_signal` would see a different value range than at training time. Stage_06 correctly used `raw_proba` for meta features.
+- **Fix**: Changed to `oof_proba_1bar = [[1 - raw_prob, raw_prob]]`. `raw_prob` already computed at line 135 just before calibration. Meta features now consistent with training distribution across stage_05, stage_06, and stage_08.
+- **Status**: FIXED
+
+### ISSUE-050: BUG 15 — compute_objective crash if price_returns None — NOT A BUG IN OUR CODE
+- **Date investigated**: 2026-04-20
+- **Location**: `src/models/primary_model.py:compute_objective`, `tune_hyperparams`
+- **Finding**: `compute_objective` is only called from `tune_hyperparams` line 195 via `ret_v = returns_array[val_idx]`. `returns_array` is always a numpy array — guarded at lines 161–164: if `price_returns is None`, falls back to binary proxy from `y_train`. No path exists where `returns=None` reaches `compute_objective`. Bug does not exist in this codebase.
+- **Status**: WONT FIX (not a real bug here)
+
+### ISSUE-049: BUG 8 — `total_bars` dead parameter in compute_label_uniqueness — FIXED
+- **Date discovered**: 2026-04-20 (prior session)
+- **Date fixed**: 2026-04-20 (prior session)
+- **Location**: `src/labels/sample_weights.py:compute_label_uniqueness`
+- **Problem**: `total_bars: int` parameter was accepted but never used. Uniqueness is purely overlap-based (1/overlap_count); total bar count is irrelevant to the formula. Parameter misled callers into thinking it affected the result.
+- **Fix**: Parameter kept as `total_bars: int = 0` for backward compatibility with any callers that pass it positionally, but added comment marking it unused. No logic change needed — formula was already correct.
+- **Status**: FIXED
+
+### ISSUE-048: BUG 6 — vol_lookback config key had no effect on ATR period — FIXED
+- **Date discovered**: 2026-04-20 (prior session)
+- **Date fixed**: 2026-04-20 (prior session)
+- **Location**: `src/labels/triple_barrier.py:label_all_bars`
+- **Problem**: `cfg.labels.vol_lookback` was read but never passed to `compute_atr_barriers`. ATR was always computed with the hardcoded default of 14 regardless of config.
+- **Fix**: `label_all_bars` now passes `atr_period=vol_lookback` to `compute_atr_barriers`. Config key is now respected.
+- **Status**: FIXED
+
+### ISSUE-047: BUG 5 — bars_to_exit missing from label output — FIXED
+- **Date discovered**: 2026-04-20 (prior session)
+- **Date fixed**: 2026-04-20 (prior session)
+- **Location**: `src/labels/triple_barrier.py:apply_triple_barrier_clipped`
+- **Problem**: The old `apply_triple_barrier` returned only `label` and `t1`. `bars_to_exit` (actual bars held before barrier hit) was never stored in the label parquet. Stage_04 could not compute true per-trade holding periods, so `actual_avg_hold` always fell back to `max_hold_bars/2`, inflating Sharpe annualization.
+- **Fix**: `apply_triple_barrier_clipped` now returns a DataFrame with `label`, `t1`, and `bars_to_exit` columns. Stage_04 reads `bars_to_exit` directly for `actual_avg_hold` computation.
+- **Status**: FIXED
+
+### ISSUE-046: BUG 3 — compute_return_weights O(n²) iterrows loop — FIXED
+- **Date discovered**: 2026-04-20 (prior session)
+- **Date fixed**: 2026-04-20 (prior session)
+- **Location**: `src/labels/sample_weights.py:compute_return_weights`
+- **Problem**: Original implementation used `iterrows()` — O(n²) over the close series for each label row. With 50k+ label rows and 150k+ close bars, this took 20–40 minutes per symbol.
+- **Fix**: Fully vectorized: `t0→p0` via `idx_map` dict lookup (O(n)), `t1→p1` via `np.searchsorted` on the sorted close index (O(n log n)). Runtime drops from ~30 min to <1 second per symbol.
+- **Status**: FIXED
+
+### ISSUE-045: BUG 7 — fee_adjust_labels never triggers (threshold always False) — FIXED
+- **Date discovered**: 2026-04-20 (prior session)
+- **Date fixed**: 2026-04-20 (prior session)
+- **Location**: `src/labels/triple_barrier.py:label_all_bars`
+- **Problem**: Old condition compared `tp_level < round_trip_cost_pct` (e.g. `< 0.003`). But `tp_level` is clipped to `tp_min_pct=0.008` minimum — so `tp_level < 0.003` was always False. Fee-adjust never reclassified a single label. Also, the fallback cost was hardcoded as `0.006` (double the actual Binance taker fee).
+- **Fix**: Threshold is now `cost * dead_zone_cost_multiple` (both from config). With `tp_min=0.008` and `cost=0.003`, setting `dead_zone_cost_multiple=3.0` gives threshold `0.009` > `tp_min`, so marginal TP hits near the clip boundary are correctly reclassified. Hardcoded fallback changed to `0.003`.
+- **Status**: FIXED
+
+### ISSUE-036b: BUG 1 (P0) — actual barriers unclipped, inconsistent with stored tp_level/sl_level — FIXED
+- **Date discovered**: 2026-04-20 (prior session)
+- **Date fixed**: 2026-04-20 (prior session)
+- **Location**: `src/labels/triple_barrier.py`
+- **Problem**: Old `apply_triple_barrier` computed barrier prices using `natr * tp_mult` / `natr * sl_mult` (unclipped). But `compute_atr_barriers` stored clipped `tp_level`/`sl_level` in the parquet. Stage_04 reconstructed `price_returns` from the stored (clipped) values — but the actual trade outcome was determined by the unclipped barriers. A label of +1 in the parquet did not correspond to the stored `tp_level` value; the true barrier was larger. This is a label geometry inconsistency.
+- **Fix**: Replaced `apply_triple_barrier` with `apply_triple_barrier_clipped` which takes pre-clipped `tp_level`/`sl_level` Series from `compute_atr_barriers` directly. Actual barriers and stored values are now identical by construction.
+- **Status**: FIXED
+
+### ISSUE-044: HTF calibrator contaminated by early-stopping set — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/htf_model.py:train_htf_model` (lines ~161–174)
+- **Problem**: Calibrator (Platt scaling) was fit on `eval_X`/`eval_y` — the exact same data used to drive early stopping. The model has already minimised loss on this set during training via the ES signal; calibrating on it overestimates calibration quality and biases probabilities toward the training regime.
+- **Fix**: When `len(X_val) >= 10`, split val 80% ES / 20% calibration. Final model early-stops on ES slice; calibrator is fit on the held-out 20%. Falls back to train tail for ES and whatever val exists for calibration when val is too small.
+- **Status**: FIXED
+
+### ISSUE-043: HTF `predict_htf_proba` silently drops missing features — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/htf_model.py:predict_htf_proba` (lines ~226–227)
+- **Problem**: `avail = [c for c in feature_names if c in feat_df.columns]` silently ran inference on a feature-reduced set when `_build_htf_features` was changed but the saved model wasn't retrained. Model saw a different feature count than it was trained on — silent NaN/zero fill for missing columns.
+- **Fix**: Raise `ValueError` immediately if any trained feature is absent, listing up to 5 missing names. Forces retrain instead of producing silently wrong predictions.
+- **Status**: FIXED
+
+### ISSUE-042: `use_label_encoder=False` deprecated/removed in XGBoost 2.0 — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/htf_model.py:train_htf_model` line 152, `src/models/primary_model.py:build_xgb_params` line 69
+- **Problem**: `use_label_encoder=False` was removed in XGBoost 2.0. Passing it raises `TypeError: __init__() got an unexpected keyword argument`. Training crashes on XGBoost ≥2.0.
+- **Fix**: Removed the parameter from both `XGBClassifier()` calls. XGBoost 2.0 never uses label encoding for binary:logistic objective.
+- **Status**: FIXED
+
+### ISSUE-041: Meta dead-zone relabels correct bars as "wrong" — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/meta_labeler.py:create_meta_labels` line 26, `src/pipeline/stage_05_meta.py` line 103
+- **Problem**: `meta_y[in_dead_zone] = 0` taught the meta-model that bars where primary was near-random are "incorrect predictions". This is not a correctness signal — it's noise that corrupts the meta-model's ability to distinguish actually-wrong primary predictions from just-uncertain ones.
+- **Fix**: `create_meta_labels` now returns `(meta_y, dead_zone_mask)` tuple. Stage_05 applies `keep_mask = ~dead_zone_mask` to drop dead-zone bars before training, not relabel them. Added guard: if fewer than 50 non-dead-zone samples remain, return error.
+- **Status**: FIXED
+
+### ISSUE-040: Meta-labeler Optuna and final ES use same validation set — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/meta_labeler.py:train_meta_labeler` lines 108–170
+- **Problem**: 80/20 split used `X_mv` for both Optuna hyperparameter eval (10 trials) and final model early stopping. Optuna already picked the lr/subsample that minimised loss on `X_mv`. Using `X_mv` again for ES let the final model keep trees that overfit to what Optuna already exploited — double-dipping the same held-out set.
+- **Fix**: Triple temporal split: 60% fit (`X_ms`), 20% Optuna eval (`X_mv`), 20% ES (`X_es`). Final model trains on 60%+20%=80% (`X_fit`), early-stops on `X_es` only.
+- **Status**: FIXED
+
+### ISSUE-039: `time_since_last_signal` counter starts at `len(signal_active)` — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/meta_labeler.py:build_meta_features` line 69
+- **Problem**: `counter = len(signal_active)` initialized the "bars since last signal" counter to the full dataset length (e.g. 50,000). For all leading bars before the first signal, the feature read as 50,000+ instead of monotonically increasing from 0. The first signal would then drop the feature to 0 — a huge step discontinuity. Meta-model learned a spurious pattern from this artifact.
+- **Fix**: `counter = 0`. The first bar starts at 0 (meaning "at signal" or "0 bars since start"). Counter increments normally from there.
+- **Status**: FIXED
+
+### ISSUE-038: SHAP importance sampled from first 2000 bars (oldest data) — FIXED
+- **Date discovered**: 2026-04-20
+- **Date fixed**: 2026-04-20
+- **Location**: `src/models/primary_model.py:compute_shap_importance` line 383
+- **Problem**: `X_train.iloc[:n_sample]` took the first 2000 rows — the oldest, likely most non-stationary data. SHAP importances reflected which features mattered in stale market regimes, not current ones. Feature ranking could mislead feature selection review.
+- **Fix**: Changed to `X_train.iloc[-n_sample:]` — most recent 2000 bars, closer in distribution to the current market regime and live inference window.
+- **Status**: FIXED
+
+### ISSUE-037: Variance threshold uses pandas ddof=1 vs sklearn ddof=0 — WONT FIX
+- **Date discovered**: 2026-04-20
+- **Location**: `src/models/stability_selection.py:variance_threshold_filter` line 98
+- **Finding**: `X.var()` uses ddof=1 (sample variance); sklearn `VarianceThreshold` uses ddof=0 (population variance). Difference = `n/(n-1)` ≈ 1.001 for n≥1000. With `variance_threshold` configured for our feature scale (~0.01), the relative error is negligible (<0.1%). Changing ddof would require recalibrating all thresholds.
+- **Decision**: Not worth fixing. Threshold config values were tuned empirically against the ddof=1 behaviour. Changing to ddof=0 would silently change which features are dropped without adjusting the threshold.
+- **Status**: WONT FIX
+
 ## Open Issues (Not Fixed)
 
 ### ISSUE-035: Position sizing uses stale equity from project_state.json and divides by max_symbols — FIXED
@@ -862,3 +1218,163 @@ ISSUE-001 through ISSUE-021 are all FIXED. Remaining open:
 
 **Efficiency**: No major inefficiencies; minor improvements possible (PyArrow usage, replica code extraction).
 
+
+### ISSUE-067-FIX (2026-04-18)
+- **Location**: `src/execution/binance_client.py:_fetch_symbol_info`
+- **Problem**: `_qty_max_cache[symbol]` was first set from LOT_SIZE.maxQty, then **overwritten** unconditionally by MARKET_LOT_SIZE.maxQty (if DEMO). For SOLUSDT: LOT_SIZE maxQty=1,000,000 was overwritten by MARKET_LOT_SIZE maxQty=6,000. WIFUSDT: 1,000,000 → 50,000. These are still far above any realistic position size so no live P&L impact yet — but would have incorrectly capped orders as balance grows.
+- **Fix**: MARKET_LOT_SIZE only overrides when it is **more restrictive** (smaller) than existing LOT_SIZE value. Now correct: SOLUSDT stays 1,000,000; BTCUSDT stays 120 (MARKET_LOT_SIZE=120 < LOT_SIZE=1000).
+- **Status**: FIXED
+
+### DECISION-068 (2026-04-18)
+- **Location**: `CLAUDE.md` Python Environment section
+- **Decision**: Added explicit rules to never use `python3`, `python`, or `conda` for any project command — only full venv path. Added rule for Bash tool to always use `D:/Workspace/AI/crypto_model/.venv/Scripts/python.exe` (forward slashes).
+- **Rationale**: Bash tool was repeatedly resolving to system Python 3.11 (C:\Program Files\Python311) or conda base, neither of which has project deps. Cost: wasted cycles on UnicodeDecodeError and import failures per session.
+- **Status**: FIXED (documented)
+
+### ISSUE-069-FIX (2026-04-18)
+- **Location**: `src/execution/binance_client.py:_fetch_symbol_info`
+- **Problem**: LOT_SIZE.stepSize=0.0001 for SOLUSDT on DEMO is wrong — actual enforced precision is 0.01. Placing qty=17.1689 caused -1111 precision error. MARKET_LOT_SIZE.stepSize reflects real precision for MARKET orders.
+- **Fix**: After parsing MARKET_LOT_SIZE, if its stepSize > LOT_SIZE stepSize, override qty_step_cache with the larger (correct) value.
+- **Verified**: MARKET BUY SOLUSDT qty=17.16 FILLED at avgPrice=86.75, notional=$1488.97
+- **Status**: FIXED
+
+### DECISION-070 (2026-04-18)
+- **Decision**: Added `src/pipeline/model_health.py` — runs after stage 4/5/7, prints per-symbol DA/meta/Sharpe table with flags (NO_SIGNAL, LOW_SHARPE, FEW_TRADES, NO_MODEL_FILE), saves results/model_health.csv, prints action items Claude needs to improve model.
+- **Run**: `.venv/Scripts/python.exe -m src.pipeline.model_health`
+- **Status**: DONE
+
+### ISSUE-071-FIX (2026-04-18)
+- **Location**: `src/pipeline/stage_08_live.py:_process_symbol` (sizing), `config/base.yaml:growth_gate`
+- **Problem**: Volume per posisi dihitung sebagai `wallet × vol_mult / max(trade_limit, 1)` — salah. Posisi kedua mendapat setengah volume posisi pertama, padahal sesuai Est Profit.xlsx harus sama (Vol1 = Vol2 = wallet × mult).
+- **Fix**: Volume per posisi = `wallet_today × _get_vol_mult(wallet, cfg)`, TIDAK dibagi trade_limit. Fungsi `_get_vol_mult` baru membaca tier dari config.
+- **Files**: `src/pipeline/stage_08_live.py`, `config/base.yaml`
+- **Status**: FIXED
+
+### DECISION-072 (2026-04-18)
+- **Decision**: TP=1% price move, SL=5% price move, daily profit cap=+4% wallet, daily hard stop=-5% wallet. Sesuai Est Profit.xlsx compound formula: 2 posisi × 1% TP = 2% per hari, 2 hari compound = 4% target.
+- **Rationale**: User confirmed "Excel exact + daily cap" approach. SL 5% untuk ruang gerak 15m candle. Daily cap +4% = cukup 2 posisi TP; stop buka baru hari itu.
+- **Config keys**: `growth_gate.tp_fixed_pct=0.01`, `growth_gate.sl_fixed_pct=0.05`, `growth_gate.daily_profit_target_pct=0.04`, `growth_gate.daily_loss_limit_pct=0.05`
+- **Status**: DONE
+
+### DECISION-073 (2026-04-18)
+- **Decision**: vol_mult tier-based sesuai Est Profit.xlsx: wallet<$150 → 2×, $150-$2500 → 3× (growth phase agresif), ≥$2500 → 2× (income phase turun). Leverage 10× fixed semua tier (margin kecil per posisi, notional besar).
+- **Config**: `growth_gate.tiers` rewritten dengan field `vol_mult` per tier. `fixed_leverage=10`, `trading.leverage=10`.
+- **Logic**: `_get_vol_mult(wallet, cfg)` baru di stage_08_live.py. wallet_day_start disimpan ke project_state.json setiap UTC midnight untuk daily P&L tracking.
+- **Status**: DONE
+
+### ISSUE-074-FIX (2026-04-18): DEMO exchangeInfo returns full list — symbols[0] is always BTCUSDT, wrong symbol data cached for all others
+- **Date discovered**: 2026-04-18
+- **Date fixed**: 2026-04-18
+- **Location**: `src/execution/binance_client.py:_fetch_symbol_info` (line ~329), `src/execution/order_manager.py:submit_entry` (step 3c integer guard)
+- **Problem 1**: `/fapi/v1/exchangeInfo?symbol=XRPUSDT` on DEMO ignores the `symbol=` query param and returns the full unsorted list. Code did `sym_info = data["symbols"][0]`, which is always BTCUSDT (first alphabetically). BTCUSDT MARKET_LOT_SIZE.maxQty=120 was cached under every other symbol's key. Result: XRPUSDT get_max_qty() returned 120 → qty=120 → notional=$172 instead of ~$8,870.
+- **Problem 2**: BTCUSDT LOT_SIZE.stepSize=0.0001 was also cached for ETHUSDT. Integer guard condition was `qty_step <= 0.001` (inclusive of 0.001), so ETHUSDT's own correct stepSize=0.001 would also have triggered the guard. Guard floors qty=3.76→3.0.
+- **Fix 1 (binance_client.py)**: After fetching exchangeInfo, search `data["symbols"]` by name with `next(s for s in ... if s["symbol"] == symbol)` instead of blindly taking `[0]`. Raises ValueError if symbol not in response, triggering existing fallback.
+- **Fix 2 (order_manager.py)**: Tightened integer guard from `qty_step <= 0.001` to `qty_step < 0.001` (strict less-than). Only fires for truly anomalous precision (0.0001, 0.00001) — stepSize=0.001 symbols (ETHUSDT) are genuine decimal symbols and must not be floored.
+- **Verification**: XRPUSDT: LOT_SIZE maxQty=1,000,000, MARKET_LOT_SIZE maxQty=1,000,000 → no cap at realistic sizes. ETHUSDT: stepSize=0.001 → guard no longer fires → qty=3.76 instead of 3.
+- **Status**: FIXED
+
+### ISSUE-074-FIX (2026-04-18)
+- **Location**: `src/execution/binance_client.py:_fetch_symbol_info`
+- **Problem**: `exchangeInfo?symbol=X` on DEMO returns full list — `symbols[0]` was always BTCUSDT. Every symbol got BTCUSDT's maxQty=120 and stepSize=0.0001 cached under their name. XRPUSDT, FLOKIUSDT, XPLUSDT etc all got qty capped at 120.
+- **Fix**: Replace `data["symbols"][0]` with `next(s for s in data["symbols"] if s["symbol"] == symbol)`.
+- **Status**: FIXED (applied by ml-timeseries-quant agent)
+
+### ISSUE-075-FIX (2026-04-18)
+- **Location**: `src/execution/binance_client.py:_fetch_symbol_info` MARKET_LOT_SIZE block
+- **Problem**: After ISSUE-074 fix, code used `min(LOT_SIZE, MARKET_LOT_SIZE)` for maxQty. XTZUSDT has LOT_SIZE.maxQty=10,000 but MARKET_LOT_SIZE.maxQty=1,000,000 — min() gave 10,000 notional=$7,000 (wrong). Verified via Postman: MARKET orders allowed beyond LOT_SIZE.maxQty for most symbols.
+- **Fix**: Use `max(LOT_SIZE.maxQty, MARKET_LOT_SIZE.maxQty)` — exchange rejects naturally if real limit exceeded. stepSize still takes max() (ISSUE-069 logic preserved).
+- **Status**: FIXED
+
+### DECISION-076 (2026-04-18)
+- **Decision**: PUMPUSDT removed from pipeline — status=SETTLING (contract expired). Removed from training.completed_symbols and meta_labeling.completed_symbols in project_state.json. Pipeline now has 56 symbols.
+- **Status**: DONE
+
+### DECISION-077 (2026-04-18)
+- **Decision**: 1000FLOKIUSDT kept in pipeline despite low notional ($1,900 at $0.00019/unit). This is a genuine exchange constraint (maxQty=10M, price too small), not a code bug. Order still fills above min_notional=$5. Acceptable for model training/signal generation even if live sizing is small.
+- **Status**: ACCEPTED AS-IS
+
+### ISSUE-075-REOPEN + FIX (2026-04-18)
+- **Problem**: After ISSUE-075 fix used max(LOT,MKT), ml-timeseries-quant audit found this is WRONG. Binance applies MARKET_LOT_SIZE specifically to MARKET orders — exchange REJECTS (not caps) if qty exceeds MARKET_LOT_SIZE.maxQty. 26/56 symbols have LOT_max > MKT_max. At current T1 wallet all safe, but BARDUSDT breaks at T2 and 8 symbols break at T3.
+- **Fix**: Reverted to min(LOT_max, MKT_max) — MARKET_LOT_SIZE.maxQty overrides LOT_SIZE.maxQty when more restrictive. Same as original ISSUE-067 fix intent.
+- **XTZUSDT**: LOT=10k, MKT=1M → min=10k. At T3 volume=$10k, price=$0.7 → qty_raw=14,285 > 10k → CAPPED. Notional=$7,000 (70%). Acceptable.
+- **Status**: FIXED
+
+### DECISION-078 (2026-04-18)
+- **Decision**: 1000FLOKIUSDT baseAsset=1000FLOKI — kontrak 1000x multiplier (standard Binance naming for micro-price tokens). Price $0.031 = harga per 1000 FLOKI token. Sizing correct: 283k qty × $0.031 = $8,850 notional. No issue.
+- **Status**: CLARIFIED
+
+### ISSUE-079-FIX (2026-04-19): Synthetic Sharpe inflated ~4× — per-trade annualization + cost correction
+- **Date discovered**: 2026-04-19
+- **Date fixed**: 2026-04-19
+- **Location**: `src/pipeline/stage_04_train.py` fold Sharpe loop (~line 314)
+- **Problem**: `price_returns` is full trade P/L (barrier outcome), not per-bar return. Annualizing by `sqrt(252×96)` (bar count) overstates trade frequency by `sqrt(avg_hold_bars)` ≈ 4×. No transaction costs deducted. Result: reported Sharpe 132–207 was inflated ~4× — not useful as absolute benchmark.
+- **Fix**: (1) Subtract `round_trip_cost_pct` (0.003) from each active trade return before Sharpe. (2) Annualize by `trades_per_year = 252×96 / avg_hold` where `avg_hold = max_hold_bars / 2` (default 16 bars → 1512 trades/year). (3) CSV column renamed `synthetic_sharpe_mean` → `pertrade_sharpe_mean`. Log updated to `Sharpe(per-trade)=`.
+- **Status**: FIXED (takes effect on symbols trained after this session; current 6 already trained are unaffected)
+
+### ISSUE-080-FIX (2026-04-19): PBO metric was mathematical tautology — renamed to fold_consistency
+- **Date discovered**: 2026-04-19
+- **Date fixed**: 2026-04-19
+- **Location**: `src/models/splitter.py`, `src/pipeline/stage_04_train.py`
+- **Problem**: `compute_pbo` counted folds below median → always 4/8 = 0.500 for 8-fold even split. Not Bailey CSCV PBO. Tier A gate `pbo <= tier_A_pbo_max` was never meaningful.
+- **Fix**: Added `compute_fold_consistency` (fraction of folds with positive net Sharpe). `stage_04_train.py` now calls `compute_fold_consistency` — variable name `pbo` retained for compatibility with downstream consumers. `compute_pbo` kept in splitter.py for backward compat.
+- **Status**: FIXED
+
+### DECISION-081 (2026-04-19): DA edge logging + high-confidence subset DA added
+- **Date**: 2026-04-19
+- **Location**: `src/pipeline/stage_04_train.py` (~line 281)
+- **Change**: After class balance log, now also logs: `naive={naive_baseline_val:.3f} edge={edge_val:+.3f}` and `high_conf_DA` on bars where model prob > 0.70 or < 0.30. Both added to metrics dict and pipeline_diagnostics.csv.
+- **Rationale**: DA alone is misleading with 90% class imbalance. Edge (DA - majority baseline) and high-conf DA are the meaningful metrics for assessing whether the primary model adds signal above naive.
+- **Status**: DONE
+
+### ISSUE-006-FIX (2026-04-19): PBO CSCV Bailey 2014 implemented — replaces tautological fraction-below-median
+- **Date fixed**: 2026-04-19
+- **Location**: `src/models/splitter.py:compute_pbo_cscv`, `src/models/primary_model.py:tune_hyperparams`, `src/pipeline/stage_04_train.py`
+- **Fix**:
+  1. `tune_hyperparams` now saves `fold_scores` per trial via `trial.set_user_attr("fold_scores", fold_scores)` and returns `_trial_fold_scores` (K×N matrix) inside best_params.
+  2. `compute_pbo_cscv(trial_fold_scores)` in splitter.py implements true CSCV: for each C(N,N/2) IS/OOS fold split, pick best-IS trial, compute logit of its OOS rank, PBO = fraction of splits with logit<0. Capped at 256 splits.
+  3. stage_04_train extracts trial_fold_scores, calls `compute_pbo_cscv` → real PBO, separate from `compute_fold_consistency` which remains as its own metric.
+  4. `compute_pbo` legacy function kept for backward compat with comment.
+- **Result**: PBO now ranges 0.0–1.0 meaningfully. PBO<0.5 = IS-best trial tends to win OOS too (low overfit). PBO=1.0 = IS-best always loses OOS (severe overfit). Tier A gate `pbo <= tier_A_pbo_max=0.40` is now a real filter.
+- **fold_consistency** kept as separate metric — fraction of folds with positive net Sharpe, added to metrics dict and log.
+- **Status**: FIXED (takes effect on symbols trained after this session)
+
+### DECISION-082 (2026-04-19): Actual avg_hold from label data for Sharpe annualization
+- **Date**: 2026-04-19
+- **Location**: `src/pipeline/stage_04_train.py` fold Sharpe loop
+- **Change**: `trades_per_year` now computed from actual avg holding period: (1) `bars_to_exit` column if present, (2) `t1 - t0` in bars from label parquet, (3) `max_hold_bars/2` as conservative fallback. More accurate than fixed assumption.
+- **Status**: DONE
+
+### DECISION-083 (2026-04-19): OOF prob distribution logging added
+- **Date**: 2026-04-19
+- **Location**: `src/pipeline/stage_04_train.py` after OOF computation
+- **Change**: Logs `mean/std/q05/q95` of OOF long probabilities. std<0.05 = model near-constant output → useless for meta-filtering.
+- **Status**: DONE
+
+### ISSUE-084-FIX (2026-04-19): Triple barrier — 8 bugs di src/labels/ diperbaiki
+- **Date fixed**: 2026-04-19
+- **Files**: `src/labels/triple_barrier.py`, `src/labels/sample_weights.py`
+
+**BUG 1 (P0) — Barrier aktual tidak konsisten dengan stored tp_level/sl_level:**
+- `label_all_bars` memanggil `apply_triple_barrier(tp_mult, sl_mult, vol=natr)` → barrier = `p0 × (1 ± mult × natr)` tanpa clip. Tapi `compute_atr_barriers` menyimpan `tp_level = (natr × mult).clip(tp_min, tp_max)`. Barrier yang menentukan label berbeda dari yang disimpan ke parquet.
+- Fix: Ganti `apply_triple_barrier` dengan `apply_triple_barrier_clipped(tp_level, sl_level)` yang pakai clipped fractional levels dari `compute_atr_barriers` langsung → label dan stored barrier sekarang konsisten.
+
+**BUG 2 (P1) — Fee-adjust hardcoded fallback 0.006 stale:**
+- Fix: Fallback diganti ke `0.003` sesuai config aktif.
+
+**BUG 3 (P1) — `compute_return_weights` O(n²) loop:**
+- Fix: Vektorisasi via `idx_map` + `np.searchsorted` → O(n log n).
+
+**BUG 5 (P2) — `bars_to_exit` tidak disimpan:**
+- Fix: `apply_triple_barrier_clipped` sekarang returns column `bars_to_exit` (bars held before exit). Dipakai di stage_04 untuk actual avg_hold Sharpe annualization.
+
+**BUG 6 (P2) — `vol_lookback` dibaca tapi tidak dipakai:**
+- Fix: `compute_atr_barriers` sekarang terima `atr_period` param. `label_all_bars` pass `vol_lookback` sebagai `atr_period`. Config key sekarang punya efek nyata.
+
+**BUG 7 (P1) — Fee-adjust tidak pernah trigger:**
+- `tp_level` di-clip ke `tp_min_pct=0.008`, tapi kondisi `tp_level < cost=0.003` selalu False. Feature diam-diam mati.
+- Fix: Threshold diganti ke `cost × dead_zone_cost_multiple` (config key sudah ada, default 1.0 → threshold = 0.003). Untuk aktifkan reklasifikasi yang lebih agresif, naikkan `dead_zone_cost_multiple` di config.
+
+**BUG 8 (P2) — `total_bars` parameter dead:**
+- Fix: Dijadikan `total_bars: int = 0` dengan komentar backward compat. Caller tidak perlu berubah.
+
+- **Status**: FIXED (takes effect on next `--stage 3 --force`)

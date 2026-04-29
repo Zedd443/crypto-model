@@ -21,10 +21,8 @@ from src.utils.logger import get_logger
 
 logger = get_logger("live_features")
 
-# Columns eligible for fracdiff — same list as feature_pipeline._FRACDIFF_COLS
+# Columns eligible for fracdiff — must stay in sync with feature_pipeline._FRACDIFF_COLS
 _FRACDIFF_COLS = [
-    "close_5_mean", "close_10_mean", "close_20_mean",
-    "close_50_mean", "close_100_mean", "close_200_mean",
     "obv", "vwap_20",
 ]
 
@@ -124,14 +122,24 @@ def compute_live_features(
 
     # 2b. HTF model predictions (4h, 1d) — inject calibrated long-prob as features
     # Mirrors feature_pipeline step 2b. Models trained in stage_04b.
+    # Macro panels are loaded once and passed to predict_htf_proba to match training.
     models_dir = Path(cfg.data.models_dir)
+    _htf_macro_cache: dict = {}
     for _tf, _df_htf in [("4h", klines_4h), ("1d", klines_1d)]:
         _htf_model_path = models_dir / f"{symbol}_{_tf}_htf_model.json"
         if _df_htf is not None and len(_df_htf) > 0 and _htf_model_path.exists():
             try:
                 from src.models.htf_model import load_htf_model, predict_htf_proba
                 _htf_model, _htf_cal, _htf_feat_names = load_htf_model(symbol, _tf, models_dir)
-                _htf_pred = predict_htf_proba(_htf_model, _htf_cal, _htf_feat_names, _df_htf, _tf)
+                # Load macro panel for this timeframe (cached across loop iterations)
+                if _tf not in _htf_macro_cache:
+                    _mp = Path(cfg.data.processed_dir) / f"macro_panel_{_tf}.parquet"
+                    _htf_macro_cache[_tf] = pd.read_parquet(_mp) if _mp.exists() else None
+                _htf_macro = _htf_macro_cache[_tf]
+                _htf_pred = predict_htf_proba(
+                    _htf_model, _htf_cal, _htf_feat_names, _df_htf, _tf,
+                    macro_panel=_htf_macro,
+                )
                 _ffill_limit = _HTF_FFILL.get(_tf, 16)
                 _htf_pred_aligned = _htf_pred.reindex(all_features.index, method="ffill", limit=_ffill_limit)
                 all_features = pd.concat([all_features, _htf_pred_aligned], axis=1)
@@ -201,7 +209,7 @@ def compute_live_features(
     if "log_return" in hmm_input.columns:
         try:
             bocpd_model = fit_bocpd(hmm_input["log_return"], cfg)
-            cp_dist = get_changepoint_distance(hmm_input["log_return"], bocpd_model)
+            cp_dist = get_changepoint_distance(hmm_input["log_return"], bocpd_model, cfg)
             cp_dist_aligned = cp_dist.reindex(all_features.index)
             all_features = pd.concat([all_features, cp_dist_aligned.to_frame()], axis=1)
         except Exception as exc:
@@ -222,15 +230,16 @@ def compute_live_features(
 
     # 9. Macro and onchain panels — load last-known values from stage-1 processed files
     macro_panel, onchain_panel = _load_macro_onchain(cfg)
+    _macro_ffill_limit = int(getattr(cfg.features, 'macro_ffill_limit_bars', 2880))
     if macro_panel is not None and len(macro_panel) > 0:
         try:
-            macro_aligned = macro_panel.reindex(all_features.index, method="ffill")
+            macro_aligned = macro_panel.reindex(all_features.index, method="ffill", limit=_macro_ffill_limit)
             all_features = pd.concat([all_features, macro_aligned], axis=1)
         except Exception as exc:
             logger.warning(f"{symbol}: macro panel merge failed — {exc}")
     if onchain_panel is not None and len(onchain_panel) > 0:
         try:
-            onchain_aligned = onchain_panel.reindex(all_features.index, method="ffill")
+            onchain_aligned = onchain_panel.reindex(all_features.index, method="ffill", limit=_macro_ffill_limit)
             all_features = pd.concat([all_features, onchain_aligned], axis=1)
         except Exception as exc:
             logger.warning(f"{symbol}: onchain panel merge failed — {exc}")
@@ -284,11 +293,19 @@ def compute_live_features(
 
     last_row = last_row[selected_features]
 
+    # Capture raw (pre-scale) values for meta-feature construction.
+    # stage_05 training reads these from the unscaled features parquet — we must match
+    # that distribution exactly. Exact column names must match stage_05 (rv_daily, volume_surprise_20, etc.).
+    _META_RAW_COLS = ["rv_daily", "volume_surprise_20", "ofi_20", "spread_proxy_20", "atr_14"]
+    meta_raw = {col: float(last_row[col].iloc[0]) if col in last_row.columns else float("nan")
+                for col in _META_RAW_COLS}
+
     # 14. Transform with imputer then scaler — uses transform_with_imputer which handles
     # the dict artifact format (imputer + indicator_cols) correctly
     transformed = transform_with_imputer(last_row.values, symbol, "15m", imp_dir)
     transformed = transform_with_scaler(transformed, symbol, "15m", imp_dir)
 
     result = pd.Series(transformed[0], index=selected_features, name=last_row.index[0])
+    result.attrs["meta_raw"] = meta_raw
     logger.debug(f"{symbol}: live features computed — {len(result)} features, {len(missing_cols)} filled NaN")
     return result

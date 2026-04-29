@@ -42,11 +42,11 @@ def get_growth_gate_limits(equity: float, cfg) -> tuple:
     if pos_override > 0:
         max_symbols = min(max_symbols, pos_override)
 
-    # Hard override: cfg.trading.leverage takes priority, then growth_gate.fixed_leverage (0 = use tier)
-    lev_override = int(getattr(getattr(cfg, "trading", cfg), "leverage", 0)) or \
-                   int(getattr(cfg.growth_gate, "fixed_leverage", 0))
-    if lev_override > 0:
-        max_leverage = lev_override
+    # Cap leverage: tier max_leverage is the ceiling; config can only lower it, not raise it
+    lev_cap = int(getattr(getattr(cfg, "trading", cfg), "leverage", 0)) or \
+              int(getattr(cfg.growth_gate, "fixed_leverage", 0))
+    if lev_cap > 0:
+        max_leverage = min(max_leverage, lev_cap)
 
     return max_symbols, max_leverage
 

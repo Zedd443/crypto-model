@@ -1,22 +1,24 @@
 {
-  "last_updated": "2026-04-17T07:45:49.725878+00:00",
+  "last_updated": "2026-04-27T07:45:07.103223+00:00",
   "stages": {
     "ingest": {
       "status": "done",
-      "hash": "fb2587fdd559f668afae251313924c4b",
-      "last_run": "2026-04-16T17:04:05.668469+00:00",
-      "issues": []
+      "hash": "e395fcf78cfca2534261135a59d2c62d",
+      "last_run": "2026-04-25T22:21:12.324221+00:00",
+      "issues": [
+        "Excluded for 1d: ['ASTERUSDT', 'LITUSDT', 'KITEUSDT', 'XPLUSDT', 'BARDUSDT']"
+      ]
     },
     "features": {
       "status": "done",
-      "hash": "d6ba016fa12b27e487f3dba01085f059",
-      "last_run": "2026-04-16T17:04:14.934635+00:00",
+      "hash": "977de4467fa93b6d3644da741d0c2c7c",
+      "last_run": "2026-04-25T23:21:52.069437+00:00",
       "issues": []
     },
     "labels": {
       "status": "done",
-      "hash": "ef0a6889c31b527a0a7dd876ec48bfd6",
-      "last_run": "2026-04-16T17:05:15.402622+00:00",
+      "hash": "453462436d78b840433fdbdd37a2aefb",
+      "last_run": "2026-04-25T23:39:28.071353+00:00",
       "issues": []
     },
     "training": {
@@ -36,9 +38,9 @@
         "ARBUSDT",
         "OPUSDT",
         "STRKUSDT",
+        "POLUSDT",
         "UNIUSDT",
         "INJUSDT",
-        "POLUSDT",
         "RUNEUSDT",
         "1INCHUSDT",
         "ZRXUSDT",
@@ -81,35 +83,37 @@
         "BARDUSDT"
       ],
       "failed_symbols": {},
-      "hash": "334b088608584cacd9eb7854b447d690",
-      "last_run": "2026-04-16T17:16:25.857764+00:00",
-      "issues": []
+      "hash": "61e1a3bed2470f0f0286d1647e67a723",
+      "last_run": "2026-04-26T20:02:59.856487+00:00",
+      "issues": [
+        "LITUSDT: Insufficient train samples after filtering: 0",
+        "KITEUSDT: Insufficient train samples after filtering: 0"
+      ]
     },
     "meta_labeling": {
       "status": "done",
       "completed_symbols": [
-        "SOLUSDT",
-        "JASMYUSDT",
-        "AVAXUSDT",
-        "DOTUSDT",
         "BTCUSDT",
+        "SOLUSDT",
+        "DOTUSDT",
+        "AVAXUSDT",
         "NEARUSDT",
-        "TRXUSDT",
         "ATOMUSDT",
         "ALGOUSDT",
+        "TRXUSDT",
         "TONUSDT",
-        "ARBUSDT",
-        "SUIUSDT",
         "HBARUSDT",
+        "SUIUSDT",
+        "ARBUSDT",
         "OPUSDT",
-        "POLUSDT",
         "STRKUSDT",
-        "INJUSDT",
+        "POLUSDT",
         "UNIUSDT",
+        "INJUSDT",
         "RUNEUSDT",
         "1INCHUSDT",
-        "ZRXUSDT",
         "PENDLEUSDT",
+        "ZRXUSDT",
         "GMXUSDT",
         "TRUMPUSDT",
         "1000BONKUSDT",
@@ -127,10 +131,10 @@
         "FILUSDT",
         "TIAUSDT",
         "IOTAUSDT",
-        "PYTHUSDT",
         "ARUSDT",
-        "SANDUSDT",
+        "PYTHUSDT",
         "AXSUSDT",
+        "SANDUSDT",
         "GALAUSDT",
         "IMXUSDT",
         "XTZUSDT",
@@ -141,32 +145,43 @@
         "ROSEUSDT",
         "SUPERUSDT",
         "PUMPUSDT",
-        "KMNOUSDT",
         "XPLUSDT",
+        "KMNOUSDT",
         "FORMUSDT",
-        "BARDUSDT"
+        "BARDUSDT",
+        "JASMYUSDT"
       ],
       "failed_symbols": {},
-      "hash": "295c7a6c27483aecb25619b6e67f977a",
-      "last_run": "2026-04-16T17:16:36.484339+00:00",
-      "issues": []
+      "hash": "5d8a57940e7258d9b8ffcb7c449cfb52",
+      "last_run": "2026-04-26T20:10:26.161049+00:00",
+      "issues": [
+        "LITUSDT: OOF predictions not found: data\\checkpoints\\oof\\LITUSDT_15m_oof_proba.npy",
+        "KITEUSDT: OOF predictions not found: data\\checkpoints\\oof\\KITEUSDT_15m_oof_proba.npy"
+      ]
     },
     "portfolio": {
       "status": "done",
-      "hash": "d4dcb238e4db50bc30154ce3005dc17c",
-      "last_run": "2026-04-16T17:16:39.191261+00:00",
-      "issues": []
+      "hash": "e3819a461f9321de5f204e50f1b6260f",
+      "last_run": "2026-04-26T22:58:57.806011+00:00",
+      "issues": [
+        "LITUSDT: No primary model found",
+        "KITEUSDT: No primary model found",
+        "FORMUSDT: Primary model prediction failed: float() argument must be a string or a real number, not 'NAType'"
+      ]
     },
     "backtest": {
       "status": "done",
-      "hash": "e78be542bdc5683f2b5af5b67e5b9af7",
-      "last_run": "2026-04-16T17:16:41.741487+00:00",
-      "issues": []
+      "hash": "e0f5ec7c0575f2769413331edd0e3ea3",
+      "last_run": "2026-04-26T23:00:12.570408+00:00",
+      "issues": [
+        "LITUSDT: no signals checkpoint",
+        "KITEUSDT: no signals checkpoint"
+      ]
     }
   },
   "model_tiers": {},
   "account": {
-    "current_equity": 4893.38215402,
+    "current_equity": 3723.17705711,
     "active_symbol_count": 1,
     "growth_gate_unlocked": false,
     "growth_gate_threshold": 300.0,
@@ -187,8 +202,10 @@
     "read_if_relevant": {
       "training_issue": "models/training_summary.csv",
       "drift_alert": "monitoring/model_health.json",
+      "live_drift": "monitoring/live_vs_training.json",
       "trade_debug": "results/trade_log.csv",
       "execution_issue": "monitoring/skip_log.csv"
     }
-  }
+  },
+  "wallet_day_start": 3729.14179551
 }

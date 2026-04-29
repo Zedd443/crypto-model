@@ -109,7 +109,7 @@ def fit_bocpd(train_series: pd.Series, cfg) -> object:
     return model
 
 
-def get_changepoint_distance(series: pd.Series, bocpd_model) -> pd.Series:
+def get_changepoint_distance(series: pd.Series, bocpd_model, cfg=None) -> pd.Series:
     # Returns bars_since_last_changepoint for each timestamp
     if bocpd_model is None or not _RUPTURES_AVAILABLE:
         return pd.Series(np.nan, index=series.index, name="bars_since_changepoint")
@@ -120,8 +120,11 @@ def get_changepoint_distance(series: pd.Series, bocpd_model) -> pd.Series:
         return pd.Series(np.nan, index=series.index, name="bars_since_changepoint")
 
     try:
-        # Predict with penalty; use BIC or a fixed penalty
-        penalty = max(5, int(np.log(n) * 2))
+        # Penalty = max(floor, log(n) * multiplier) — tuneable via config
+        # bocpd_penalty_floor and bocpd_penalty_mult live in cfg.regime
+        _floor = int(getattr(getattr(cfg, 'regime', cfg), 'bocpd_penalty_floor', 5)) if cfg is not None else 5
+        _mult = float(getattr(getattr(cfg, 'regime', cfg), 'bocpd_penalty_mult', 2.0)) if cfg is not None else 2.0
+        penalty = max(_floor, int(np.log(n) * _mult))
         breakpoints = bocpd_model.predict(pen=penalty)
     except Exception as e:
         logger.warning(f"BOCPD predict failed: {e}")
@@ -129,13 +132,29 @@ def get_changepoint_distance(series: pd.Series, bocpd_model) -> pd.Series:
 
     # Build bars_since array on the dropna index
     dropna_index = series.dropna().index
-    cp_set = set(breakpoints[:-1])  # last element is n (end of series)
-    bars_since = np.zeros(n, dtype=float)
-    last_cp = 0
-    for i in range(n):
-        if i in cp_set:
-            last_cp = i
-        bars_since[i] = i - last_cp
+    # breakpoints[-1] == n (sentinel end-of-series), exclude it
+    cp_indices = np.array(sorted(breakpoints[:-1]), dtype=np.intp)
+
+    # Vectorized "distance to last event" using cumsum trick:
+    # Mark changepoint positions in a boolean array, then for each bar
+    # compute position - position_of_last_True_at_or_before_this_bar.
+    is_cp = np.zeros(n, dtype=np.float64)
+    if len(cp_indices) > 0:
+        # Clip to valid range (ruptures guarantees 0 <= bp < n, but guard anyway)
+        valid = cp_indices[(cp_indices >= 0) & (cp_indices < n)]
+        is_cp[valid] = 1.0
+
+    # cumsum of is_cp gives a monotone counter; positions array is just arange.
+    # For each i: last_cp_i = max index j<=i where is_cp[j]==1, else 0.
+    # bars_since[i] = i - last_cp_i, with last_cp_i=0 before any changepoint.
+    cum_cp = np.cumsum(is_cp)  # increases at each CP position
+    # For each CP count value c, the "last CP position" when cum_cp==c is the
+    # index of the c-th changepoint. Map each bar to its last_cp position via searchsorted.
+    cp_positions = np.concatenate([[0], cp_indices]) if len(cp_indices) > 0 else np.array([0])
+    # cum_cp[i] gives how many CPs have occurred up to and including i.
+    # last_cp[i] = cp_positions[cum_cp[i]] (0-indexed into cp_positions which starts at 0).
+    last_cp_arr = cp_positions[cum_cp.astype(np.intp)]
+    bars_since = np.arange(n, dtype=np.float64) - last_cp_arr
 
     result = pd.Series(bars_since, index=dropna_index, name="bars_since_changepoint")
     return result.reindex(series.index)

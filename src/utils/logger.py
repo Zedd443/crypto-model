@@ -1,6 +1,14 @@
 from pathlib import Path
 from loguru import logger as _logger
 import sys
+import warnings
+
+# Also applied in worker subprocesses since they re-import this module.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*sklearn\.utils\.parallel\.delayed.*should be used with.*",
+    category=UserWarning,
+)
 
 _stderr_added = False
 _file_sinks: set = set()

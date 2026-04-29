@@ -21,6 +21,7 @@ def optimize_portfolio_weights(
     max_weight = float(cfg.portfolio.max_position_size)
     max_turnover = float(cfg.portfolio.max_turnover)
     cvar_lambda = float(cfg.portfolio.cvar_lambda_penalty)
+    cvar_z = float(cfg.portfolio.cvar_z_score)
 
     # Ensure prev_weights is the right size
     if prev_weights is None or len(prev_weights) != n_assets:
@@ -34,9 +35,9 @@ def optimize_portfolio_weights(
         port_var = float(w @ cov_matrix @ w)
         port_std = np.sqrt(max(port_var, 1e-12))
         sharpe = port_ret / (port_std + 1e-9)
-        # Penalize with CVaR contribution
-        obj = -(sharpe - cvar_lambda * abs(cvar_val))
-        return obj
+        # CVaR penalty: approximate as z * port_std (parametric, depends on w via port_std)
+        cvar_penalty = cvar_lambda * cvar_z * port_std
+        return -(sharpe - cvar_penalty)
 
     constraints = [
         {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
@@ -95,10 +96,9 @@ def rebalance_needed(
         return True
 
     if signal_strengths is not None and len(signal_strengths) == len(current_weights):
-        # Normalize signal strengths to weights
-        total_strength = signal_strengths.sum()
+        total_strength = float(np.abs(signal_strengths).sum())
         if total_strength > 0:
-            target_w = signal_strengths / total_strength
+            target_w = np.abs(signal_strengths) / total_strength
             turnover = float(np.sum(np.abs(current_weights - target_w)))
             if turnover > float(cfg.portfolio.max_turnover):
                 return True
